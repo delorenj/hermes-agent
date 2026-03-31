@@ -146,11 +146,17 @@ def _install_dependencies(provider_name: str) -> None:
     if not pip_deps:
         return
 
+    # pip name → import name mapping for packages where they differ
+    _IMPORT_NAMES = {
+        "honcho-ai": "honcho",
+        "mem0ai": "mem0",
+        "hindsight-client": "hindsight_client",
+    }
+
     # Check which packages are missing
     missing = []
     for dep in pip_deps:
-        # Normalize: pip package name → import name (rough heuristic)
-        import_name = dep.replace("-", "_").split("[")[0]
+        import_name = _IMPORT_NAMES.get(dep, dep.replace("-", "_").split("[")[0])
         try:
             __import__(import_name)
         except ImportError:
