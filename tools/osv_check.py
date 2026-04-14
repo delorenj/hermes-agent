@@ -5,7 +5,10 @@ Vulnerabilities) API to check if the package has any known malware advisories
 (MAL-* IDs).  Regular CVEs are ignored — only confirmed malware is blocked.
 
 The API is free, public, and maintained by Google.  Typical latency is ~300ms.
-Fail-open: network errors allow the package to proceed.
+
+Fail-closed by default: network errors block the package to prevent bypass.
+Set ``MCP_OSV_FAIL_OPEN=1`` or ``mcp.osv_fail_open: true`` in config.yaml
+to restore the old fail-open behavior (network errors allow the package).
 
 Inspired by Block/goose's extension malware check.
 """
@@ -21,6 +24,21 @@ logger = logging.getLogger(__name__)
 
 _OSV_ENDPOINT = os.getenv("OSV_ENDPOINT", "https://api.osv.dev/v1/query")
 _TIMEOUT = 10  # seconds
+
+
+def _is_fail_open() -> bool:
+    """Check if OSV check should fail-open on network errors."""
+    # Env var override (explicit opt-in to fail-open)
+    env_val = os.getenv("MCP_OSV_FAIL_OPEN", "").strip().lower()
+    if env_val in ("1", "true", "yes"):
+        return True
+    # Config.yaml: mcp.osv_fail_open
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        return bool(cfg.get("mcp", {}).get("osv_fail_open", False))
+    except Exception:
+        return False  # default: fail-closed
 
 
 def check_package_for_malware(
@@ -46,9 +64,18 @@ def check_package_for_malware(
     try:
         malware = _query_osv(package, ecosystem, version)
     except Exception as exc:
-        # Fail-open: network errors, timeouts, parse failures → allow
-        logger.debug("OSV check failed for %s/%s (allowing): %s", ecosystem, package, exc)
-        return None
+        if _is_fail_open():
+            # Legacy behavior: network errors, timeouts, parse failures → allow
+            logger.debug("OSV check failed for %s/%s (allowing — fail-open mode): %s", ecosystem, package, exc)
+            return None
+        # Fail-closed: block the package on network errors
+        logger.warning("OSV check failed for %s/%s (blocking — fail-closed mode): %s", ecosystem, package, exc)
+        return (
+            f"BLOCKED: OSV malware check for '{package}' ({ecosystem}) failed "
+            f"due to a network error: {exc}. Cannot verify package safety. "
+            f"Set MCP_OSV_FAIL_OPEN=1 or mcp.osv_fail_open: true in config.yaml "
+            f"to allow packages when the OSV API is unreachable."
+        )
 
     if malware:
         ids = ", ".join(m["id"] for m in malware[:3])

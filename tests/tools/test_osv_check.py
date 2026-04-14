@@ -1,6 +1,7 @@
 """Tests for OSV malware check on MCP extension packages."""
 
 import json
+import os
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -115,9 +116,18 @@ class TestCheckPackageForMalware:
         assert "MAL-2023-7938" in result
         assert "CVE-2023-1234" not in result  # regular CVEs filtered
 
-    def test_network_error_fails_open(self):
-        """Network errors allow the package (fail-open)."""
+    def test_network_error_fails_closed_by_default(self):
+        """Network errors block the package (fail-closed) by default."""
         with patch("tools.osv_check.urllib.request.urlopen", side_effect=ConnectionError("timeout")):
+            result = check_package_for_malware("npx", ["some-package"])
+        assert result is not None
+        assert "BLOCKED" in result
+        assert "network error" in result.lower()
+
+    def test_network_error_fails_open_with_env_var(self):
+        """Network errors allow the package when MCP_OSV_FAIL_OPEN=1."""
+        with patch("tools.osv_check.urllib.request.urlopen", side_effect=ConnectionError("timeout")), \
+             patch.dict(os.environ, {"MCP_OSV_FAIL_OPEN": "1"}):
             result = check_package_for_malware("npx", ["some-package"])
         assert result is None
 

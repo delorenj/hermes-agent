@@ -86,6 +86,67 @@ def _get_disabled_plugins() -> set:
 
 
 # ---------------------------------------------------------------------------
+# Plugin approval gate
+# ---------------------------------------------------------------------------
+
+_APPROVALS_FILENAME = "approved_plugins.json"
+
+
+def _approvals_path() -> Path:
+    """Return the path to the plugin approvals file."""
+    return get_hermes_home() / _APPROVALS_FILENAME
+
+
+def _load_approvals() -> dict:
+    """Load the approved plugins dict from disk."""
+    import json
+    path = _approvals_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_approvals(approvals: dict) -> None:
+    """Persist the approved plugins dict to disk."""
+    import json
+    path = _approvals_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(approvals, indent=2) + "\n", encoding="utf-8")
+
+
+def approve_plugin(name: str, source: str = "unknown") -> None:
+    """Approve a plugin for auto-loading on future launches."""
+    import datetime
+    approvals = _load_approvals()
+    approvals[name] = {
+        "approved": True,
+        "source": source,
+        "approved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    _save_approvals(approvals)
+    logger.info("Plugin '%s' approved for auto-loading.", name)
+
+
+def revoke_plugin(name: str) -> bool:
+    """Revoke approval for a plugin.  Returns True if it was in the list."""
+    approvals = _load_approvals()
+    if name in approvals:
+        del approvals[name]
+        _save_approvals(approvals)
+        logger.info("Plugin '%s' approval revoked.", name)
+        return True
+    return False
+
+
+def list_approved_plugins() -> dict:
+    """Return the current approvals dict."""
+    return _load_approvals()
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -303,8 +364,12 @@ class PluginManager:
         # 3. Pip / entry-point plugins
         manifests.extend(self._scan_entry_points())
 
-        # Load each manifest (skip user-disabled plugins)
+        # Load each manifest (skip disabled and unapproved plugins)
         disabled = _get_disabled_plugins()
+        approvals = _load_approvals()
+        approvals_file_exists = _approvals_path().exists()
+        unapproved: List[PluginManifest] = []
+
         for manifest in manifests:
             if manifest.name in disabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
@@ -312,7 +377,42 @@ class PluginManager:
                 self._plugins[manifest.name] = loaded
                 logger.debug("Skipping disabled plugin '%s'", manifest.name)
                 continue
+
+            # Approval gate: if the approvals file exists, only load
+            # approved plugins.  If it doesn't exist yet (first run /
+            # upgrade), auto-approve all found plugins and create the file.
+            if approvals_file_exists and manifest.name not in approvals:
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = "not approved (run 'hermes plugins approve')"
+                self._plugins[manifest.name] = loaded
+                unapproved.append(manifest)
+                continue
+
             self._load_plugin(manifest)
+
+        # First-run migration: if no approvals file, create one with all
+        # currently found (and loaded) plugins auto-approved.
+        if not approvals_file_exists and manifests:
+            import datetime
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            for m in manifests:
+                if m.name not in disabled:
+                    approvals[m.name] = {
+                        "approved": True,
+                        "source": m.source,
+                        "approved_at": now,
+                        "auto_approved": True,
+                    }
+            _save_approvals(approvals)
+            logger.debug("Created plugin approvals file (auto-approved %d existing plugins)", len(approvals))
+
+        if unapproved:
+            names = ", ".join(m.name for m in unapproved)
+            logger.warning(
+                "Blocked %d unapproved plugin(s): %s — run "
+                "'hermes plugins approve <name>' to allow.",
+                len(unapproved), names,
+            )
 
         if manifests:
             logger.info(
