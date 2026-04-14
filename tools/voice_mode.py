@@ -959,6 +959,8 @@ def check_voice_requirements() -> Dict[str, Any]:
         details_parts.append("STT provider: DISABLED in config (stt.enabled: false)")
     elif stt_provider == "local":
         details_parts.append("STT provider: OK (local faster-whisper)")
+    elif stt_provider == "local_command":
+        details_parts.append("STT provider: OK (custom local command)")
     elif stt_provider == "groq":
         details_parts.append("STT provider: OK (Groq)")
     elif stt_provider == "openai":

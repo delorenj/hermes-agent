@@ -137,6 +137,13 @@ def _find_whisper_binary() -> Optional[str]:
 
 def _get_local_command_template() -> Optional[str]:
     configured = os.getenv(LOCAL_STT_COMMAND_ENV, "").strip()
+    if not configured:
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+            load_hermes_dotenv(hermes_home=get_hermes_home())
+            configured = os.getenv(LOCAL_STT_COMMAND_ENV, "").strip()
+        except Exception:
+            configured = os.getenv(LOCAL_STT_COMMAND_ENV, "").strip()
     if configured:
         return configured
 
