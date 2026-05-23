@@ -75,3 +75,18 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+
+# Fork-only additions (delorenj/hermes-agent)
+**/.claude/settings.local.json
+*.mp4
+*.mp3
+*.zip
+*.aab
+.lastagent
+
+# Codex runtime/state (committed accidentally in earlier auto-checkpoints,
+# de-tracked separately when convenient)
+.codex/tmp/
+.codex/*.sqlite-shm
+.codex/*.sqlite-wal
+.codex/goals_*.sqlite

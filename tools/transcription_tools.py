@@ -37,6 +37,7 @@ from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
 from utils import is_truthy_value
+from hermes_constants import get_hermes_home
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import managed_nous_tools_enabled, resolve_openai_audio_api_key
 
@@ -155,6 +156,13 @@ def _find_whisper_binary() -> Optional[str]:
 
 def _get_local_command_template() -> Optional[str]:
     configured = os.getenv(LOCAL_STT_COMMAND_ENV, "").strip()
+    if not configured:
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+            load_hermes_dotenv(hermes_home=get_hermes_home())
+            configured = os.getenv(LOCAL_STT_COMMAND_ENV, "").strip()
+        except Exception:
+            configured = os.getenv(LOCAL_STT_COMMAND_ENV, "").strip()
     if configured:
         return configured
 
