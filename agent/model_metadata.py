@@ -194,6 +194,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     "llama": 131072,
     # Qwen — specific model families before the catch-all.
     # Official docs: https://help.aliyun.com/zh/model-studio/developer-reference/
+    "qwen3.6-plus": 1048576,      # 1M context (DashScope/Alibaba & OpenRouter)
     "qwen3-coder-plus": 1000000,  # 1M context
     "qwen3-coder": 262144,        # 256K context
     "qwen": 131072,
@@ -208,6 +209,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # via a custom provider. Values sourced from models.dev (2026-04).
     # Keys use substring matching (longest-first), so e.g. "grok-4.20"
     # matches "grok-4.20-0309-reasoning" / "-non-reasoning" / "-multi-agent-0309".
+    "grok-build": 256000,       # grok-build-0.1
     "grok-code-fast": 256000,   # grok-code-fast-1
     "grok-4-1-fast": 2000000,   # grok-4-1-fast-(non-)reasoning
     "grok-2-vision": 8192,      # grok-2-vision, -1212, -latest
@@ -358,6 +360,12 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "api.deepseek.com": "deepseek",
     "api.githubcopilot.com": "copilot",
     "models.github.ai": "copilot",
+    # GitHub Models free tier (Azure-hosted prototyping endpoint) — same
+    # canonical provider as the Copilot API.  Hard per-request token cap
+    # (often 8K) makes it unusable for Hermes' system prompt, but mapping
+    # it here lets us recognize the endpoint and emit a targeted hint
+    # instead of falling through the unknown-custom-endpoint path.
+    "models.inference.ai.azure.com": "copilot",
     "api.fireworks.ai": "fireworks",
     "opencode.ai": "opencode-go",
     "api.x.ai": "xai",

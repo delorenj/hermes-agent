@@ -133,8 +133,19 @@ _CREDENTIAL_FILES = (
     r'(?:~|\$home|\$\{home\})/\.'
     r'(?:netrc|pgpass|npmrc|pypirc)\b'
 )
+# macOS: /etc, /var, /tmp, /home are symlinks to /private/{etc,var,tmp,home}.
+# A command written to target /private/etc/sudoers works identically to
+# /etc/sudoers on macOS but bypasses a plain "/etc/" pattern check. Match
+# both forms. Inspired by Claude Code 2.1.113's "dangerous path protection".
+_MACOS_PRIVATE_SYSTEM_PATH = r'/private/(?:etc|var|tmp|home)/'
+# System-config paths that should trigger approval for any write/edit,
+# collapsing /etc, its macOS /private/etc mirror, and /etc/sudoers.d/ into
+# one shared fragment so new DANGEROUS_PATTERNS stay consistent.
+_SYSTEM_CONFIG_PATH = (
+    rf'(?:/etc/|{_MACOS_PRIVATE_SYSTEM_PATH})'
+)
 _SENSITIVE_WRITE_TARGET = (
-    r'(?:/etc/|/dev/sd|'
+    rf'(?:{_SYSTEM_CONFIG_PATH}|/dev/sd|'
     rf'{_SSH_SENSITIVE_PATH}|'
     rf'{_HERMES_ENV_PATH}|'
     rf'{_SHELL_RC_FILES}|'
@@ -318,10 +329,17 @@ DANGEROUS_PATTERNS = [
     # *next* line to satisfy the negative lookahead, silently allowing DELETE without WHERE.
     (r'\bDELETE\s+FROM\b(?![^\n]*\bWHERE\b)', "SQL DELETE without WHERE"),
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
-    (r'>\s*/etc/', "overwrite system config"),
+    (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
     (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
+    # killall with SIGKILL (parallel to pkill -9). Catches -9 / -KILL /
+    # -s KILL / -SIGKILL forms, and also `killall -r <regex>` broad sweeps
+    # that can wipe out unrelated processes by accident.
+    # Inspired by Claude Code 2.1.113 expanded deny rules.
+    (r'\bkillall\s+(-[^\s]*\s+)*-(9|KILL|SIGKILL)\b', "force kill processes (killall -KILL)"),
+    (r'\bkillall\s+(-[^\s]*\s+)*-s\s+(KILL|SIGKILL|9)\b', "force kill processes (killall -s KILL)"),
+    (r'\bkillall\s+(-[^\s]*\s+)*-r\b', "kill processes by regex (killall -r)"),
     (r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:', "fork bomb"),
     # Any shell invocation via -c or combined flags like -lc, -ic, etc.
     (r'\b(bash|sh|zsh|ksh)\s+-[^\s]*c(\s+|$)', "shell command via -c/-lc flag"),
@@ -333,7 +351,11 @@ DANGEROUS_PATTERNS = [
     (rf'\btee\b.*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config via tee"),
     (rf'>>?\s*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config via redirection"),
     (r'\bxargs\s+.*\brm\b', "xargs with rm"),
-    (r'\bfind\b.*-exec\s+(/\S*/)?rm\b', "find -exec rm"),
+    # find -exec rm / -execdir rm — the -execdir variant (same semantics,
+    # runs in the directory of each match) was previously missed. Claude
+    # Code 2.1.113 tightened their equivalent find rule to stop auto-
+    # approving -exec / -delete flags.
+    (r'\bfind\b.*-exec(?:dir)?\s+(/\S*/)?rm\b', "find -exec/-execdir rm"),
     (r'\bfind\b.*-delete\b', "find -delete"),
     # Gateway lifecycle protection: prevent the agent from killing its own
     # gateway process.  These commands trigger a gateway restart/stop that
@@ -351,11 +373,12 @@ DANGEROUS_PATTERNS = [
     # to regex at detection time. Catch the structural pattern instead.
     (r'\bkill\b.*\$\(\s*pgrep\b', "kill process via pgrep expansion (self-termination)"),
     (r'\bkill\b.*`\s*pgrep\b', "kill process via backtick pgrep expansion (self-termination)"),
-    # File copy/move/edit into sensitive system paths
-    (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
+    # File copy/move/edit into sensitive system paths (/etc/ and macOS
+    # /private/etc/ mirror).
+    (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),
     (rf'\b(cp|mv|install)\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config file"),
-    (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
-    (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
+    (rf'\bsed\s+-[^\s]*i.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config"),
+    (rf'\bsed\s+--in-place\b.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config (long flag)"),
     # Script execution via heredoc — bypasses the -e/-c flag patterns above.
     # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
     (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
@@ -1276,12 +1299,34 @@ def check_all_command_guards(command: str, env_type: str,
             )
 
             if not resolved or choice is None or choice == "deny":
-                reason = "timed out" if not resolved else "denied by user"
+                # Consent contract: silence is NOT consent, and an explicit
+                # deny is also a hard halt — both produce a BLOCKED outcome
+                # that names the agent's most common evasion paths (retry,
+                # rephrase, achieve the same outcome via a different command).
+                # See issue #24912 for the original incident.
+                if not resolved:
+                    reason = "timed out without user response"
+                    timeout_addendum = " Silence is not consent."
+                    outcome = "timeout"
+                else:
+                    reason = "denied by user"
+                    timeout_addendum = ""
+                    outcome = "denied"
                 return {
                     "approved": False,
-                    "message": f"BLOCKED: Command {reason}. Do NOT retry this command.",
+                    "message": (
+                        f"BLOCKED: Command {reason}. The user has NOT consented "
+                        f"to this action. Do NOT retry this command, do NOT "
+                        f"rephrase it, and do NOT attempt the same outcome via "
+                        f"a different command. Stop the current workflow and "
+                        f"wait for the user to respond before taking any "
+                        f"further destructive or irreversible action."
+                        f"{timeout_addendum}"
+                    ),
                     "pattern_key": primary_key,
                     "description": combined_desc,
+                    "outcome": outcome,
+                    "user_consent": False,
                 }
 
             # User approved — persist based on scope (same logic as CLI)
@@ -1309,7 +1354,8 @@ def check_all_command_guards(command: str, env_type: str,
         return {
             "approved": False,
             "pattern_key": primary_key,
-            "status": "approval_required",
+            "status": "pending_approval",
+            "approval_pending": True,
             "command": command,
             "description": combined_desc,
             "message": (
@@ -1345,9 +1391,18 @@ def check_all_command_guards(command: str, env_type: str,
     if choice == "deny":
         return {
             "approved": False,
-            "message": "BLOCKED: User denied. Do NOT retry.",
+            "message": (
+                "BLOCKED: User denied this command. The user has NOT consented "
+                "to this action. Do NOT retry this command, do NOT rephrase "
+                "it, and do NOT attempt the same outcome via a different "
+                "command. Stop the current workflow and wait for the user "
+                "to respond before taking any further destructive or "
+                "irreversible action."
+            ),
             "pattern_key": primary_key,
             "description": combined_desc,
+            "outcome": "denied",
+            "user_consent": False,
         }
 
     # Persist approval for each warning individually
