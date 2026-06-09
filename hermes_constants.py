@@ -5,6 +5,7 @@ without risk of circular imports.
 """
 
 import os
+import re
 import sys
 import sysconfig
 from contextvars import ContextVar, Token
@@ -48,6 +49,53 @@ def _get_platform_default_hermes_home() -> Path:
         base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
         return base / "hermes"
     return Path.home() / ".hermes"
+
+
+# Mirrors hermes_cli.profiles._PROFILE_ID_RE (kept local: this module must
+# stay import-safe with no hermes_cli dependency).
+_REGISTERED_PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def find_registered_profile_for_home(home: Path) -> str | None:
+    """Reverse-lookup ``home`` through the native profiles registry.
+
+    The fleet provisioning pattern registers repo-local agent runtimes as
+    named profiles by symlinking ``~/.hermes/profiles/<name>`` at
+    ``<repo>/agents/hermes/<role>/runtime``. Launchers, however, export the
+    physical runtime path as ``HERMES_HOME``, so nothing downstream can see
+    the registered name lexically. This maps a physical home back to its
+    registry name.
+
+    Returns the first matching name in sorted order when several registry
+    entries point at the same runtime (that duplication is registry drift,
+    not a supported layout). Returns ``None`` for unregistered homes, the
+    native home itself, and on any filesystem error.
+    """
+    native_home = _get_platform_default_hermes_home()
+    profiles_root = native_home / "profiles"
+    if not profiles_root.is_dir():
+        return None
+    try:
+        target = home.resolve()
+    except OSError:
+        return None
+    if target == native_home.resolve():
+        return None
+    try:
+        entries = sorted(profiles_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not _REGISTERED_PROFILE_NAME_RE.match(entry.name):
+            continue
+        if not entry.is_dir():
+            continue
+        try:
+            if entry.resolve() == target:
+                return entry.name
+        except OSError:
+            continue
+    return None
 
 
 def get_hermes_home() -> Path:

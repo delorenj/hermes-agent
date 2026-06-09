@@ -378,11 +378,7 @@ def load_cli_config() -> Dict[str, Any]:
     # config as a fallback so defaults stay sensible).
     ignore_user_config = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
 
-    # Use user config if it exists, otherwise project config
-    if user_config_path.exists() and not ignore_user_config:
-        config_path = user_config_path
-    else:
-        config_path = project_config_path
+    config_path = user_config_path
 
     # Default configuration
     defaults = {
@@ -500,60 +496,77 @@ def load_cli_config() -> Dict[str, Any]:
     # file should be authoritative.
     _file_has_terminal_config = False
 
-    # Load from file if exists
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                from hermes_cli.config import _normalize_root_model_keys
+    file_config: Dict[str, Any] = {}
+    layer_paths: List[Path] = []
+    try:
+        from hermes_cli.config import (
+            _load_user_config_layers,
+            _normalize_root_model_keys,
+            _resolve_profile_config_inheritance,
+        )
 
-                file_config = _normalize_root_model_keys(yaml.safe_load(f) or {})
-            
-            _file_has_terminal_config = "terminal" in file_config
+        inheritance = None
+        if not ignore_user_config:
+            inheritance = _resolve_profile_config_inheritance(user_config_path)
+            file_config, layer_paths = _load_user_config_layers(user_config_path)
+        if not layer_paths and inheritance is None and project_config_path.exists():
+            config_path = project_config_path
+            with open(project_config_path, "r", encoding="utf-8") as f:
+                file_config = yaml.safe_load(f) or {}
+            layer_paths = [project_config_path]
+        file_config = _normalize_root_model_keys(file_config)
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.warning("Failed to load config for CLI startup: %s", e)
+        file_config = {}
+        layer_paths = []
 
-            # Handle model config - can be string (new format) or dict (old format)
-            if "model" in file_config:
-                if isinstance(file_config["model"], str):
-                    # New format: model is just a string, convert to dict structure
-                    defaults["model"]["default"] = file_config["model"]
-                elif isinstance(file_config["model"], dict):
-                    # Old format: model is a dict with default/base_url
-                    defaults["model"].update(file_config["model"])
-                    # If the user config sets model.model but not model.default,
-                    # promote model.model to model.default so the user's explicit
-                    # choice isn't shadowed by the hardcoded default.  Without this,
-                    # profile configs that only set "model:" (not "default:") silently
-                    # fall back to claude-opus because the merge preserves the
-                    # hardcoded default and HermesCLI.__init__ checks "default" first.
-                    if "model" in file_config["model"] and "default" not in file_config["model"]:
-                        defaults["model"]["default"] = file_config["model"]["model"]
+    if layer_paths:
+        _file_has_terminal_config = "terminal" in file_config
 
-            # Deep merge file_config into defaults.
-            # First: merge keys that exist in both (deep-merge dicts, overwrite scalars)
-            for key in defaults:
-                if key == "model":
-                    continue  # Already handled above
-                if key in file_config:
-                    if isinstance(defaults[key], dict) and isinstance(file_config[key], dict):
-                        defaults[key].update(file_config[key])
-                    else:
-                        defaults[key] = file_config[key]
-            
-            # Second: carry over keys from file_config that aren't in defaults
-            # (e.g. platform_toolsets, provider_routing, memory, honcho, etc.)
-            for key in file_config:
-                if key not in defaults and key != "model":
+        # Handle model config - can be string (new format) or dict (old format)
+        if "model" in file_config:
+            if isinstance(file_config["model"], str):
+                # New format: model is just a string, convert to dict structure
+                defaults["model"]["default"] = file_config["model"]
+            elif isinstance(file_config["model"], dict):
+                # Old format: model is a dict with default/base_url
+                defaults["model"].update(file_config["model"])
+                # If the user config sets model.model but not model.default,
+                # promote model.model to model.default so the user's explicit
+                # choice isn't shadowed by the hardcoded default.  Without this,
+                # profile configs that only set "model:" (not "default:") silently
+                # fall back to claude-opus because the merge preserves the
+                # hardcoded default and HermesCLI.__init__ checks "default" first.
+                if "model" in file_config["model"] and "default" not in file_config["model"]:
+                    defaults["model"]["default"] = file_config["model"]["model"]
+
+        # Deep merge file_config into defaults.
+        # First: merge keys that exist in both (deep-merge dicts, overwrite scalars)
+        for key in defaults:
+            if key == "model":
+                continue  # Already handled above
+            if key in file_config:
+                if isinstance(defaults[key], dict) and isinstance(file_config[key], dict):
+                    defaults[key].update(file_config[key])
+                else:
                     defaults[key] = file_config[key]
-            
-            # Handle legacy root-level max_turns (backwards compat) - copy to
-            # agent.max_turns whenever the nested key is missing.
-            agent_file_config = file_config.get("agent")
-            if "max_turns" in file_config and not (
-                isinstance(agent_file_config, dict)
-                and agent_file_config.get("max_turns") is not None
-            ):
-                defaults["agent"]["max_turns"] = file_config["max_turns"]
-        except Exception as e:
-            logger.warning("Failed to load cli-config.yaml: %s", e)
+
+        # Second: carry over keys from file_config that aren't in defaults
+        # (e.g. platform_toolsets, provider_routing, memory, honcho, etc.)
+        for key in file_config:
+            if key not in defaults and key != "model":
+                defaults[key] = file_config[key]
+
+        # Handle legacy root-level max_turns (backwards compat) - copy to
+        # agent.max_turns whenever the nested key is missing.
+        agent_file_config = file_config.get("agent")
+        if "max_turns" in file_config and not (
+            isinstance(agent_file_config, dict)
+            and agent_file_config.get("max_turns") is not None
+        ):
+            defaults["agent"]["max_turns"] = file_config["max_turns"]
 
     # Expand ${ENV_VAR} references in config values before bridging to env vars.
     from hermes_cli.config import _expand_env_vars

@@ -9359,28 +9359,48 @@ def cmd_profile(args):
     action = getattr(args, "profile_action", None)
 
     if action is None:
-        # Bare `hermes profile` — show current profile status
+        # Bare `hermes profile` — show current profile status. Every field
+        # is computed from the active HERMES_HOME rather than searched in
+        # list_profiles(): the active home is authoritative for itself, and
+        # registered fleet runtimes live outside the listing's roots, so the
+        # old search either missed them or described a different profile.
+        from hermes_cli.profiles import (
+            _check_gateway_running,
+            _count_skills,
+            _read_config_model,
+            find_alias_for_profile,
+            read_profile_meta,
+        )
+        from hermes_constants import get_hermes_home
+
         profile_name = get_active_profile_name()
         dhh = display_hermes_home()
+        home = get_hermes_home()
         print(f"\nActive profile: {profile_name}")
         print(f"Path:           {dhh}")
 
-        profiles = list_profiles()
-        for p in profiles:
-            if p.name == profile_name or (profile_name == "default" and p.is_default):
-                if p.model:
-                    print(
-                        f"Model:          {p.model}"
-                        + (f" ({p.provider})" if p.provider else "")
-                    )
-                print(
-                    f"Gateway:        {'running' if p.gateway_running else 'stopped'}"
-                )
-                print(f"Skills:         {p.skill_count} installed")
-                if p.alias_path:
-                    alias_display = p.alias_name or p.name
-                    print(f"Alias:          {alias_display} → hermes -p {p.name}")
-                break
+        model, provider = _read_config_model(home, effective=True)
+        if model:
+            print(
+                f"Model:          {model}"
+                + (f" ({provider})" if provider else "")
+            )
+        print(
+            f"Gateway:        {'running' if _check_gateway_running(home) else 'stopped'}"
+        )
+        print(f"Skills:         {_count_skills(home)} installed")
+        meta = read_profile_meta(home)
+        config_meta = meta.get("config") if isinstance(meta, dict) else None
+        if isinstance(config_meta, dict) and config_meta.get("inherit_from"):
+            save_mode = config_meta.get("save_mode") or "delta"
+            print(
+                f"Config:         inherits from {config_meta['inherit_from']}"
+                f" (save mode: {save_mode})"
+            )
+        if profile_name not in ("default", "custom"):
+            alias_name = find_alias_for_profile(profile_name)
+            if alias_name:
+                print(f"Alias:          {alias_name} → hermes -p {profile_name}")
         print()
         return
 
@@ -9440,6 +9460,7 @@ def cmd_profile(args):
         clone_all = getattr(args, "clone_all", False)
         no_alias = getattr(args, "no_alias", False)
         no_skills = getattr(args, "no_skills", False)
+        inherit_config = getattr(args, "inherit_config", False)
 
         try:
             clone_from = getattr(args, "clone_from", None)
@@ -9452,6 +9473,7 @@ def cmd_profile(args):
                 no_alias=no_alias,
                 no_skills=no_skills,
                 description=getattr(args, "description", None),
+                inherit_config=inherit_config,
             )
             print(f"\nProfile '{name}' created at {profile_dir}")
 
@@ -9465,6 +9487,9 @@ def cmd_profile(args):
                     print(
                         f"Cloned config, .env, SOUL.md, and skills from {source_label}."
                     )
+            elif inherit_config:
+                print("Config inherits non-secret settings from the default profile.")
+                print("Only local overrides are written to this profile's config.yaml.")
 
             # Auto-clone Honcho config for the new profile (only with --clone/--clone-all)
             if clone or clone_all:
@@ -9530,6 +9555,10 @@ def cmd_profile(args):
             if clone or clone_all:
                 print(f"\n  Edit {profile_dir_display}/.env for different API keys")
                 print(f"  Edit {profile_dir_display}/SOUL.md for different personality")
+            elif inherit_config:
+                print(f"\n  Edit {profile_dir_display}/config.yaml for local overrides")
+                print(f"  Edit {profile_dir_display}/.env for this profile's API keys")
+                print(f"  Edit {profile_dir_display}/SOUL.md to customize personality")
             else:
                 print(
                     f"\n  ⚠ This profile has no API keys yet. Run '{name} setup' first,"
@@ -9541,6 +9570,108 @@ def cmd_profile(args):
         except (ValueError, FileExistsError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)
+
+    elif action == "config-inherit":
+        from hermes_cli import profiles as _profiles_mod
+
+        name = args.profile_name
+        inherit_from = getattr(args, "inherit_from", None)
+        try:
+            canon = _profiles_mod.normalize_profile_name(name)
+            if canon == "default":
+                raise ValueError("the default profile cannot inherit config from itself")
+            if inherit_from != "default":
+                raise ValueError("config inheritance currently supports only --from default")
+            if not _profiles_mod.profile_exists(canon):
+                raise FileNotFoundError(f"Profile '{canon}' does not exist.")
+            profile_dir = _profiles_mod.get_profile_dir(canon)
+            _profiles_mod.write_profile_meta(
+                profile_dir,
+                config_inherit_from="default",
+                config_save_mode="delta",
+            )
+            print(f"Config inheritance enabled for '{canon}' (from default, save mode: delta).")
+        except (ValueError, FileNotFoundError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    elif action == "config-uninherit":
+        from hermes_cli import profiles as _profiles_mod
+
+        name = args.profile_name
+        try:
+            canon = _profiles_mod.normalize_profile_name(name)
+            if canon == "default":
+                raise ValueError("the default profile does not inherit config")
+            if not _profiles_mod.profile_exists(canon):
+                raise FileNotFoundError(f"Profile '{canon}' does not exist.")
+            profile_dir = _profiles_mod.get_profile_dir(canon)
+            _profiles_mod.write_profile_meta(
+                profile_dir,
+                config_inherit_from=None,
+                config_save_mode=None,
+            )
+            print(f"Config inheritance disabled for '{canon}'.")
+        except (ValueError, FileNotFoundError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    elif action == "config-backfill":
+        from hermes_cli import profiles as _profiles_mod
+
+        roles = [
+            role.strip()
+            for role in str(getattr(args, "roles", "pm,scrum-master")).split(",")
+            if role.strip()
+        ]
+        profile_names = getattr(args, "profile_names", None) or None
+        apply_changes = bool(getattr(args, "apply", False))
+        prune_model = bool(getattr(args, "prune_model", False))
+        restart_services = bool(getattr(args, "restart_services", False))
+
+        try:
+            results = _profiles_mod.backfill_profile_config_inheritance(
+                profile_names=profile_names,
+                roles=roles,
+                apply=apply_changes,
+                prune_model=prune_model,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+        mode = "APPLY" if apply_changes else "DRY-RUN"
+        print(f"{mode}: profile config inheritance backfill")
+        if not results:
+            print("  no matching profiles")
+        for result in results:
+            actions = []
+            if result.inheritance_changed:
+                actions.append("inherit config")
+            if result.model_pruned:
+                model_label = result.local_model or "configured model"
+                if result.local_provider:
+                    model_label = f"{model_label} ({result.local_provider})"
+                actions.append(f"prune local model override: {model_label}")
+            if not actions:
+                actions.append("ok")
+            print(f"  {result.name}: {', '.join(actions)}")
+
+        changed = [result.name for result in results if result.changed]
+        if not apply_changes:
+            print("\ndry-run only. Re-run with --apply to write changes.")
+            if prune_model:
+                print("Local model overrides would be removed for listed prune actions.")
+            if restart_services and changed:
+                units = _profiles_mod.profile_config_backfill_units(changed)
+                print(f"Would try-restart {len(units)} conventional user units.")
+        elif restart_services and changed:
+            try:
+                units = _profiles_mod.restart_profile_config_backfill_services(changed)
+                print(f"\nRestarted {len(units)} conventional user units.")
+            except (RuntimeError, subprocess.CalledProcessError) as e:
+                print(f"\nWarning: service restart failed: {e}")
+        print(f"\nchanged profiles: {len(changed)}")
 
     elif action == "delete":
         name = args.profile_name
@@ -9663,17 +9794,20 @@ def cmd_profile(args):
             _read_distribution_meta,
             _get_wrapper_dir,
             find_alias_for_profile,
+            read_profile_meta,
         )
 
         if not profile_exists(name):
             print(f"Error: Profile '{name}' does not exist.")
             sys.exit(1)
         profile_dir = get_profile_dir(name)
-        model, provider = _read_config_model(profile_dir)
+        model, provider = _read_config_model(profile_dir, effective=True)
         gw = _check_gateway_running(profile_dir)
         skills = _count_skills(profile_dir)
         dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
         alias_name = find_alias_for_profile(name)
+        meta = read_profile_meta(profile_dir)
+        config_meta = meta.get("config") if isinstance(meta, dict) else {}
 
         print(f"\nProfile: {name}")
         print(f"Path:    {profile_dir}")
@@ -9687,6 +9821,10 @@ def cmd_profile(args):
         print(
             f"SOUL.md: {'exists' if (profile_dir / 'SOUL.md').exists() else 'not configured'}"
         )
+        if isinstance(config_meta, dict) and config_meta.get("inherit_from"):
+            inherit_from = config_meta.get("inherit_from")
+            save_mode = config_meta.get("save_mode") or "delta"
+            print(f"Config:  inherits from {inherit_from} (save mode: {save_mode})")
         if dist_name:
             print(f"Distribution: {dist_name}@{dist_version or '?'}")
             if dist_source:

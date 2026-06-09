@@ -28,7 +28,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from agent.skill_utils import is_excluded_skill_path
 
@@ -106,6 +106,7 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] = frozenset({
 # `hermes skills install` or drop SKILL.md files into the profile's skills/.
 # Delete the marker file to opt back in.
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+_META_UNSET = object()
 
 
 def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
@@ -503,6 +504,22 @@ class ProfileInfo:
     description_auto: bool = False
 
 
+@dataclass
+class ProfileConfigBackfillResult:
+    """Planned or applied inherited-config backfill for one profile."""
+
+    name: str
+    path: Path
+    inheritance_changed: bool = False
+    model_pruned: bool = False
+    local_model: Optional[str] = None
+    local_provider: Optional[str] = None
+
+    @property
+    def changed(self) -> bool:
+        return self.inheritance_changed or self.model_pruned
+
+
 def _read_distribution_meta(profile_dir: Path) -> tuple:
     """Return ``(name, version, source)`` from the profile's ``distribution.yaml``
     if present; ``(None, None, None)`` otherwise.
@@ -528,8 +545,38 @@ def _read_distribution_meta(profile_dir: Path) -> tuple:
         return None, None, None
 
 
-def _read_config_model(profile_dir: Path) -> tuple:
-    """Read model/provider from a profile's config.yaml. Returns (model, provider)."""
+def _model_from_config_dict(cfg: dict) -> tuple:
+    """Return (model, provider) from a loaded config dict."""
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, str):
+        return model_cfg, None
+    if isinstance(model_cfg, dict):
+        return (
+            model_cfg.get("default") or model_cfg.get("model"),
+            model_cfg.get("provider"),
+        )
+    return None, None
+
+
+def _read_config_model(profile_dir: Path, *, effective: bool = False) -> tuple:
+    """Read model/provider for a profile. Returns (model, provider).
+
+    By default this reads only the profile's local ``config.yaml``. With
+    ``effective=True``, inherited profiles resolve the merged default profile
+    config plus local delta so summary commands show the model Hermes will
+    actually use.
+    """
+    if effective:
+        try:
+            from hermes_cli.config import _load_user_config_layers, _normalize_root_model_keys
+
+            config_path = profile_dir / "config.yaml"
+            cfg, layer_paths = _load_user_config_layers(config_path)
+            if layer_paths:
+                return _model_from_config_dict(_normalize_root_model_keys(cfg))
+        except Exception:
+            pass
+
     config_path = profile_dir / "config.yaml"
     if not config_path.exists():
         return None, None
@@ -537,14 +584,181 @@ def _read_config_model(profile_dir: Path) -> tuple:
         import yaml
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, str):
-            return model_cfg, None
-        if isinstance(model_cfg, dict):
-            return model_cfg.get("default") or model_cfg.get("model"), model_cfg.get("provider")
-        return None, None
+        return _model_from_config_dict(cfg)
     except Exception:
         return None, None
+
+
+def _read_local_config(profile_dir: Path) -> dict:
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_local_config(profile_dir: Path, config: dict) -> None:
+    from utils import atomic_yaml_write
+
+    atomic_yaml_write(profile_dir / "config.yaml", config, sort_keys=False)
+
+
+def _profile_config_inherits_default(profile_dir: Path) -> bool:
+    meta = read_profile_meta(profile_dir)
+    config_meta = meta.get("config") if isinstance(meta, dict) else None
+    return (
+        isinstance(config_meta, dict)
+        and config_meta.get("inherit_from") == "default"
+        and (config_meta.get("save_mode") or "delta") == "delta"
+    )
+
+
+def _normalize_backfill_roles(roles: Optional[Iterable[str]]) -> tuple[str, ...]:
+    raw_roles = tuple(roles or ("pm", "scrum-master"))
+    normalized: list[str] = []
+    for role in raw_roles:
+        value = str(role).strip().lower()
+        if not value:
+            continue
+        if value not in {"pm", "scrum-master"}:
+            raise ValueError(
+                "config backfill roles currently support only 'pm' and 'scrum-master'"
+            )
+        normalized.append(value)
+    if not normalized:
+        raise ValueError("at least one role must be selected for config backfill")
+    return tuple(dict.fromkeys(normalized))
+
+
+def _profile_matches_backfill_roles(name: str, roles: tuple[str, ...]) -> bool:
+    return (
+        ("pm" in roles and name.endswith("-pm"))
+        or ("scrum-master" in roles and name.endswith("-scrum-master"))
+    )
+
+
+def _discover_backfill_profiles(
+    profile_names: Optional[Iterable[str]],
+    roles: tuple[str, ...],
+) -> list[str]:
+    if profile_names:
+        discovered: list[str] = []
+        for profile_name in profile_names:
+            canon = normalize_profile_name(profile_name)
+            if canon == "default":
+                raise ValueError("the default profile cannot inherit config from itself")
+            validate_profile_name(canon)
+            if not profile_exists(canon):
+                raise FileNotFoundError(f"Profile '{canon}' does not exist.")
+            discovered.append(canon)
+        return list(dict.fromkeys(discovered))
+
+    names: list[str] = []
+    profiles_root = _get_profiles_root()
+    if not profiles_root.is_dir():
+        return names
+    for entry in sorted(profiles_root.iterdir()):
+        name = entry.name
+        if not _PROFILE_ID_RE.match(name):
+            continue
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue
+        if _profile_matches_backfill_roles(name, roles):
+            names.append(name)
+    return names
+
+
+def backfill_profile_config_inheritance(
+    *,
+    profile_names: Optional[Iterable[str]] = None,
+    roles: Optional[Iterable[str]] = None,
+    apply: bool = False,
+    prune_model: bool = False,
+) -> list[ProfileConfigBackfillResult]:
+    """Plan or apply inherited-config metadata across existing profiles.
+
+    This is the fleet-maintenance counterpart to ``profile create
+    --inherit-config``. It is intentionally dry-run by default and only touches
+    ``profile.yaml`` plus, when requested, local ``config.yaml`` model blocks.
+    It does not infer from ``role.yaml`` or stale agent ids.
+    """
+    selected_roles = _normalize_backfill_roles(roles)
+    names = _discover_backfill_profiles(profile_names, selected_roles)
+    results: list[ProfileConfigBackfillResult] = []
+
+    for name in names:
+        profile_dir = get_profile_dir(name)
+        local_config = _read_local_config(profile_dir)
+        local_model, local_provider = _model_from_config_dict(local_config)
+        inheritance_changed = not _profile_config_inherits_default(profile_dir)
+        model_pruned = bool(prune_model and "model" in local_config)
+
+        result = ProfileConfigBackfillResult(
+            name=name,
+            path=profile_dir,
+            inheritance_changed=inheritance_changed,
+            model_pruned=model_pruned,
+            local_model=local_model,
+            local_provider=local_provider,
+        )
+
+        if apply:
+            if inheritance_changed:
+                write_profile_meta(
+                    profile_dir,
+                    config_inherit_from="default",
+                    config_save_mode="delta",
+                )
+            if model_pruned:
+                local_config.pop("model", None)
+                _write_local_config(profile_dir, local_config)
+
+        results.append(result)
+
+    return results
+
+
+def profile_config_backfill_units(profile_names: Iterable[str]) -> list[str]:
+    """Return conventional user service units affected by profile backfill."""
+    units: list[str] = []
+    for profile_name in profile_names:
+        canon = normalize_profile_name(profile_name)
+        units.extend(
+            [
+                f"hermes-{canon}-gateway.service",
+                f"hermes-{canon}-consumer.service",
+                f"hermes-{canon}-continuous-ticket-sentinel.service",
+                f"hermes-{canon}-continuous-ticket-sentinel.timer",
+            ]
+        )
+    return list(dict.fromkeys(units))
+
+
+def restart_profile_config_backfill_services(profile_names: Iterable[str]) -> list[str]:
+    """Try-restart conventional user services for backfilled profiles."""
+    units = profile_config_backfill_units(profile_names)
+    if not units:
+        return []
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        raise RuntimeError("systemctl not found; cannot restart profile services")
+
+    env = os.environ.copy()
+    get_uid = getattr(os, "get" + "uid", None)
+    if "XDG_RUNTIME_DIR" not in env and get_uid is not None:
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{get_uid()}"
+
+    subprocess.run([systemctl, "--user", "daemon-reload"], check=True, env=env)
+    subprocess.run([systemctl, "--user", "try-restart", *units], check=True, env=env)
+    return units
 
 
 def _check_gateway_running(profile_dir: Path) -> bool:
@@ -590,25 +804,32 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
 def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``<profile_dir>/profile.yaml`` and return a dict.
 
-    Returns ``{"description": "", "description_auto": False}`` when the
-    file is missing or unreadable. Never raises — a corrupt
-    profile.yaml on an unrelated profile must not break
+    Returns empty defaults when the file is missing or unreadable. Never
+    raises — a corrupt profile.yaml on an unrelated profile must not break
     ``hermes profile list``.
     """
+    empty = {"description": "", "description_auto": False, "config": {}}
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
-        return {"description": "", "description_auto": False}
+        return dict(empty)
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
-        return {"description": "", "description_auto": False}
+        return dict(empty)
     if not isinstance(data, dict):
-        return {"description": "", "description_auto": False}
+        return dict(empty)
+    config_meta = data.get("config")
+    if not isinstance(config_meta, dict):
+        config_meta = {}
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
+        "config": {
+            "inherit_from": config_meta.get("inherit_from"),
+            "save_mode": config_meta.get("save_mode"),
+        },
     }
 
 
@@ -617,6 +838,8 @@ def write_profile_meta(
     *,
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
+    config_inherit_from: object = _META_UNSET,
+    config_save_mode: object = _META_UNSET,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
@@ -641,6 +864,35 @@ def write_profile_meta(
         existing["description"] = description.strip()
     if description_auto is not None:
         existing["description_auto"] = bool(description_auto)
+    if config_inherit_from is not _META_UNSET or config_save_mode is not _META_UNSET:
+        config_meta = existing.get("config")
+        if not isinstance(config_meta, dict):
+            config_meta = {}
+
+        if config_inherit_from is not _META_UNSET:
+            if config_inherit_from is None:
+                config_meta.pop("inherit_from", None)
+            else:
+                if config_inherit_from != "default":
+                    raise ValueError(
+                        "config inheritance currently supports only inherit_from='default'"
+                    )
+                config_meta["inherit_from"] = config_inherit_from
+
+        if config_save_mode is not _META_UNSET:
+            if config_save_mode is None:
+                config_meta.pop("save_mode", None)
+            else:
+                if config_save_mode != "delta":
+                    raise ValueError(
+                        "config inheritance currently supports only save_mode='delta'"
+                    )
+                config_meta["save_mode"] = config_save_mode
+
+        if config_meta:
+            existing["config"] = config_meta
+        else:
+            existing.pop("config", None)
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(existing, f, sort_keys=False, default_flow_style=False)
 
@@ -657,7 +909,7 @@ def list_profiles() -> List[ProfileInfo]:
     # Default profile
     default_home = _get_default_hermes_home()
     if default_home.is_dir():
-        model, provider = _read_config_model(default_home)
+        model, provider = _read_config_model(default_home, effective=True)
         dist_name, dist_version, dist_source = _read_distribution_meta(default_home)
         meta = read_profile_meta(default_home)
         profiles.append(ProfileInfo(
@@ -687,7 +939,7 @@ def list_profiles() -> List[ProfileInfo]:
                 continue  # already added as the built-in default above
             if not _PROFILE_ID_RE.match(name):
                 continue
-            model, provider = _read_config_model(entry)
+            model, provider = _read_config_model(entry, effective=True)
             alias_name = find_alias_for_profile(name)
             if alias_name:
                 is_windows = sys.platform == "win32"
@@ -725,6 +977,7 @@ def create_profile(
     no_alias: bool = False,
     no_skills: bool = False,
     description: Optional[str] = None,
+    inherit_config: bool = False,
 ) -> Path:
     """Create a new profile directory.
 
@@ -757,6 +1010,11 @@ def create_profile(
         raise ValueError(
             "--no-skills is mutually exclusive with --clone / --clone-all "
             "(cloning explicitly copies skills from the source profile)."
+        )
+    if inherit_config and (clone_config or clone_all):
+        raise ValueError(
+            "--inherit-config is mutually exclusive with --clone / --clone-all "
+            "(inherited profiles keep only local config overrides)."
         )
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
@@ -858,18 +1116,22 @@ def create_profile(
         except OSError:
             pass  # best-effort — the feature still works via the empty skills/ dir
 
-    # Persist description if the caller provided one. Done last so a
-    # partial-create failure doesn't strand a description file in an
-    # incomplete profile.
-    if description and description.strip():
+    # Persist profile metadata if the caller provided any. Done last so a
+    # partial-create failure doesn't strand a metadata file in an incomplete
+    # profile.
+    if (description and description.strip()) or inherit_config:
         try:
             write_profile_meta(
                 profile_dir,
-                description=description.strip(),
-                description_auto=False,
+                description=description.strip() if description else None,
+                description_auto=False if description and description.strip() else None,
+                config_inherit_from="default" if inherit_config else _META_UNSET,
+                config_save_mode="delta" if inherit_config else _META_UNSET,
             )
         except Exception:
-            pass  # non-fatal — user can describe later with `hermes profile describe`
+            if inherit_config:
+                raise
+            pass  # non-fatal — user can update metadata later with `hermes profile`
 
     # Phase 4: when running inside a container under s6, register the
     # new profile's gateway as a runtime s6 service so
@@ -1286,20 +1548,42 @@ def get_active_profile_name() -> str:
     """Infer the current profile name from HERMES_HOME.
 
     Returns ``"default"`` if HERMES_HOME is not set or points to ``~/.hermes``.
-    Returns the profile name if HERMES_HOME points into ``~/.hermes/profiles/<name>``.
+    Returns the profile name if HERMES_HOME points into ``~/.hermes/profiles/<name>``
+    — including when that entry is a registry symlink whose physical target
+    lives elsewhere (the fleet repo-runtime pattern), and the converse: when
+    HERMES_HOME is the physical runtime path of a registered profile, the
+    registry name is returned.
     Returns ``"custom"`` if HERMES_HOME is set to an unrecognized path.
     """
-    from hermes_constants import get_hermes_home
+    from hermes_constants import find_registered_profile_for_home, get_hermes_home
     hermes_home = get_hermes_home()
+
+    # Lexical first: a registry entry under <root>/profiles IS the profile,
+    # even when it is a symlink that resolves outside the root. Resolving
+    # before classifying would misreport every symlinked profile as custom.
+    profiles_root = _get_profiles_root()
+    try:
+        rel = hermes_home.relative_to(profiles_root)
+        parts = rel.parts
+        if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
+            return parts[0]
+    except ValueError:
+        pass
+
+    # Fleet pattern: HERMES_HOME is the physical repo-runtime path that a
+    # registered profile symlink points at. Recover the registry name.
+    registered = find_registered_profile_for_home(hermes_home)
+    if registered:
+        return registered
+
     resolved = hermes_home.resolve()
 
     default_resolved = _get_default_hermes_home().resolve()
     if resolved == default_resolved:
         return "default"
 
-    profiles_root = _get_profiles_root().resolve()
     try:
-        rel = resolved.relative_to(profiles_root)
+        rel = resolved.relative_to(profiles_root.resolve())
         parts = rel.parts
         if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
             return parts[0]

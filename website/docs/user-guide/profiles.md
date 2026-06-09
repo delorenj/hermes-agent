@@ -66,6 +66,64 @@ Copies **everything** — config, API keys, personality, all memories, full sess
 hermes profile create work --clone --clone-from coder
 ```
 
+### Inherit non-secret config (`--inherit-config`)
+
+Picture a common local setup: `coder` handles repo work, `reviewer` reads pull
+requests, and `ops` watches gateways or cron jobs. You want all three profiles
+to move together when you change the default model, provider, toolsets, display
+skin, or terminal defaults. You don't want them to share API keys, `SOUL.md`,
+memories, sessions, gateway tokens, or cron history. `--inherit-config` gives
+you that shape: one shared config base with separate profile identities.
+
+Profiles are isolated by default. To opt a profile into the shared config base,
+create it with `--inherit-config`:
+
+```bash
+hermes profile create reviewer --inherit-config
+```
+
+From then on, changing a shared setting in the default profile changes the
+effective config for `reviewer` unless `reviewer` overrides that key:
+
+```bash
+hermes config set model.default anthropic/claude-sonnet-4
+hermes -p reviewer config get model.default
+```
+
+This records the inheritance choice in
+`~/.hermes/profiles/reviewer/profile.yaml`:
+
+```yaml
+config:
+  inherit_from: default
+  save_mode: delta
+```
+
+Only `config.yaml` inherits. API keys in `.env`, `SOUL.md`, memories,
+sessions, skills, gateway state, and cron state stay local to the profile. Use
+this for shared non-secret settings. Keep credentials in each profile's `.env`.
+
+Effective config uses this precedence:
+
+```text
+Hermes defaults < default profile config < active profile config < environment
+```
+
+The profile's `config.yaml` stores only local overrides. For example,
+`reviewer` can inherit the default model while starting in its own project:
+
+```yaml
+terminal:
+  cwd: /absolute/path/to/reviewer-project
+```
+
+You can opt an existing profile in or out later:
+
+```bash
+hermes profile config-inherit reviewer --from default
+hermes profile config-uninherit reviewer
+```
+
 :::tip Honcho memory + profiles
 When Honcho is enabled, `--clone` automatically creates a dedicated AI peer for the new profile while sharing the same user workspace. Each profile builds its own observations and identity. See [Honcho -- Multi-agent / Profiles](./features/memory-providers.md#honcho) for details.
 :::
@@ -187,6 +245,10 @@ Each profile has its own:
 - **`config.yaml`** — model, provider, toolsets, all settings
 - **`.env`** — API keys, bot tokens
 - **`SOUL.md`** — personality and instructions
+
+Profiles created with `--inherit-config` still have local `.env` and
+`SOUL.md` files. Their `config.yaml` contains only settings that override the
+default profile's config.
 
 ```bash
 coder config set model.default anthropic/claude-sonnet-4

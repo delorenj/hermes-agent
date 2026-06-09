@@ -32,11 +32,13 @@ Run `hermes setup --portal` — one OAuth gets you a model provider and all four
 ```bash
 hermes config              # View current configuration
 hermes config edit         # Open config.yaml in your editor
+hermes config get KEY      # Print one effective value
 hermes config set KEY VAL  # Set a specific value
 hermes config check        # Check for missing options (after updates)
 hermes config migrate      # Interactively add missing options
 
 # Examples:
+hermes config get model.default
 hermes config set model anthropic/claude-opus-4
 hermes config set terminal.backend docker
 hermes config set OPENROUTER_API_KEY sk-or-...  # Saves to .env

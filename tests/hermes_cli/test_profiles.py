@@ -8,10 +8,12 @@ and shell completion generation.
 import json
 import io
 import tarfile
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+import yaml
 
 from hermes_cli.profiles import (
     normalize_profile_name,
@@ -33,6 +35,10 @@ from hermes_cli.profiles import (
     seed_profile_skills,
     has_bundled_skills_opt_out,
     NO_BUNDLED_SKILLS_MARKER,
+    read_profile_meta,
+    write_profile_meta,
+    backfill_profile_config_inheritance,
+    profile_config_backfill_units,
 )
 
 
@@ -308,6 +314,230 @@ class TestCreateProfile:
         # SOUL.md is always seeded with the default even when clone source lacks it
         assert (profile_dir / "SOUL.md").exists()
 
+    def test_inherit_config_writes_profile_metadata(self, profile_env):
+        profile_dir = create_profile("coder", inherit_config=True, no_alias=True)
+
+        meta = read_profile_meta(profile_dir)
+
+        assert meta["config"]["inherit_from"] == "default"
+        assert meta["config"]["save_mode"] == "delta"
+        assert not (profile_dir / "config.yaml").exists()
+
+    def test_inherit_config_conflicts_with_clone(self, profile_env):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            create_profile(
+                "coder",
+                inherit_config=True,
+                clone_config=True,
+                no_alias=True,
+            )
+
+    def test_inherit_config_conflicts_with_clone_all(self, profile_env):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            create_profile(
+                "coder",
+                inherit_config=True,
+                clone_all=True,
+                no_alias=True,
+            )
+
+
+class TestProfileConfigMetadata:
+    """Tests for inherited-config metadata in profile.yaml."""
+
+    def test_write_profile_meta_preserves_unrelated_metadata(self, profile_env):
+        profile_dir = create_profile("coder", no_alias=True)
+        (profile_dir / "profile.yaml").write_text(
+            "description: Focused coder\n"
+            "description_auto: false\n"
+            "custom_field: keep-me\n"
+            "config:\n"
+            "  local_note: keep-this-too\n",
+            encoding="utf-8",
+        )
+
+        write_profile_meta(
+            profile_dir,
+            config_inherit_from="default",
+            config_save_mode="delta",
+        )
+
+        raw = yaml.safe_load((profile_dir / "profile.yaml").read_text(encoding="utf-8"))
+        assert raw["description"] == "Focused coder"
+        assert raw["custom_field"] == "keep-me"
+        assert raw["config"]["local_note"] == "keep-this-too"
+        assert raw["config"]["inherit_from"] == "default"
+        assert raw["config"]["save_mode"] == "delta"
+
+    def test_write_profile_meta_can_remove_inheritance_fields(self, profile_env):
+        profile_dir = create_profile("coder", no_alias=True)
+        write_profile_meta(
+            profile_dir,
+            description="Focused coder",
+            description_auto=False,
+            config_inherit_from="default",
+            config_save_mode="delta",
+        )
+
+        write_profile_meta(
+            profile_dir,
+            config_inherit_from=None,
+            config_save_mode=None,
+        )
+
+        meta = read_profile_meta(profile_dir)
+        assert meta["description"] == "Focused coder"
+        assert meta["config"]["inherit_from"] is None
+        assert meta["config"]["save_mode"] is None
+
+
+class TestProfileConfigInheritanceCommands:
+    """Tests for profile config inheritance CLI plumbing."""
+
+    def test_parser_source_exposes_inherit_config_surface(self):
+        import inspect
+        import hermes_cli.subcommands.profile as profile_subcommands
+
+        source = inspect.getsource(profile_subcommands.build_profile_parser)
+
+        assert "--inherit-config" in source
+        assert "config-inherit" in source
+        assert "config-uninherit" in source
+        assert "config-backfill" in source
+
+    def test_config_inherit_command_preserves_description(self, profile_env):
+        profile_dir = create_profile(
+            "coder",
+            no_alias=True,
+            description="Focused coder",
+        )
+        from hermes_cli.main import cmd_profile
+
+        cmd_profile(
+            SimpleNamespace(
+                profile_action="config-inherit",
+                profile_name="coder",
+                inherit_from="default",
+            )
+        )
+
+        meta = read_profile_meta(profile_dir)
+        assert meta["description"] == "Focused coder"
+        assert meta["config"]["inherit_from"] == "default"
+        assert meta["config"]["save_mode"] == "delta"
+
+    def test_config_uninherit_command_preserves_description(self, profile_env):
+        profile_dir = create_profile(
+            "coder",
+            inherit_config=True,
+            no_alias=True,
+            description="Focused coder",
+        )
+        from hermes_cli.main import cmd_profile
+
+        cmd_profile(
+            SimpleNamespace(
+                profile_action="config-uninherit",
+                profile_name="coder",
+            )
+        )
+
+        meta = read_profile_meta(profile_dir)
+        assert meta["description"] == "Focused coder"
+        assert meta["config"]["inherit_from"] is None
+        assert meta["config"]["save_mode"] is None
+
+    def test_profile_show_prints_inheritance_state(self, profile_env, capsys):
+        (profile_env / ".hermes" / "config.yaml").write_text(
+            "model:\n"
+            "  default: inherited-model\n"
+            "  provider: openrouter\n",
+            encoding="utf-8",
+        )
+        create_profile("coder", inherit_config=True, no_alias=True)
+        from hermes_cli.main import cmd_profile
+
+        cmd_profile(SimpleNamespace(profile_action="show", profile_name="coder"))
+
+        out = capsys.readouterr().out
+        assert "Model:   inherited-model (openrouter)" in out
+        assert "Config:  inherits from default (save mode: delta)" in out
+
+
+class TestProfileConfigBackfill:
+    """Tests for the fleet config-inheritance backfill workflow."""
+
+    def test_dry_run_discovers_role_profiles_without_writing(self, profile_env):
+        profile_dir = create_profile("alpha-pm", no_alias=True)
+        create_profile("alpha-dev", no_alias=True)
+        (profile_dir / "config.yaml").write_text(
+            "model:\n"
+            "  default: local-model\n"
+            "  provider: openrouter\n"
+            "terminal:\n"
+            "  cwd: /workspace/alpha\n",
+            encoding="utf-8",
+        )
+
+        results = backfill_profile_config_inheritance(
+            roles=["pm"],
+            prune_model=True,
+        )
+
+        assert [result.name for result in results] == ["alpha-pm"]
+        assert results[0].inheritance_changed is True
+        assert results[0].model_pruned is True
+        assert not (profile_dir / "profile.yaml").exists()
+        saved = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+        assert "model" in saved
+
+    def test_apply_writes_metadata_and_prunes_local_model(self, profile_env):
+        profile_dir = create_profile("alpha-pm", no_alias=True)
+        (profile_dir / "config.yaml").write_text(
+            "model:\n"
+            "  default: local-model\n"
+            "terminal:\n"
+            "  cwd: /workspace/alpha\n",
+            encoding="utf-8",
+        )
+
+        results = backfill_profile_config_inheritance(
+            roles=["pm"],
+            apply=True,
+            prune_model=True,
+        )
+
+        assert results[0].changed is True
+        meta = read_profile_meta(profile_dir)
+        assert meta["config"]["inherit_from"] == "default"
+        assert meta["config"]["save_mode"] == "delta"
+        saved = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+        assert saved == {"terminal": {"cwd": "/workspace/alpha"}}
+
+    def test_explicit_profile_target_does_not_need_role_suffix(self, profile_env):
+        profile_dir = create_profile("utility", no_alias=True)
+
+        results = backfill_profile_config_inheritance(
+            profile_names=["utility"],
+            roles=["pm"],
+            apply=True,
+        )
+
+        assert [result.name for result in results] == ["utility"]
+        meta = read_profile_meta(profile_dir)
+        assert meta["config"]["inherit_from"] == "default"
+        assert meta["config"]["save_mode"] == "delta"
+
+    def test_backfill_units_are_conventional_profile_units(self):
+        units = profile_config_backfill_units(["alpha-pm"])
+
+        assert units == [
+            "hermes-alpha-pm-gateway.service",
+            "hermes-alpha-pm-consumer.service",
+            "hermes-alpha-pm-continuous-ticket-sentinel.service",
+            "hermes-alpha-pm-continuous-ticket-sentinel.timer",
+        ]
+
 
 # ===================================================================
 # TestNoSkillsOptOut
@@ -477,6 +707,20 @@ class TestListProfiles:
         assert profiles[0].name == "default"
         assert profiles[0].is_default is True
 
+    def test_inherited_profile_lists_effective_default_model(self, profile_env):
+        (profile_env / ".hermes" / "config.yaml").write_text(
+            "model:\n"
+            "  default: inherited-model\n"
+            "  provider: openrouter\n",
+            encoding="utf-8",
+        )
+        create_profile("coder", inherit_config=True, no_alias=True)
+
+        profiles = {p.name: p for p in list_profiles()}
+
+        assert profiles["coder"].model == "inherited-model"
+        assert profiles["coder"].provider == "openrouter"
+
 
 # ===================================================================
 # TestActiveProfile
@@ -542,6 +786,32 @@ class TestGetActiveProfileName:
         # not "custom".  The user is on the default profile of their
         # custom deployment.
         assert get_active_profile_name() == "default"
+
+    def _register_fleet_runtime(self, tmp_path, name="repo-pm"):
+        """Create a repo-local runtime and its registry symlink."""
+        runtime = tmp_path / "code" / "repo" / "agents" / "hermes" / "pm" / "runtime"
+        runtime.mkdir(parents=True)
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        profiles_root.mkdir(parents=True, exist_ok=True)
+        (profiles_root / name).symlink_to(runtime, target_is_directory=True)
+        return runtime
+
+    def test_registered_runtime_path_returns_registry_name(self, profile_env, monkeypatch):
+        """Fleet pattern: physical runtime path maps back to its registry name."""
+        tmp_path = profile_env
+        runtime = self._register_fleet_runtime(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(runtime))
+        assert get_active_profile_name() == "repo-pm"
+
+    def test_registry_symlink_path_returns_profile_name(self, profile_env, monkeypatch):
+        """A symlinked profile entry keeps its name even though it resolves
+        outside the profiles root."""
+        tmp_path = profile_env
+        self._register_fleet_runtime(tmp_path)
+        monkeypatch.setenv(
+            "HERMES_HOME", str(tmp_path / ".hermes" / "profiles" / "repo-pm")
+        )
+        assert get_active_profile_name() == "repo-pm"
 
 
 # ===================================================================

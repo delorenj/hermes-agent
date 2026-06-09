@@ -1,6 +1,7 @@
 """Tests for hermes_cli configuration management."""
 
 import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from hermes_cli.config import (
     get_hermes_home,
     ensure_hermes_home,
     get_compatible_custom_providers,
+    get_config_value,
     load_config,
     load_env,
     migrate_config,
@@ -81,6 +83,272 @@ class TestLoadConfigDefaults:
             config = load_config()
             assert config["agent"]["max_turns"] == 42
             assert "max_turns" not in config
+
+
+class TestProfileConfigInheritance:
+    def _profile(self, tmp_path, *, inherit: bool = True):
+        root = tmp_path / ".hermes"
+        profile = root / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        if inherit:
+            (profile / "profile.yaml").write_text(
+                "config:\n"
+                "  inherit_from: default\n"
+                "  save_mode: delta\n",
+                encoding="utf-8",
+            )
+        return root, profile
+
+    def test_named_profile_without_opt_in_does_not_inherit_root_config(self, tmp_path):
+        root, profile = self._profile(tmp_path, inherit=False)
+
+        (root / "config.yaml").write_text(
+            "model:\n"
+            "  default: root-model\n"
+            "agent:\n"
+            "  max_turns: 123\n",
+            encoding="utf-8",
+        )
+        (profile / "config.yaml").write_text(
+            "terminal:\n"
+            "  cwd: /workspace/coder\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            config = load_config()
+
+        assert config["model"] == DEFAULT_CONFIG["model"]
+        assert config["agent"]["max_turns"] == DEFAULT_CONFIG["agent"]["max_turns"]
+        assert config["terminal"]["cwd"] == "/workspace/coder"
+
+    def test_profile_load_inherits_root_config_then_applies_profile_delta(self, tmp_path):
+        root, profile = self._profile(tmp_path)
+
+        (root / "config.yaml").write_text(
+            "agent:\n"
+            "  max_turns: 123\n"
+            "terminal:\n"
+            "  timeout: 456\n"
+            "model:\n"
+            "  default: root-model\n"
+            "toolsets:\n"
+            "  - terminal\n",
+            encoding="utf-8",
+        )
+        (profile / "config.yaml").write_text(
+            "terminal:\n"
+            "  cwd: /workspace/coder\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            config = load_config()
+
+        assert config["agent"]["max_turns"] == 123
+        assert config["terminal"]["timeout"] == 456
+        assert config["terminal"]["cwd"] == "/workspace/coder"
+        assert config["model"]["default"] == "root-model"
+        assert config["toolsets"] == ["terminal"]
+
+    def _fleet_runtime(self, tmp_path, *, register: bool = True, inherit: bool = True):
+        """Repo-local runtime registered as a profile via a registry symlink."""
+        root = tmp_path / ".hermes"
+        runtime = tmp_path / "code" / "repo" / "agents" / "hermes" / "pm" / "runtime"
+        runtime.mkdir(parents=True)
+        (root / "profiles").mkdir(parents=True, exist_ok=True)
+        if register:
+            (root / "profiles" / "repo-pm").symlink_to(
+                runtime, target_is_directory=True
+            )
+        if inherit:
+            (runtime / "profile.yaml").write_text(
+                "config:\n"
+                "  inherit_from: default\n"
+                "  save_mode: delta\n",
+                encoding="utf-8",
+            )
+        return root, runtime
+
+    def test_registered_fleet_runtime_inherits_root_config(self, tmp_path, monkeypatch):
+        """A raw runtime HERMES_HOME inherits when a registry symlink points at it."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        root, runtime = self._fleet_runtime(tmp_path)
+        (root / "config.yaml").write_text(
+            "model:\n"
+            "  default: fleet-model\n"
+            "agent:\n"
+            "  max_turns: 77\n",
+            encoding="utf-8",
+        )
+        (runtime / "config.yaml").write_text(
+            "terminal:\n"
+            "  cwd: /workspace/repo\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(runtime)}):
+            config = load_config()
+
+        assert config["model"]["default"] == "fleet-model"
+        assert config["agent"]["max_turns"] == 77
+        assert config["terminal"]["cwd"] == "/workspace/repo"
+
+    def test_unregistered_runtime_does_not_inherit_root_config(self, tmp_path, monkeypatch):
+        """Without a registry symlink, a raw runtime stays isolated even if
+        its profile.yaml opts in — registration is what marks it a profile."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        root, runtime = self._fleet_runtime(tmp_path, register=False)
+        (root / "config.yaml").write_text(
+            "model:\n"
+            "  default: fleet-model\n",
+            encoding="utf-8",
+        )
+        (runtime / "config.yaml").write_text(
+            "terminal:\n"
+            "  cwd: /workspace/repo\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(runtime)}):
+            config = load_config()
+
+        assert config["model"] == DEFAULT_CONFIG["model"]
+        assert config["terminal"]["cwd"] == "/workspace/repo"
+
+    def test_profile_save_writes_only_delta_from_inherited_root_config(self, tmp_path):
+        root, profile = self._profile(tmp_path)
+
+        (root / "config.yaml").write_text(
+            "agent:\n"
+            "  max_turns: 123\n"
+            "terminal:\n"
+            "  timeout: 456\n",
+            encoding="utf-8",
+        )
+        (profile / "config.yaml").write_text(
+            "terminal:\n"
+            "  cwd: /workspace/coder\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            config = load_config()
+            config["terminal"]["cwd"] = "/workspace/renamed"
+            config["agent"]["max_turns"] = 123
+            save_config(config)
+
+        saved = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+        assert saved == {"terminal": {"cwd": "/workspace/renamed"}}
+
+    def test_default_config_update_invalidates_inherited_profile_cache(self, tmp_path):
+        root, profile = self._profile(tmp_path)
+
+        (root / "config.yaml").write_text(
+            "model:\n"
+            "  default: first-model\n",
+            encoding="utf-8",
+        )
+        (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            assert load_config()["model"]["default"] == "first-model"
+            time.sleep(0.01)
+            (root / "config.yaml").write_text(
+                "model:\n"
+                "  default: second-model\n",
+                encoding="utf-8",
+            )
+            assert load_config()["model"]["default"] == "second-model"
+
+    def test_invalid_inherit_from_fails_clearly(self, tmp_path):
+        root, profile = self._profile(tmp_path, inherit=False)
+        (root / "config.yaml").write_text("model: root\n", encoding="utf-8")
+        (profile / "profile.yaml").write_text(
+            "config:\n"
+            "  inherit_from: other-profile\n"
+            "  save_mode: delta\n",
+            encoding="utf-8",
+        )
+        (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            with pytest.raises(ValueError, match="inherit_from must be 'default'"):
+                load_config()
+
+    def test_legacy_root_max_turns_normalizes_in_inherited_layers(self, tmp_path):
+        root, profile = self._profile(tmp_path)
+
+        (root / "config.yaml").write_text("max_turns: 42\n", encoding="utf-8")
+        (profile / "config.yaml").write_text("max_turns: 13\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            config = load_config()
+
+        assert config["agent"]["max_turns"] == 13
+        assert "max_turns" not in config
+
+    def test_load_cli_config_matches_load_config_for_inherited_model(
+        self, tmp_path, monkeypatch
+    ):
+        root, profile = self._profile(tmp_path)
+
+        (root / "config.yaml").write_text(
+            "model:\n"
+            "  default: inherited-model\n"
+            "  provider: openrouter\n",
+            encoding="utf-8",
+        )
+        (profile / "config.yaml").write_text(
+            "terminal:\n"
+            "  cwd: /workspace/coder\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        effective = load_config()
+
+        import cli
+
+        monkeypatch.setattr(cli, "_hermes_home", profile)
+        cli_config = cli.load_cli_config()
+
+        assert cli_config["model"]["default"] == effective["model"]["default"]
+        assert cli_config["model"]["provider"] == effective["model"]["provider"]
+
+    def test_config_get_reads_effective_inherited_value(self, tmp_path, capsys):
+        root, profile = self._profile(tmp_path)
+
+        (root / "config.yaml").write_text(
+            "model:\n"
+            "  default: inherited-model\n",
+            encoding="utf-8",
+        )
+        (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            get_config_value("model.default")
+
+        assert capsys.readouterr().out.strip() == "inherited-model"
+
+    def test_broken_inherited_yaml_warns_and_profile_layer_still_applies(self, tmp_path, capsys):
+        from hermes_cli import config as cfg_mod
+
+        cfg_mod._CONFIG_PARSE_WARNED.clear()
+        root, profile = self._profile(tmp_path)
+
+        (root / "config.yaml").write_text("\tbroken inherited:\n", encoding="utf-8")
+        (profile / "config.yaml").write_text(
+            "model:\n"
+            "  default: profile-model\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile)}):
+            config = load_config()
+
+        assert config["model"]["default"] == "profile-model"
+        assert "hermes config:" in capsys.readouterr().err
 
 
 class TestLoadConfigParseFailure:
@@ -389,7 +657,7 @@ class TestSaveConfigAtomicity:
 
             # Read raw YAML to verify it's valid and correct
             config_path = tmp_path / "config.yaml"
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 raw = yaml.safe_load(f)
             assert raw["model"] == "test/atomic-model"
             assert raw["agent"]["max_turns"] == 77

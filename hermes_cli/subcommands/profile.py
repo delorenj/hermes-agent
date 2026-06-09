@@ -43,6 +43,11 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
         help="Full copy of active profile (all state)",
     )
     profile_create.add_argument(
+        "--inherit-config",
+        action="store_true",
+        help="Inherit non-secret config.yaml settings from the default profile",
+    )
+    profile_create.add_argument(
         "--clone-from",
         metavar="SOURCE",
         help="Source profile to clone from (default: active)",
@@ -105,6 +110,55 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
 
     profile_show = profile_subparsers.add_parser("show", help="Show profile details")
     profile_show.add_argument("profile_name", help="Profile to show")
+
+    profile_config_inherit = profile_subparsers.add_parser(
+        "config-inherit",
+        help="Opt a profile into inheriting config.yaml from default",
+    )
+    profile_config_inherit.add_argument("profile_name", help="Profile to update")
+    profile_config_inherit.add_argument(
+        "--from",
+        dest="inherit_from",
+        required=True,
+        choices=["default"],
+        help="Config source profile (v1 supports only: default)",
+    )
+
+    profile_config_uninherit = profile_subparsers.add_parser(
+        "config-uninherit",
+        help="Stop inheriting config.yaml for a profile",
+    )
+    profile_config_uninherit.add_argument("profile_name", help="Profile to update")
+
+    profile_config_backfill = profile_subparsers.add_parser(
+        "config-backfill",
+        help="Backfill inherited config metadata across existing profiles",
+    )
+    profile_config_backfill.add_argument(
+        "profile_names",
+        nargs="*",
+        help="Specific profiles to target. Defaults to profiles matching --roles.",
+    )
+    profile_config_backfill.add_argument(
+        "--roles",
+        default="pm,scrum-master",
+        help="Comma-separated conventional roles to discover: pm,scrum-master",
+    )
+    profile_config_backfill.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write profile.yaml/config.yaml changes. Without this, only prints a plan.",
+    )
+    profile_config_backfill.add_argument(
+        "--prune-model",
+        action="store_true",
+        help="Remove local config.yaml model blocks so model settings inherit from default.",
+    )
+    profile_config_backfill.add_argument(
+        "--restart-services",
+        action="store_true",
+        help="After --apply, try-restart conventional user services for changed profiles.",
+    )
 
     profile_alias = profile_subparsers.add_parser(
         "alias", help="Manage wrapper scripts"

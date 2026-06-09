@@ -223,7 +223,7 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # save_config() + migrate_config() write via atomic_yaml_write which
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+_LOAD_CONFIG_CACHE: Dict[str, Tuple[Tuple[Any, ...], Dict[str, Any]]] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -662,6 +662,156 @@ def _chown_to_hermes_uid(path) -> None:
         # the entrypoint's startup chown -R will fix it on next restart.
         pass
 
+
+@dataclass(frozen=True)
+class _ConfigInheritance:
+    """Resolved opt-in config inheritance for a named profile."""
+
+    profile_dir: Path
+    profile_meta_path: Path
+    base_config_path: Path
+    inherit_from: str
+    save_mode: str
+
+
+def _profile_dir_for_config_path(config_path: Path) -> Optional[Path]:
+    """Return the named profile dir for ``.../profiles/<name>/config.yaml``."""
+    if config_path.name != "config.yaml":
+        return None
+    profile_dir = config_path.parent
+    if profile_dir.parent.name != "profiles":
+        return None
+    return profile_dir
+
+
+def _resolve_profile_config_inheritance(config_path: Path) -> Optional[_ConfigInheritance]:
+    """Return inherited-config metadata when a named profile opted in.
+
+    Profile isolation remains the default. Only a ``profile.yaml`` containing
+    ``config.inherit_from: default`` enables inheritance, and v1 supports only
+    the default profile as the base.
+
+    Two layouts qualify as a named profile: a directory lexically under
+    ``<root>/profiles/`` (including registry symlinks), and the fleet
+    pattern — a repo-local runtime directory that a symlink under the
+    native ``~/.hermes/profiles/`` registry points at. Launchers export the
+    physical runtime path as ``HERMES_HOME``, so the lexical check alone
+    would silently disable inheritance for every deployed fleet agent.
+    """
+    fleet_registered = False
+    profile_dir = _profile_dir_for_config_path(config_path)
+    if profile_dir is None:
+        if config_path.name == "config.yaml":
+            from hermes_constants import find_registered_profile_for_home
+
+            if find_registered_profile_for_home(config_path.parent):
+                profile_dir = config_path.parent
+                fleet_registered = True
+    if profile_dir is None:
+        return None
+
+    try:
+        from hermes_cli.profiles import read_profile_meta
+
+        meta = read_profile_meta(profile_dir)
+    except Exception:
+        return None
+
+    config_meta = meta.get("config") if isinstance(meta, dict) else None
+    if not isinstance(config_meta, dict):
+        return None
+
+    inherit_from = config_meta.get("inherit_from")
+    if not inherit_from:
+        return None
+    if inherit_from != "default":
+        raise ValueError(
+            f"Unsupported config inheritance for profile '{profile_dir.name}': "
+            f"config.inherit_from must be 'default' (got {inherit_from!r})."
+        )
+
+    save_mode = config_meta.get("save_mode") or "delta"
+    if save_mode != "delta":
+        raise ValueError(
+            f"Unsupported config save mode for profile '{profile_dir.name}': "
+            f"config.save_mode must be 'delta' (got {save_mode!r})."
+        )
+
+    if fleet_registered:
+        from hermes_constants import _get_platform_default_hermes_home
+
+        base_config_path = _get_platform_default_hermes_home() / "config.yaml"
+    else:
+        base_config_path = profile_dir.parent.parent / "config.yaml"
+    # A registry entry symlinked at the native home itself would make the
+    # profile inherit from its own config — refuse rather than double-merge.
+    if base_config_path == config_path:
+        return None
+
+    return _ConfigInheritance(
+        profile_dir=profile_dir,
+        profile_meta_path=profile_dir / "profile.yaml",
+        base_config_path=base_config_path,
+        inherit_from=inherit_from,
+        save_mode=save_mode,
+    )
+
+
+def _read_config_file(config_path: Path) -> Dict[str, Any]:
+    """Read a YAML config file without merging defaults."""
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        _warn_config_parse_failure(config_path, e)
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def _normalize_loaded_user_config(user_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize legacy keys before merging a user-owned config layer."""
+    user_config = dict(user_config)
+    if "max_turns" in user_config:
+        agent_user_config = dict(user_config.get("agent") or {})
+        if agent_user_config.get("max_turns") is None:
+            agent_user_config["max_turns"] = user_config["max_turns"]
+        user_config["agent"] = agent_user_config
+        user_config.pop("max_turns", None)
+    return user_config
+
+
+def _should_ignore_user_config() -> bool:
+    return os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
+
+
+def _load_user_config_layers(config_path: Path) -> Tuple[Dict[str, Any], List[Path]]:
+    """Load and merge user-owned config layers for ``config_path``.
+
+    Returns ``(merged_config, layer_paths)`` without applying
+    :data:`DEFAULT_CONFIG`. For inherited profiles the layer order is:
+    default profile config, then active profile override config.
+    """
+    if _should_ignore_user_config():
+        return {}, []
+
+    merged: Dict[str, Any] = {}
+    layer_paths: List[Path] = []
+    inheritance = _resolve_profile_config_inheritance(config_path)
+
+    if inheritance is not None and inheritance.base_config_path.exists():
+        base_config = _normalize_loaded_user_config(
+            _read_config_file(inheritance.base_config_path)
+        )
+        merged = _deep_merge(merged, base_config)
+        layer_paths.append(inheritance.base_config_path)
+
+    if config_path.exists():
+        active_config = _normalize_loaded_user_config(_read_config_file(config_path))
+        merged = _deep_merge(merged, active_config)
+        layer_paths.append(config_path)
+
+    return merged, layer_paths
 
 def _secure_dir(path):
     """Set directory to owner-only access (0700 by default). No-op on Windows.
@@ -5028,6 +5178,95 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+_NO_DELTA = object()
+
+
+def _stat_cache_part(path: Path) -> Tuple[int, int]:
+    try:
+        st = path.stat()
+        return st.st_mtime_ns, st.st_size
+    except (FileNotFoundError, OSError):
+        return 0, 0
+
+
+def _cache_key_for_config(config_path: Path) -> Optional[Tuple[Any, ...]]:
+    if _should_ignore_user_config():
+        return ("ignore-user-config",)
+
+    config_part = _stat_cache_part(config_path)
+    inheritance = _resolve_profile_config_inheritance(config_path)
+    profile_dir = _profile_dir_for_config_path(config_path)
+
+    if inheritance is None and config_part == (0, 0):
+        return None
+
+    parts: List[Any] = [str(config_path), *config_part]
+    if profile_dir is not None:
+        meta_path = profile_dir / "profile.yaml"
+        parts.extend([str(meta_path), *_stat_cache_part(meta_path)])
+
+    if inheritance is not None:
+        parts.extend([
+            "inherit",
+            inheritance.inherit_from,
+            inheritance.save_mode,
+            str(inheritance.base_config_path),
+            *_stat_cache_part(inheritance.base_config_path),
+        ])
+
+    return tuple(parts)
+
+
+def _load_inherited_config_base(config_path: Path) -> Dict[str, Any]:
+    """Return DEFAULT_CONFIG plus an opted-in profile's inherited base."""
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    inheritance = _resolve_profile_config_inheritance(config_path)
+    if inheritance is None or not inheritance.base_config_path.exists():
+        return config
+
+    shared_config = _normalize_loaded_user_config(
+        _read_config_file(inheritance.base_config_path)
+    )
+    return _deep_merge(config, shared_config)
+
+
+def _config_delta(base_effective: Any, current_effective: Any, current_to_write: Any) -> Any:
+    """Return only values from ``current`` that differ from ``base``."""
+    if current_effective == base_effective:
+        return _NO_DELTA
+
+    if isinstance(base_effective, dict) and isinstance(current_effective, dict):
+        result: Dict[str, Any] = {}
+        write_map = current_to_write if isinstance(current_to_write, dict) else current_effective
+        for key, value in current_effective.items():
+            child = _config_delta(
+                base_effective.get(key),
+                value,
+                write_map.get(key) if isinstance(write_map, dict) else value,
+            )
+            if child is not _NO_DELTA:
+                result[key] = child
+        return result if result else _NO_DELTA
+
+    return current_to_write
+
+
+def _profile_delta_for_save(config_path: Path, effective_config: Dict[str, Any], write_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Prune inherited defaults from a profile config before persisting it."""
+    inheritance = _resolve_profile_config_inheritance(config_path)
+    if inheritance is None:
+        return write_config
+
+    base_effective = _expand_env_vars(
+        _normalize_root_model_keys(
+            _normalize_max_turns_config(_load_inherited_config_base(config_path))
+        )
+    )
+    current_effective = _expand_env_vars(effective_config)
+    delta = _config_delta(base_effective, current_effective, write_config)
+    return {} if delta is _NO_DELTA else delta
+
+
 def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:
     """Traverse nested dict keys safely, returning ``default`` on any miss.
 
@@ -5247,33 +5486,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         config_path = get_config_path()
         path_key = str(config_path)
 
-        try:
-            st = config_path.stat()
-            cache_key: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
-        except FileNotFoundError:
-            cache_key = None
+        cache_key = _cache_key_for_config(config_path)
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_key is not None and cached[:2] == cache_key:
-            return copy.deepcopy(cached[2]) if want_deepcopy else cached[2]
+        if cached is not None and cache_key is not None and cached[0] == cache_key:
+            return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
-
-        if cache_key is not None:
-            try:
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
-
-                if "max_turns" in user_config:
-                    agent_user_config = dict(user_config.get("agent") or {})
-                    if agent_user_config.get("max_turns") is None:
-                        agent_user_config["max_turns"] = user_config["max_turns"]
-                    user_config["agent"] = agent_user_config
-                    user_config.pop("max_turns", None)
-
-                config = _deep_merge(config, user_config)
-            except Exception as e:
-                _warn_config_parse_failure(config_path, e)
+        user_config, _ = _load_user_config_layers(config_path)
+        if user_config:
+            config = _deep_merge(config, user_config)
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
@@ -5284,7 +5506,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # cached value, and ``load_config_readonly()`` (deepcopy=False)
             # callers all see the same stable cached object.
             cached_copy = copy.deepcopy(expanded)
-            _LOAD_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], cached_copy)
+            _LOAD_CONFIG_CACHE[path_key] = (cache_key, cached_copy)
             # On the readonly path return the same cached object subsequent
             # calls will see — keeps "two readonly calls return the same
             # object" invariant that callers may rely on for identity checks.
@@ -5395,20 +5617,24 @@ def save_config(config: Dict[str, Any]):
                 _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
             )
 
+        profile_scoped = _resolve_profile_config_inheritance(config_path) is not None
+        normalized = _profile_delta_for_save(config_path, current_normalized, normalized)
+
         # Build optional commented-out sections for features that are off by
         # default or only relevant when explicitly configured.
         parts = []
-        sec = normalized.get("security", {})
-        if not sec or sec.get("redact_secrets") is None:
-            parts.append(_SECURITY_COMMENT)
-        fb = normalized.get("fallback_model", {})
-        fb_is_valid = False
-        if isinstance(fb, list):
-            fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
-        elif isinstance(fb, dict):
-            fb_is_valid = bool(fb.get("provider") and fb.get("model"))
-        if not fb_is_valid:
-            parts.append(_FALLBACK_COMMENT)
+        if not profile_scoped:
+            sec = normalized.get("security", {})
+            if not sec or sec.get("redact_secrets") is None:
+                parts.append(_SECURITY_COMMENT)
+            fb = normalized.get("fallback_model", {})
+            fb_is_valid = False
+            if isinstance(fb, list):
+                fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
+            elif isinstance(fb, dict):
+                fb_is_valid = bool(fb.get("provider") and fb.get("model"))
+            if not fb_is_valid:
+                parts.append(_FALLBACK_COMMENT)
 
         atomic_yaml_write(
             config_path,
@@ -6136,6 +6362,26 @@ def set_config_value(key: str, value: str):
     print(f"✓ Set {key} = {value} in {config_path}")
 
 
+_MISSING_CONFIG_VALUE = object()
+
+
+def get_config_value(key: str):
+    """Print a single effective configuration value."""
+    config = load_config()
+    value = cfg_get(config, *key.split("."), default=_MISSING_CONFIG_VALUE)
+    if value is _MISSING_CONFIG_VALUE:
+        print(f"Config key not found: {key}", file=sys.stderr)
+        sys.exit(1)
+    if isinstance(value, (dict, list)):
+        print(yaml.safe_dump(value, sort_keys=False).rstrip())
+    elif value is None:
+        print("null")
+    elif isinstance(value, bool):
+        print(str(value).lower())
+    else:
+        print(value)
+
+
 # =============================================================================
 # Command handler
 # =============================================================================
@@ -6162,6 +6408,13 @@ def config_command(args):
             print("  hermes config set OPENROUTER_API_KEY sk-or-...")
             sys.exit(1)
         set_config_value(key, value)
+
+    elif subcmd == "get":
+        key = getattr(args, 'key', None)
+        if not key:
+            print("Usage: hermes config get <key>")
+            sys.exit(1)
+        get_config_value(key)
     
     elif subcmd == "path":
         print(get_config_path())

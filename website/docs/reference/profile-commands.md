@@ -22,6 +22,9 @@ Top-level command for managing profiles. Running `hermes profile` without a subc
 | `describe` | Read or set a profile's description (used by the kanban orchestrator for routing). |
 | `delete` | Delete a profile. |
 | `show` | Show details about a profile. |
+| `config-inherit` | Opt a profile into inheriting `config.yaml` from `default`. |
+| `config-backfill` | Backfill inherited `config.yaml` metadata across existing profiles. |
+| `config-uninherit` | Stop inheriting `config.yaml` for a profile. |
 | `alias` | Regenerate the shell alias for a profile. |
 | `rename` | Rename a profile. |
 | `export` | Export a profile to a tar.gz archive. |
@@ -82,6 +85,7 @@ Creates a new profile.
 | `<name>` | Name for the new profile. Must be a valid directory name (alphanumeric, hyphens, underscores). |
 | `--clone` | Copy `config.yaml`, `.env`, and `SOUL.md` from the current profile. |
 | `--clone-all` | Copy everything (config, memories, skills, sessions, state) from the current profile. |
+| `--inherit-config` | Inherit non-secret `config.yaml` settings from the default profile. Mutually exclusive with `--clone` and `--clone-all`. |
 | `--clone-from <profile>` | Clone from a specific profile instead of the current one. Used with `--clone` or `--clone-all`. |
 | `--no-alias` | Skip wrapper script creation. |
 | `--description "<text>"` | One- or two-sentence description of what this profile is good at. Used by the kanban orchestrator to route tasks based on role instead of profile name alone. Skip and add later via `hermes profile describe`. Persisted in `<profile_dir>/profile.yaml`. |
@@ -103,6 +107,9 @@ hermes profile create backup --clone-all
 
 # Clone config from a specific profile
 hermes profile create work2 --clone --clone-from work
+
+# Share default config while keeping local secrets and state
+hermes profile create reviewer --inherit-config
 ```
 
 ## `hermes profile describe`
@@ -188,7 +195,101 @@ Gateway: stopped
 Skills:  12
 .env:    exists
 SOUL.md: exists
+Config:  inherits from default (save mode: delta)
 Alias:   ~/.local/bin/work
+```
+
+## `hermes profile config-inherit`
+
+```bash
+hermes profile config-inherit <name> --from default
+```
+
+Opts an existing specialist profile into the default profile's non-secret
+`config.yaml` settings. Use this when profiles such as `coder`, `reviewer`, and
+`ops` need the same model, provider, toolsets, and display settings, but each
+profile must keep its own `.env`, `SOUL.md`, sessions, gateway state, and local
+overrides. Version 1 supports only `--from default`.
+
+The command writes this metadata to `<profile>/profile.yaml`:
+
+```yaml
+config:
+  inherit_from: default
+  save_mode: delta
+```
+
+Only `config.yaml` inherits. `.env`, `SOUL.md`, memories, sessions, skills,
+gateway state, and cron state remain profile-local. The profile's own
+`config.yaml` stores only local overrides.
+
+| Argument / Option | Description |
+|-------------------|-------------|
+| `<name>` | Profile to update. The `default` profile cannot inherit from itself. |
+| `--from default` | Required source profile. No other source is supported. |
+
+**Example:**
+
+```bash
+hermes profile config-inherit reviewer --from default
+hermes -p reviewer config get model.default
+```
+
+## `hermes profile config-backfill`
+
+```bash
+hermes profile config-backfill [profile ...] [options]
+```
+
+Backfills inherited-config metadata across existing profiles. With no profile
+names, the command discovers conventional PM and scrum-master profiles by name.
+It runs as a dry run by default, so you can inspect the plan before it writes
+changes.
+
+Use `--prune-model` when a profile already has a local `model:` block that must
+be removed so the profile inherits `model.default` and `model.provider` from the
+default profile. The command only prunes the local `model:` block; other local
+settings in `config.yaml` remain in place.
+
+| Argument / Option | Description |
+|-------------------|-------------|
+| `[profile ...]` | Specific profiles to target. When omitted, Hermes discovers profiles from `--roles`. |
+| `--roles <roles>` | Comma-separated conventional roles to discover. Defaults to `pm,scrum-master`. |
+| `--apply` | Write `profile.yaml` and optional `config.yaml` changes. Without this option, the command prints a plan only. |
+| `--prune-model` | Remove local `model:` blocks so model settings inherit from `default`. |
+| `--restart-services` | After `--apply`, try-restart conventional user services for changed profiles. |
+
+**Examples:**
+
+```bash
+# Preview the fleet backfill plan
+hermes profile config-backfill --roles pm,scrum-master --prune-model
+
+# Apply the plan and restart changed profile services
+hermes profile config-backfill --roles pm,scrum-master --prune-model --apply --restart-services
+
+# Target specific profiles
+hermes profile config-backfill pjangler-pm skillex-pm --prune-model --apply
+```
+
+## `hermes profile config-uninherit`
+
+```bash
+hermes profile config-uninherit <name>
+```
+
+Removes inherited-config metadata from a profile. After this command, the
+profile returns to standalone `config.yaml` behavior. Existing local overrides
+remain in the profile's `config.yaml`.
+
+| Argument | Description |
+|----------|-------------|
+| `<name>` | Profile to update. |
+
+**Example:**
+
+```bash
+hermes profile config-uninherit reviewer
 ```
 
 ## `hermes profile alias`

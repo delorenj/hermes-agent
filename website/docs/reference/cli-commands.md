@@ -946,6 +946,7 @@ Subcommands:
 |------------|-------------|
 | `show` | Show current config values. |
 | `edit` | Open `config.yaml` in your editor. |
+| `get <key>` | Print one effective config value. |
 | `set <key> <value>` | Set a config value. |
 | `path` | Print the config file path. |
 | `env-path` | Print the `.env` file path. |
@@ -1373,9 +1374,11 @@ Manage profiles — multiple isolated Hermes instances, each with its own config
 |------------|-------------|
 | `list` | List all profiles. |
 | `use <name>` | Set a sticky default profile. |
-| `create <name> [--clone] [--clone-all] [--clone-from <source>] [--no-alias]` | Create a new profile. `--clone` copies config, `.env`, and `SOUL.md` from the active profile. `--clone-all` copies all state. `--clone-from` specifies a source profile. |
+| `create <name> [--clone] [--clone-all] [--inherit-config] [--clone-from <source>] [--no-alias]` | Create a new profile. `--clone` copies config, `.env`, and `SOUL.md` from the active profile. `--clone-all` copies all state. `--inherit-config` inherits non-secret config from `default`. |
 | `delete <name> [-y]` | Delete a profile. |
 | `show <name>` | Show profile details (home directory, config, etc.). |
+| `config-inherit <name> --from default` | Opt a profile into inheriting `config.yaml` from `default`. |
+| `config-uninherit <name>` | Stop inheriting `config.yaml` for a profile. |
 | `alias <name> [--remove] [--name NAME]` | Manage wrapper scripts for quick profile access. |
 | `rename <old> <new>` | Rename a profile. |
 | `export <name> [-o FILE]` | Export a profile to a `.tar.gz` archive (local backup). |
