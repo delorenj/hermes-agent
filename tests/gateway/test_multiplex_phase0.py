@@ -168,6 +168,51 @@ class TestMultiplexConfigFlag:
         assert scoped_config["display"]["interim_assistant_messages"] is False
 
 
+class TestMultiplexSecondaryAdaptersConfig:
+    """Secondary profile adapters stay on unless routing-only is explicit."""
+
+    def test_default_is_true(self):
+        assert GatewayConfig().multiplex_secondary_adapters is True
+
+    def test_cli_and_gateway_defaults_match(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert (
+            DEFAULT_CONFIG["gateway"]["multiplex_secondary_adapters"]
+            is GatewayConfig().multiplex_secondary_adapters
+        )
+
+    def test_to_dict_includes_flag(self):
+        config = GatewayConfig(multiplex_secondary_adapters=False)
+
+        assert config.to_dict()["multiplex_secondary_adapters"] is False
+
+    def test_from_dict_top_level(self):
+        config = GatewayConfig.from_dict(
+            {"multiplex_secondary_adapters": False}
+        )
+
+        assert config.multiplex_secondary_adapters is False
+
+    def test_from_dict_nested_gateway(self):
+        config = GatewayConfig.from_dict(
+            {"gateway": {"multiplex_secondary_adapters": False}}
+        )
+
+        assert config.multiplex_secondary_adapters is False
+
+    def test_roundtrip(self):
+        original = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_secondary_adapters=False,
+        )
+
+        restored = GatewayConfig.from_dict(original.to_dict())
+
+        assert restored.multiplex_profiles is True
+        assert restored.multiplex_secondary_adapters is False
+
+
 class TestSessionStoreProfileResolution:
     """SessionStore._generate_session_key honors the flag: legacy namespace
     when off, active-profile namespace when on."""

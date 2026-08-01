@@ -10154,9 +10154,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         skills, and credentials. Same-platform credential collisions (two
         profiles polling the same bot token) are detected and refused here, the
         only point that sees every profile's resolved credentials together.
+        Routing-only multiplexers still enumerate and record served profiles,
+        but skip every secondary adapter lifecycle operation.
         """
         if not getattr(self.config, "multiplex_profiles", False):
             return 0
+        secondary_adapters_enabled = getattr(
+            self.config, "multiplex_secondary_adapters", True
+        )
+        if not secondary_adapters_enabled:
+            logger.info(
+                "Secondary profile platform adapters disabled; multiplex routing "
+                "remains active for primary process-level adapters"
+            )
 
         try:
             from hermes_cli.profiles import profiles_to_serve, get_active_profile_name
@@ -10165,6 +10175,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         active = get_active_profile_name() or "default"
         connected = 0
+        routing_only_profiles: list[str] = []
         # (platform, token-fingerprint) -> profile that claimed it. Detects two
         # profiles trying to poll the same bot credential (impossible to do
         # concurrently). Seed with the active profile's adapters.
@@ -10177,6 +10188,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for profile_name, profile_home in profiles_to_serve(multiplex=True):
             if profile_name == active:
                 continue  # handled by the primary startup loop
+            if not secondary_adapters_enabled:
+                routing_only_profiles.append(profile_name)
+                continue
             try:
                 connected += await self._start_one_profile_adapters(
                     profile_name, profile_home, claimed
@@ -10199,7 +10213,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.status import write_runtime_status
             from gateway.pairing import PairingStore
-            served = [active] + sorted(self._profile_adapters.keys())
+            secondary_profiles = (
+                routing_only_profiles
+                if not secondary_adapters_enabled
+                else list(self._profile_adapters.keys())
+            )
+            served = [active] + sorted(secondary_profiles)
             # Per-profile PairingStores so authz_mixin can route pairing
             # checks to the right whitelist. The active profile gets a store
             # at its HERMES_HOME; additional served profiles get one under
@@ -10217,6 +10236,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
     ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
+        if not getattr(self.config, "multiplex_secondary_adapters", True):
+            return 0
         from gateway.config import load_gateway_config
 
         with _profile_runtime_scope(profile_home):
@@ -10341,6 +10362,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, profile_name: str, platform: Platform
     ) -> None:
         """Reconnect a retryable secondary adapter under its own profile scope."""
+        if not getattr(self.config, "multiplex_secondary_adapters", True):
+            return
         attempts = 0
         current_task = asyncio.current_task()
         try:
@@ -10439,7 +10462,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, profile_name: str, platform: Platform, adapter: BasePlatformAdapter
     ) -> None:
         """Schedule one runner-owned reconnect without sharing primary secrets."""
-        if not self._running or not adapter.fatal_error_retryable:
+        if (
+            not self._running
+            or not getattr(self.config, "multiplex_secondary_adapters", True)
+            or not adapter.fatal_error_retryable
+        ):
             return
         pending = self._profile_failed_platforms
         if not isinstance(pending, dict):
