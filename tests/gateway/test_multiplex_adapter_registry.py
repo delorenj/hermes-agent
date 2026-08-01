@@ -226,6 +226,31 @@ def _install_secondary_reconnect_context(monkeypatch, runner, adapter, scoped_ho
 
 class TestSecondaryProfileFatalRecovery:
     @pytest.mark.asyncio
+    async def test_routing_only_mode_does_not_schedule_secondary_reconnect(
+        self, monkeypatch
+    ):
+        runner = _secondary_recovery_runner()
+        runner.config.multiplex_secondary_adapters = False
+        created = []
+
+        def create_task(coro, *, name):
+            coro.close()
+            created.append(name)
+            return AsyncMock()
+
+        monkeypatch.setattr(asyncio, "create_task", create_task)
+
+        runner._schedule_secondary_profile_reconnect(
+            "reviewer", Platform.DISCORD, _SecondaryRecoveryAdapter()
+        )
+        await runner._run_secondary_profile_reconnect(
+            "reviewer", Platform.DISCORD
+        )
+
+        assert created == []
+        assert runner._profile_failed_platforms == {}
+
+    @pytest.mark.asyncio
     async def test_retryable_secondary_fatal_reconnects_with_its_profile_scope(
         self, monkeypatch
     ):
@@ -490,6 +515,46 @@ class TestSecondaryProfileConfigHandling:
         assert "good" in runner._profile_adapters
         assert "bad" not in runner._profile_adapters
         assert "Skipping secondary profile 'bad'" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_routing_only_mode_skips_secondary_adapter_startup(
+        self, monkeypatch
+    ):
+        primary = object()
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_secondary_adapters=False,
+        )
+        runner.adapters = {Platform.RELAY: primary}
+        runner._profile_adapters = {}
+        runner.pairing_stores = {}
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [
+                ("default", Path("/tmp/default")),
+                ("reviewer", Path("/tmp/reviewer")),
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+        start_one = AsyncMock()
+        monkeypatch.setattr(runner, "_start_one_profile_adapters", start_one)
+        served_status = {}
+        monkeypatch.setattr(
+            "gateway.status.write_runtime_status",
+            lambda **kwargs: served_status.update(kwargs),
+        )
+
+        connected = await runner._start_secondary_profile_adapters()
+
+        assert connected == 0
+        start_one.assert_not_awaited()
+        assert runner.adapters == {Platform.RELAY: primary}
+        assert runner._profile_adapters == {}
+        assert served_status["served_profiles"] == ["default", "reviewer"]
 
     @pytest.mark.asyncio
     async def test_multiplexer_propagates_security_config_error(self, monkeypatch):

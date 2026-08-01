@@ -2505,6 +2505,58 @@ class TestMultiplexProfilesConfig:
         )
 
 
+class TestMultiplexSecondaryAdaptersConfig:
+    def test_nested_gateway_form_disables_secondary_adapters(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  multiplex_profiles: true\n"
+            "  multiplex_secondary_adapters: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.multiplex_profiles is True
+        assert config.multiplex_secondary_adapters is False
+
+    def test_top_level_form_matches_nested_loader_behavior(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "multiplex_profiles: true\n"
+            "multiplex_secondary_adapters: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.multiplex_profiles is True
+        assert config.multiplex_secondary_adapters is False
+
+    def test_top_level_form_takes_precedence(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "multiplex_secondary_adapters: true\n"
+            "gateway:\n"
+            "  multiplex_secondary_adapters: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.multiplex_secondary_adapters is True
+
+
 class TestApiServerEnvOverride:
     def test_env_key_does_not_reenable_explicitly_disabled_api_server(self):
         """An explicit ``platforms.api_server.enabled: false`` must survive

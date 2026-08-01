@@ -3152,6 +3152,11 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # In multiplex mode, start each secondary profile's configured platform
+        # adapters by default. Set false for a routing-only multiplexer where
+        # primary process-level adapters stamp source.profile themselves.
+        "multiplex_secondary_adapters": True,
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored
@@ -5854,6 +5859,7 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "always_log_local",          # top-level form bridged by gateway/config.py
     "filter_silence_narration",  # top-level form bridged by gateway/config.py
     "multiplex_profiles",    # top-level form accepted alongside gateway.multiplex_profiles
+    "multiplex_secondary_adapters",  # top-level compatibility form for gateway setting
     "profile_routes",        # top-level form accepted alongside gateway.profile_routes
     "platforms",             # top-level per-platform map merged by gateway/config.py
     "require_mention",       # top-level convenience form honored by the gateway (#3979)

@@ -106,6 +106,22 @@ keys** — credentials are never shared across profiles.
 You do **not** run `hermes gateway start` for the secondary profiles — the
 default gateway serves them. See the contract changes below.
 
+If a primary process-level adapter already identifies the destination profile
+(by setting `source.profile`), the same gateway can run in routing-only mode
+without starting Telegram, Slack, or other adapters from secondary profiles:
+
+```yaml
+gateway:
+  multiplex_profiles: true
+  multiplex_secondary_adapters: false
+```
+
+Profile routing, session namespacing, and per-profile runtime scope stay active.
+Only secondary-profile platform adapter startup and reconnect are disabled;
+adapters configured on the primary gateway still start normally. The default
+for `multiplex_secondary_adapters` is `true`, preserving existing multiplex
+behavior.
+
 ### What changes when multiplexing is on
 
 Enabling the flag changes how a few things behave. All of these revert the
