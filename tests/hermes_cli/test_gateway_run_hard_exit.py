@@ -75,3 +75,38 @@ def test_run_gateway_hard_exits_after_keyboard_interrupt(monkeypatch):
         gateway_cli.run_gateway()
 
     assert excinfo.value.code == 0
+
+
+def test_run_gateway_forwards_only_non_secret_route_metadata(monkeypatch):
+    gateway_cli = _prepare(monkeypatch)
+    observed = {}
+
+    def _fake_run(coro):
+        try:
+            coro.send(None)
+        except StopIteration as exc:
+            return exc.value
+        raise AssertionError("capture coroutine unexpectedly suspended")
+
+    async def _capture_start(**kwargs):
+        observed.update(kwargs)
+        return True
+
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
+    monkeypatch.setattr(gateway_run, "start_gateway", _capture_start)
+
+    with pytest.raises(_HardExitObserved):
+        gateway_cli.run_gateway(
+            model="hermes",
+            provider="custom",
+            base_url="https://gateway.example.test/v1",
+            api_mode="chat_completions",
+            key_env="DIRECTOR_LITELLM_KEY",
+        )
+
+    override = observed["model_override"]
+    assert override.model == "hermes"
+    assert override.key_env == "DIRECTOR_LITELLM_KEY"
+    assert "runtime-only-secret" not in repr(override)

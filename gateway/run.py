@@ -6468,13 +6468,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(
+        self,
+        config: Optional[GatewayConfig] = None,
+        *,
+        model_override: Optional["GatewayModelOverride"] = None,
+    ):
         global _gateway_runner_ref
         # When multiplex_profiles is on, load under the default profile secret
         # scope so bot tokens in that profile's .env resolve the same way
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        if model_override is not None and getattr(
+            self.config, "multiplex_profiles", False
+        ):
+            raise ValueError(
+                "Gateway startup model overrides cannot be used with "
+                "gateway.multiplex_profiles; launch a named-profile gateway "
+                "so credentials remain profile-scoped"
+            )
+        self._startup_model_override = model_override
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -7570,8 +7584,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve model/runtime for a session.
 
         Priority (highest first): session ``/model`` → ``channel_overrides`` →
-        global config/env (``_resolve_gateway_model(user_config)`` and default
-        provider resolution).
+        gateway startup override → global config/env.
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -7638,6 +7651,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime_model,
             )
             model = runtime_model
+
+        model, runtime_kwargs = self._apply_gateway_startup_model_override(
+            model, runtime_kwargs
+        )
 
         cfg = getattr(self, "config", None)
         if cfg and source is not None:
@@ -7727,6 +7744,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_state("*").conversation.last_resolved_model = model
 
         return model, runtime_kwargs
+
+    def _apply_gateway_startup_model_override(
+        self, model: str, runtime_kwargs: dict
+    ) -> tuple[str, dict]:
+        """Overlay a validated process-local route onto shared defaults.
+
+        The credential is resolved from ``key_env`` inside the active secret
+        scope.  Only the environment variable name is retained on the runner.
+        """
+        override = getattr(self, "_startup_model_override", None)
+        if override is None:
+            return model, runtime_kwargs
+
+        runtime = dict(runtime_kwargs)
+        if override.provider:
+            try:
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    override.provider
+                )
+                provider_model = runtime.pop("model", None)
+                if provider_model and not override.model:
+                    model = provider_model
+            except RuntimeError:
+                if not (override.base_url and override.key_env):
+                    raise
+                runtime = {
+                    "provider": override.provider,
+                    "requested_provider": override.provider,
+                    "api_key": None,
+                    "base_url": None,
+                    "api_mode": None,
+                    "command": None,
+                    "args": [],
+                    "credential_pool": None,
+                }
+
+        if override.model:
+            model = override.model
+        if override.provider:
+            runtime["provider"] = override.provider
+            runtime["requested_provider"] = override.provider
+        if override.base_url:
+            runtime["base_url"] = override.base_url
+            runtime["command"] = None
+            runtime["args"] = []
+        if override.api_mode:
+            runtime["api_mode"] = override.api_mode
+        if override.key_env:
+            from agent.secret_scope import get_secret
+
+            api_key = get_secret(override.key_env)
+            if not api_key:
+                raise RuntimeError(
+                    f"Gateway model credential environment variable "
+                    f"{override.key_env} is not set in the active profile scope"
+                )
+            runtime["api_key"] = api_key
+            runtime["credential_pool"] = None
+
+        logger.info(
+            "Applied gateway startup model route: model=%s provider=%s "
+            "base_url_override=%s api_mode=%s key_env=%s",
+            model,
+            runtime.get("provider"),
+            bool(override.base_url),
+            runtime.get("api_mode"),
+            override.key_env or "<inherited>",
+        )
+        return model, runtime
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -29422,7 +29508,12 @@ def _gateway_stderr_formatter() -> logging.Formatter:
     return RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
-async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
+async def start_gateway(
+    config: Optional[GatewayConfig] = None,
+    replace: bool = False,
+    verbosity: Optional[int] = 0,
+    model_override: Optional["GatewayModelOverride"] = None,
+) -> bool:
     """
     Start the gateway and run until interrupted.
     
@@ -29660,7 +29751,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
 
-    runner = GatewayRunner(config)
+    # Keep the historical constructor call shape when no override was
+    # supplied. Besides preserving third-party subclasses, this lets existing
+    # test/deployment shims that wrap ``GatewayRunner(config)`` keep working.
+    runner = (
+        GatewayRunner(config)
+        if model_override is None
+        else GatewayRunner(config, model_override=model_override)
+    )
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
     # it before the background reconnect watcher starts.

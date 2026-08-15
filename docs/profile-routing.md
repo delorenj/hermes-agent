@@ -108,6 +108,30 @@ If no route matches, the message uses the default/active profile.
 Because `gateway_runner` is injected for **all** adapters (declared on `BasePlatformAdapter`),
 every platform goes through this path — not just Discord.
 
+## Per-process model routing
+
+A named-profile gateway may override the shared model route without editing the
+shared `config.yaml`:
+
+```bash
+hermes --profile director gateway run \
+  --model hermes \
+  --provider custom \
+  --base-url https://llm-gateway.example/v1 \
+  --api-mode chat_completions \
+  --key-env DIRECTOR_LITELLM_KEY
+```
+
+`--key-env` accepts only an environment variable name. Hermes resolves its
+value inside the active profile's secret scope when a turn is built; the value
+is never stored in argv or the override object and is not logged. Resolution
+fails closed when the named variable is absent.
+
+The precedence is: session `/model` override, then `channel_overrides`, then
+the process-local gateway route, then shared config/environment defaults. A
+process-local route is rejected when `gateway.multiplex_profiles` is enabled;
+use independently launched named profiles when model credentials differ.
+
 ## Relationship to multiplexing
 
 `profile_routes` requires `gateway.multiplex_profiles: true`. Multiplexing is what

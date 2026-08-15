@@ -5421,7 +5421,18 @@ def _guard_official_docker_root_gateway() -> None:
     sys.exit(1)
 
 
-def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
+def run_gateway(
+    verbose: int = 0,
+    quiet: bool = False,
+    replace: bool = False,
+    force: bool = False,
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
+    api_mode: str | None = None,
+    key_env: str | None = None,
+):
     """Run the gateway in foreground.
 
     Args:
@@ -5432,6 +5443,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
                  hasn't fully exited yet.
         force: Skip the supervised-gateway conflict guard and start even when a
                systemd/launchd service is already supervising this profile.
+        model/provider/base_url/api_mode/key_env: Optional process-local model
+            route. ``key_env`` is a variable name; its value never enters argv.
     """
     _guard_official_docker_root_gateway()
     _guard_named_profile_under_multiplexer(force=force)
@@ -5493,7 +5506,20 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         except Exception:
             pass  # best-effort; don't block gateway startup
 
+    from gateway.model_override import GatewayModelOverride
     from gateway.run import start_gateway
+
+    try:
+        startup_model_override = GatewayModelOverride.build(
+            model=model,
+            provider=provider,
+            base_url=base_url,
+            api_mode=api_mode,
+            key_env=key_env,
+        )
+    except ValueError as exc:
+        print_error(str(exc))
+        raise SystemExit(2) from exc
 
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ⚕ Hermes Gateway Starting...                 │")
@@ -5629,7 +5655,10 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+        start_kwargs = {"replace": replace, "verbosity": verbosity}
+        if startup_model_override is not None:
+            start_kwargs["model_override"] = startup_model_override
+        success = asyncio.run(start_gateway(**start_kwargs))
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # On Windows-detached runs this shouldn't fire (we absorb SIGINT above),
@@ -7379,7 +7408,17 @@ def _gateway_command_inner(args):
         quiet = getattr(args, "quiet", False)
         replace = getattr(args, "replace", False)
         force = getattr(args, "force", False)
-        run_gateway(verbose, quiet=quiet, replace=replace, force=force)
+        run_gateway(
+            verbose,
+            quiet=quiet,
+            replace=replace,
+            force=force,
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+            base_url=getattr(args, "base_url", None),
+            api_mode=getattr(args, "api_mode", None),
+            key_env=getattr(args, "key_env", None),
+        )
         return
 
     if subcmd == "setup":
