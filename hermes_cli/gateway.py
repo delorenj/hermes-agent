@@ -5655,10 +5655,13 @@ def run_gateway(
 
     success = False
     try:
-        start_kwargs = {"replace": replace, "verbosity": verbosity}
-        if startup_model_override is not None:
-            start_kwargs["model_override"] = startup_model_override
-        success = asyncio.run(start_gateway(**start_kwargs))
+        success = asyncio.run(
+            start_gateway(
+                replace=replace,
+                verbosity=verbosity,
+                model_override=startup_model_override,
+            )
+        )
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # On Windows-detached runs this shouldn't fire (we absorb SIGINT above),
