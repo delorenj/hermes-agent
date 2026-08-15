@@ -23,6 +23,7 @@ class TestResolveShellInitFiles:
         bashrc = tmp_path / ".bashrc"
         bashrc.write_text('export MARKER=seen\n')
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
 
         # Default config: auto_source_bashrc on, no explicit list.
         with patch(
@@ -41,6 +42,7 @@ class TestResolveShellInitFiles:
         profile = tmp_path / ".profile"
         profile.write_text('export PATH="$HOME/n/bin:$PATH"\n')
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
 
         with patch(
             "tools.environments.local._read_terminal_shell_init_config",
@@ -63,6 +65,7 @@ class TestResolveShellInitFiles:
         bashrc = tmp_path / ".bashrc"
         bashrc.write_text('export FROM_BASHRC=1\n')
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
 
         with patch(
             "tools.environments.local._read_terminal_shell_init_config",
@@ -75,6 +78,7 @@ class TestResolveShellInitFiles:
     def test_skips_bashrc_when_missing(self, tmp_path, monkeypatch):
         # No rc files written.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
 
         with patch(
             "tools.environments.local._read_terminal_shell_init_config",
@@ -94,6 +98,35 @@ class TestResolveShellInitFiles:
             resolved = _resolve_shell_init_files()
 
         assert resolved == []
+
+    def test_test_isolation_skips_host_default_init_files(self, tmp_path, monkeypatch):
+        (tmp_path / ".profile").write_text('export HOST_PROFILE_RAN=1\n')
+        (tmp_path / ".bash_profile").write_text('export HOST_BASH_PROFILE_RAN=1\n')
+        (tmp_path / ".bashrc").write_text('export HOST_BASHRC_RAN=1\n')
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_TEST_ISOLATION", str(tmp_path / "hermes-test"))
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([], True),
+        ):
+            resolved = _resolve_shell_init_files()
+
+        assert resolved == []
+
+    def test_test_isolation_keeps_explicit_fixture_init_files(self, tmp_path, monkeypatch):
+        explicit = tmp_path / "fixture-init.sh"
+        explicit.write_text('export FIXTURE_INIT_RAN=1\n')
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_TEST_ISOLATION", str(tmp_path / "hermes-test"))
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([str(explicit)], True),
+        ):
+            resolved = _resolve_shell_init_files()
+
+        assert resolved == [str(explicit)]
 
 
 class TestPrependShellInit:
@@ -170,6 +203,31 @@ class TestSnapshotEndToEnd:
         assert "PROBE=probe-ok" in output
         assert "/opt/shell-init-probe/bin" in output
 
+    def test_snapshot_never_executes_host_login_files_under_test_isolation(
+        self, tmp_path, monkeypatch
+    ):
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        marker = tmp_path / "host-profile-executed"
+        (fake_home / ".bash_profile").write_text(f"touch {marker}\n")
+        (fake_home / ".profile").write_text(f"touch {marker}\n")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("HERMES_TEST_ISOLATION", str(tmp_path / "hermes-test"))
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([], True),
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                result = env.execute("printf safe")
+            finally:
+                env.cleanup()
+
+        assert result["returncode"] == 0
+        assert "safe" in result.get("output", "")
+        assert not marker.exists()
+
     def test_profile_path_export_survives_bashrc_interactive_guard(
         self, tmp_path, monkeypatch
     ):
@@ -204,6 +262,7 @@ class TestSnapshotEndToEnd:
         )
 
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
 
         with patch(
             "tools.environments.local._read_terminal_shell_init_config",

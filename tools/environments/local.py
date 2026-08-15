@@ -1361,7 +1361,11 @@ def _resolve_shell_init_files() -> list[str]:
     candidates: list[str] = []
     if explicit:
         candidates.extend(explicit)
-    elif auto_bashrc and not _IS_WINDOWS:
+    elif (
+        auto_bashrc
+        and not _IS_WINDOWS
+        and not os.environ.get("HERMES_TEST_ISOLATION")
+    ):
         # Build a login-shell-ish source list so tools like n / nvm / asdf /
         # pyenv that self-install into the user's shell rc land on PATH in
         # the captured snapshot.
@@ -1487,6 +1491,7 @@ class LocalEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
+        test_isolation = bool(os.environ.get("HERMES_TEST_ISOLATION"))
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
         # custom init files so tools registered outside bash_profile
@@ -1497,7 +1502,16 @@ class LocalEnvironment(BaseEnvironment):
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        # Test subprocesses intentionally retain the operator's real HOME so
+        # child-process tests have a stable location. Never combine that with
+        # login-shell startup: doing so executes the operator's real profile
+        # scripts (including password-manager helpers) from every test that
+        # constructs a LocalEnvironment. HERMES_TEST_ISOLATION is established
+        # by tests/conftest.py before test modules import and inherited by
+        # their children. Explicit terminal.shell_init_files are still
+        # prepended above, so the feature remains testable with fixture files.
+        use_login_shell = login and not test_isolation
+        args = [bash, "-l", "-c", cmd_string] if use_login_shell else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by

@@ -11,6 +11,8 @@
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
+#   * Host login/profile scripts suppressed for LocalEnvironment subprocesses
+#     by the HERMES_TEST_ISOLATION marker established in conftest.py
 #   * Proper venv activation (probes .venv, venv, then ~/.hermes/...)
 #
 # Usage:

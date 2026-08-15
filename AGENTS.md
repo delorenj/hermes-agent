@@ -1384,7 +1384,7 @@ ContextVars from one test file cannot leak into the next.
 |                     | Without wrapper                             | With wrapper                              |
 | ------------------- | ------------------------------------------- | ----------------------------------------- |
 | Provider API keys   | Whatever is in your env (auto-detects pool) | All env vars except a specific few unset. |
-| HOME / `~/.hermes/` | Your real config+auth.json                  | Temp dir per test                         |
+| HOME / `~/.hermes/` | Your real config+auth.json                  | Stable HOME; isolated `HERMES_HOME`; host login files suppressed |
 | Timezone            | Local TZ (PDT etc.)                         | UTC                                       |
 | Locale              | Whatever is set                             | C.UTF-8                                   |
 
