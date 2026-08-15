@@ -201,3 +201,15 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+# DeLo local operator artifacts
+**/.claude/settings.local.json
+*.mp4
+*.mp3
+*.zip
+*.aab
+.lastagent
+.codex/tmp/
+.codex/*.sqlite-shm
+.codex/*.sqlite-wal
+.codex/goals_*.sqlite
