@@ -95,6 +95,37 @@ def build_gateway_parser(
             "launchd/systemd wrapper strips its native environment markers."
         ),
     )
+    gateway_run.add_argument(
+        "--model",
+        help="Process-local default model (session and channel overrides still win)",
+    )
+    gateway_run.add_argument(
+        "--provider",
+        help="Process-local default provider (session and channel overrides still win)",
+    )
+    gateway_run.add_argument(
+        "--base-url",
+        help="Process-local model API base URL",
+    )
+    gateway_run.add_argument(
+        "--api-mode",
+        choices=(
+            "anthropic_messages",
+            "bedrock_converse",
+            "chat_completions",
+            "codex_app_server",
+            "codex_responses",
+        ),
+        help="Process-local model API protocol",
+    )
+    gateway_run.add_argument(
+        "--key-env",
+        metavar="ENV_NAME",
+        help=(
+            "Resolve the process-local model credential from this environment "
+            "variable name; the credential itself is never accepted on argv"
+        ),
+    )
     add_accept_hooks_flag(gateway_run)
     add_accept_hooks_flag(gateway_parser)
 

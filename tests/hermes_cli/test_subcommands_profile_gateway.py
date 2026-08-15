@@ -61,6 +61,31 @@ def test_gateway_and_proxy_dispatch():
     assert px.func is _h_proxy
 
 
+def test_gateway_run_accepts_process_local_model_route():
+    p = _gateway_parser()
+    ns = p.parse_args(
+        [
+            "gateway",
+            "run",
+            "--model",
+            "hermes",
+            "--provider",
+            "custom",
+            "--base-url",
+            "https://gateway.example.test/v1",
+            "--api-mode",
+            "chat_completions",
+            "--key-env",
+            "DIRECTOR_LITELLM_KEY",
+        ]
+    )
+    assert ns.model == "hermes"
+    assert ns.provider == "custom"
+    assert ns.base_url == "https://gateway.example.test/v1"
+    assert ns.api_mode == "chat_completions"
+    assert ns.key_env == "DIRECTOR_LITELLM_KEY"
+
+
 
 
 def test_gateway_enroll_dispatch():
