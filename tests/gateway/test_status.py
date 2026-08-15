@@ -173,24 +173,104 @@ class TestGatewayPidState:
 class TestGatewayRuntimeStatus:
 
     def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):
-        """Regression: setdefault() preserved stale PID from previous process (#1631)."""
+        """A new gateway process must not inherit its predecessor's health."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-        # Simulate a previous gateway run that left a state file with a stale PID
+        # Simulate a previous gateway run that left live-looking platform and
+        # process state behind. desired_state is different: it is durable s6
+        # operator intent and must survive a process restart.
         state_path = tmp_path / "gateway_state.json"
         state_path.write_text(json.dumps({
             "pid": 99999,
-            "start_time": 1000.0,
+            "start_time": 1000,
             "kind": "hermes-gateway",
-            "platforms": {},
+            "gateway_state": "running",
+            "exit_reason": "stale exit",
+            "restart_requested": True,
+            "active_agents": 4,
+            "served_profiles": ["default", "condaleeza"],
+            "platforms": {
+                "slack": {
+                    "state": "connected",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            },
+            "desired_state": "running",
             "updated_at": "2025-01-01T00:00:00Z",
-        }))
+        }), encoding="utf-8")
 
+        status.write_runtime_status(gateway_state="starting", exit_reason=None)
+
+        payload = status.read_runtime_status()
+        assert payload is not None
+        assert payload["pid"] == os.getpid()
+        assert payload["start_time"] != 1000
+        assert payload["gateway_state"] == "starting"
+        assert payload["exit_reason"] is None
+        assert payload["restart_requested"] is False
+        assert payload["active_agents"] == 0
+        assert payload["platforms"] == {}
+        assert "served_profiles" not in payload
+        assert payload["desired_state"] == "running"
+
+    def test_write_runtime_status_same_process_preserves_platform_state(
+        self, tmp_path, monkeypatch
+    ):
+        """Later writes by one process compose instead of resetting adapters."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        process_record = {
+            "pid": 4321,
+            "start_time": 8765,
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "gateway", "run"],
+            "hermes_home": str(tmp_path),
+        }
+        monkeypatch.setattr(status, "_build_pid_record", lambda: process_record)
+
+        status.write_runtime_status(
+            platform="slack",
+            platform_state="connected",
+            error_code=None,
+            error_message=None,
+        )
         status.write_runtime_status(gateway_state="running")
 
         payload = status.read_runtime_status()
-        assert payload["pid"] == os.getpid(), "PID should be overwritten, not preserved via setdefault"
-        assert payload["start_time"] != 1000.0, "start_time should be overwritten on restart"
+        assert payload is not None
+        assert payload["gateway_state"] == "running"
+        assert payload["platforms"]["slack"]["state"] == "connected"
+
+    def test_write_runtime_status_recycled_pid_drops_stale_platform_state(
+        self, tmp_path, monkeypatch
+    ):
+        """A reused PID with a new start fingerprint is a new writer."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        process_record = {
+            "pid": 4321,
+            "start_time": 9000,
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "gateway", "run"],
+            "hermes_home": str(tmp_path),
+        }
+        monkeypatch.setattr(status, "_build_pid_record", lambda: process_record)
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({
+                **process_record,
+                "start_time": 8000,
+                "gateway_state": "running",
+                "platforms": {"slack": {"state": "connected"}},
+            }),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(gateway_state="starting")
+
+        payload = status.read_runtime_status()
+        assert payload is not None
+        assert payload["pid"] == process_record["pid"]
+        assert payload["start_time"] == process_record["start_time"]
+        assert payload["gateway_state"] == "starting"
+        assert payload["platforms"] == {}
 
 
     def test_runtime_status_running_pid_rejects_pid_reused_by_other_profile(self, monkeypatch):

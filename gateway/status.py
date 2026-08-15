@@ -651,8 +651,10 @@ def _build_pid_record() -> dict:
     }
 
 
-def _build_runtime_status_record() -> dict[str, Any]:
-    payload = _build_pid_record()
+def _build_runtime_status_record(
+    process_record: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload = dict(process_record or _build_pid_record())
     payload.update({
         "gateway_state": "starting",
         "exit_reason": None,
@@ -662,6 +664,27 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "updated_at": _utc_now_iso(),
     })
     return payload
+
+
+def _runtime_status_belongs_to_process(
+    payload: dict[str, Any], process_record: dict[str, Any]
+) -> bool:
+    """Return whether runtime status was written by this process identity.
+
+    PID is the primary identity.  When both start-time fingerprints are
+    available they must also match, so PID reuse cannot carry one gateway's
+    volatile platform state into its successor.  A missing fingerprint keeps
+    the existing cross-platform fallback semantics used by the status readers.
+    """
+    if payload.get("pid") != process_record.get("pid"):
+        return False
+    previous_start = payload.get("start_time")
+    current_start = process_record.get("start_time")
+    return (
+        previous_start is None
+        or current_start is None
+        or previous_start == current_start
+    )
 
 
 def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
@@ -1064,9 +1087,26 @@ def write_runtime_status(
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
-    payload = _read_json_file(path) or _build_runtime_status_record()
-    previous_payload = copy.deepcopy(payload)
+    persisted_payload = _read_json_file(path)
     current_record = _build_pid_record()
+
+    if persisted_payload is not None and _runtime_status_belongs_to_process(
+        persisted_payload, current_record
+    ):
+        payload = persisted_payload
+    else:
+        # gateway_state.json outlives its writer.  Every field in the fresh
+        # record is process-scoped except desired_state, which is durable
+        # operator intent written by the s6 service manager for container-boot
+        # reconciliation.  Carry that field forward, but never stale platform,
+        # active-agent, restart, served-profile, or lifecycle state.
+        payload = _build_runtime_status_record(current_record)
+        if persisted_payload is not None and "desired_state" in persisted_payload:
+            payload["desired_state"] = copy.deepcopy(
+                persisted_payload["desired_state"]
+            )
+
+    previous_payload = copy.deepcopy(persisted_payload or payload)
     payload.setdefault("platforms", {})
     payload["kind"] = current_record["kind"]
     payload["pid"] = current_record["pid"]
