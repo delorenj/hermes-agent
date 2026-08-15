@@ -21,7 +21,7 @@ from tools.environments.local import (
 class TestResolveShellInitFiles:
     def test_auto_sources_bashrc_when_present(self, tmp_path, monkeypatch):
         bashrc = tmp_path / ".bashrc"
-        bashrc.write_text('export MARKER=seen\n')
+        bashrc.write_text('export MARKER=seen\n', encoding="utf-8")
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
 
@@ -40,7 +40,7 @@ class TestResolveShellInitFiles:
         guard so a non-interactive source actually runs it.
         """
         profile = tmp_path / ".profile"
-        profile.write_text('export PATH="$HOME/n/bin:$PATH"\n')
+        profile.write_text('export PATH="$HOME/n/bin:$PATH"\n', encoding="utf-8")
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
 
@@ -59,11 +59,11 @@ class TestResolveShellInitFiles:
         non-interactive ``case $- in *i*) ;; *) return;; esac`` guard.
         """
         profile = tmp_path / ".profile"
-        profile.write_text('export FROM_PROFILE=1\n')
+        profile.write_text('export FROM_PROFILE=1\n', encoding="utf-8")
         bash_profile = tmp_path / ".bash_profile"
-        bash_profile.write_text('export FROM_BASH_PROFILE=1\n')
+        bash_profile.write_text('export FROM_BASH_PROFILE=1\n', encoding="utf-8")
         bashrc = tmp_path / ".bashrc"
-        bashrc.write_text('export FROM_BASHRC=1\n')
+        bashrc.write_text('export FROM_BASHRC=1\n', encoding="utf-8")
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
 
@@ -100,9 +100,15 @@ class TestResolveShellInitFiles:
         assert resolved == []
 
     def test_test_isolation_skips_host_default_init_files(self, tmp_path, monkeypatch):
-        (tmp_path / ".profile").write_text('export HOST_PROFILE_RAN=1\n')
-        (tmp_path / ".bash_profile").write_text('export HOST_BASH_PROFILE_RAN=1\n')
-        (tmp_path / ".bashrc").write_text('export HOST_BASHRC_RAN=1\n')
+        (tmp_path / ".profile").write_text(
+            'export HOST_PROFILE_RAN=1\n', encoding="utf-8"
+        )
+        (tmp_path / ".bash_profile").write_text(
+            'export HOST_BASH_PROFILE_RAN=1\n', encoding="utf-8"
+        )
+        (tmp_path / ".bashrc").write_text(
+            'export HOST_BASHRC_RAN=1\n', encoding="utf-8"
+        )
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_TEST_ISOLATION", str(tmp_path / "hermes-test"))
 
@@ -116,7 +122,7 @@ class TestResolveShellInitFiles:
 
     def test_test_isolation_keeps_explicit_fixture_init_files(self, tmp_path, monkeypatch):
         explicit = tmp_path / "fixture-init.sh"
-        explicit.write_text('export FIXTURE_INIT_RAN=1\n')
+        explicit.write_text('export FIXTURE_INIT_RAN=1\n', encoding="utf-8")
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_TEST_ISOLATION", str(tmp_path / "hermes-test"))
 
@@ -209,8 +215,10 @@ class TestSnapshotEndToEnd:
         fake_home = tmp_path / "home"
         fake_home.mkdir()
         marker = tmp_path / "host-profile-executed"
-        (fake_home / ".bash_profile").write_text(f"touch {marker}\n")
-        (fake_home / ".profile").write_text(f"touch {marker}\n")
+        (fake_home / ".bash_profile").write_text(
+            f"touch {marker}\n", encoding="utf-8"
+        )
+        (fake_home / ".profile").write_text(f"touch {marker}\n", encoding="utf-8")
         monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setenv("HERMES_TEST_ISOLATION", str(tmp_path / "hermes-test"))
 
