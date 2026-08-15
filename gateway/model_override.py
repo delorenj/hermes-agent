@@ -92,4 +92,3 @@ class GatewayModelOverride:
                 )
 
         return cls(**values)
-

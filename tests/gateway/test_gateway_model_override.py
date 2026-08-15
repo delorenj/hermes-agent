@@ -115,4 +115,3 @@ def test_override_is_rejected_for_profile_multiplexer(monkeypatch):
             SimpleNamespace(multiplex_profiles=True),
             model_override=GatewayModelOverride.build(model="hermes"),
         )
-
