@@ -40,6 +40,10 @@ def _run_apply_profile_override(
         monkeypatch.setenv("HERMES_HOME", hermes_home)
     else:
         monkeypatch.delenv("HERMES_HOME", raising=False)
+    # These unit cases exercise production profile-selection semantics.  The
+    # suite-wide marker intentionally changes missing-HERMES_HOME behavior for
+    # subprocess safety, so opt out explicitly here.
+    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
 
     monkeypatch.setattr(sys, "argv", argv or ["hermes", "gateway", "start"])
 
@@ -154,6 +158,7 @@ class TestSupervisedChildIgnoresStickyProfile:
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
         monkeypatch.setenv("HERMES_S6_SUPERVISED_CHILD", "1")
         monkeypatch.setattr(sys, "argv", ["hermes", "-p", "coder", "gateway", "run"])
 
@@ -163,4 +168,3 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
-

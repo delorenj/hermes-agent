@@ -244,6 +244,85 @@ class TestSecondaryProfileFatalRecovery:
 class TestSecondaryProfileConfigHandling:
     """Secondary config errors degrade only when the profile is safe to skip."""
 
+    @pytest.mark.asyncio
+    async def test_command_only_mode_serves_profiles_without_secondary_pollers(
+        self, monkeypatch
+    ):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_secondary_adapters=False,
+        )
+        runner.adapters = {Platform.SLACK: MagicMock()}
+        runner._profile_adapters = {}
+        runner.pairing_stores = {
+            "default": MagicMock(),
+            "reviewer": MagicMock(),
+        }
+        runner.pairing_store = runner.pairing_stores["default"]
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex, profile_allowlist=None: [
+                ("default", Path("/tmp/default")),
+                ("reviewer", Path("/tmp/reviewer")),
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+
+        async def fail_if_started(*_args, **_kwargs):
+            raise AssertionError("secondary messaging adapter must not start")
+
+        monkeypatch.setattr(
+            runner, "_start_one_profile_adapters", fail_if_started
+        )
+        status = {}
+        monkeypatch.setattr(
+            "gateway.status.write_runtime_status",
+            lambda **kwargs: status.update(kwargs),
+        )
+
+        connected = await runner._start_secondary_profile_adapters()
+
+        assert connected == 0
+        assert runner._profile_adapters == {}
+        assert status["served_profiles"] == ["default", "reviewer"]
+        assert set(runner.pairing_stores) == {"default", "reviewer"}
+
+    @pytest.mark.asyncio
+    async def test_command_only_mode_defensively_blocks_direct_secondary_start(
+        self, monkeypatch
+    ):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_secondary_adapters=False,
+        )
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("secondary profile config must not load")
+            ),
+        )
+
+        assert await runner._start_one_profile_adapters(
+            "reviewer", Path("/tmp/reviewer"), {}
+        ) == 0
+
+    def test_command_only_mode_never_schedules_secondary_reconnect(self):
+        runner = _secondary_recovery_runner()
+        runner.config.multiplex_secondary_adapters = False
+        adapter = _SecondaryRecoveryAdapter()
+
+        runner._schedule_secondary_profile_reconnect(
+            "reviewer", Platform.DISCORD, adapter
+        )
+
+        assert runner._background_tasks == set()
+        assert runner._profile_failed_platforms == {}
+
 
     @pytest.mark.asyncio
     async def test_secondary_reports_all_port_binding_platforms(self, monkeypatch):
@@ -512,5 +591,4 @@ class TestFeishuPortBindingConditional:
 
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
-
 

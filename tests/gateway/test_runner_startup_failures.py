@@ -110,6 +110,9 @@ async def test_start_gateway_replace_aborts_when_force_killed_pid_still_alive(
     gateways fighting over the same token. It should abort instead.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "gateway.status._assert_test_isolation_signal_target", lambda pid: None
+    )
 
     calls = []
     removed_pid = False
@@ -170,6 +173,9 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
     target via systemd Restart=on-failure, starting a flap loop.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "gateway.status._assert_test_isolation_signal_target", lambda pid: None
+    )
 
     # Record the ORDER of marker-write + terminate_pid calls
     events: list[str] = []
@@ -252,6 +258,9 @@ async def test_start_gateway_replace_clears_marker_on_permission_denied(
     """If we fail to kill the existing PID (permission denied), clean up the
     marker so it doesn't grief an unrelated future shutdown."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "gateway.status._assert_test_isolation_signal_target", lambda pid: None
+    )
 
     def write_marker(target_pid: int) -> bool:
         from gateway.status import _get_takeover_marker_path, _write_json_file
@@ -411,5 +420,3 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
         await start_gateway(config=GatewayConfig(), replace=False, verbosity=0)
 
     assert exc_info.value.code == GATEWAY_FATAL_CONFIG_EXIT_CODE
-
-

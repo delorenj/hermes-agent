@@ -25,7 +25,11 @@ import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    get_hermes_test_isolation_root,
+    get_process_hermes_home,
+)
 from typing import Any, Callable, NamedTuple, Optional
 from utils import atomic_json_write
 
@@ -138,10 +142,7 @@ def _get_process_hermes_home() -> Path:
     profile directory when a profile-context task happens to be active at write
     time.  See issue #56986.
     """
-    val = os.environ.get("HERMES_HOME", "").strip()
-    if val:
-        return Path(val)
-    return _get_platform_default_hermes_home()
+    return get_process_hermes_home()
 
 
 def _canonical_hermes_home(path: Path | str) -> Path:
@@ -250,6 +251,8 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
     POSIX uses SIGTERM/SIGKILL. Windows uses taskkill /T /F for true force-kill
     because os.kill(..., SIGTERM) is not equivalent to a tree-killing hard stop.
     """
+    _assert_test_isolation_signal_target(pid)
+
     if force and _IS_WINDOWS:
         # CREATE_NO_WINDOW: terminate_pid runs from the windowless pythonw.exe
         # gateway/desktop backend, so a bare taskkill spawn would flash a
@@ -275,6 +278,74 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
 
     sig = signal.SIGTERM if not force else getattr(signal, "SIGKILL", signal.SIGTERM)
     os.kill(pid, sig)
+
+
+def _assert_test_isolation_signal_target(pid: int) -> None:
+    """Fail closed when a marked test process targets a foreign live PID.
+
+    The in-process pytest guard monkeypatches ``os.kill``, but that patch does
+    not survive ``exec``.  A real CLI child therefore needs a production-code
+    backstop.  Under ``HERMES_TEST_ISOLATION`` it may signal only itself, one
+    of its descendants, or a process carrying the same isolation marker with
+    a contained ``HERMES_HOME``.  Outside tests this function is a no-op.
+
+    PID existence and environment inspection are read-only.  Any inability to
+    establish ownership for a live target fails closed without logging its
+    command line or environment.
+    """
+    isolation_root = get_hermes_test_isolation_root()
+    if isolation_root is None:
+        return
+
+    target_pid = int(pid)
+    if target_pid == os.getpid():
+        return
+    if target_pid <= 0:
+        raise PermissionError(
+            "HERMES_TEST_ISOLATION blocked a non-positive signal target"
+        )
+
+    try:
+        import psutil  # type: ignore
+
+        target = psutil.Process(target_pid)
+    except Exception as exc:
+        # A vanished/nonexistent target is harmless: the platform primitive
+        # below will raise ProcessLookupError or be a no-op.  Only a live
+        # process whose ownership cannot be proven must be blocked.
+        if not _pid_exists(target_pid):
+            return
+        raise PermissionError(
+            "HERMES_TEST_ISOLATION could not verify a live signal target"
+        ) from exc
+
+    try:
+        if any(parent.pid == os.getpid() for parent in target.parents()):
+            return
+    except Exception:
+        pass
+
+    try:
+        target_env = target.environ()
+        raw_marker = str(target_env.get("HERMES_TEST_ISOLATION", "")).strip()
+        if not raw_marker:
+            raise ValueError("target has no isolation marker")
+        target_root = Path(raw_marker).expanduser().resolve(strict=False)
+        if target_root != isolation_root:
+            raise ValueError("target belongs to another isolation root")
+        raw_home = str(target_env.get("HERMES_HOME", "")).strip()
+        target_home = (
+            Path(raw_home).expanduser().resolve(strict=False)
+            if raw_home
+            else target_root
+        )
+        target_home.relative_to(isolation_root)
+        return
+    except Exception as exc:
+        raise PermissionError(
+            "HERMES_TEST_ISOLATION blocked a gateway signal to a process "
+            "outside its disposable process tree"
+        ) from exc
 
 
 def _scope_hash(identity: str) -> str:

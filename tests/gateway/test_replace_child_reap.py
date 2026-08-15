@@ -171,6 +171,9 @@ async def test_start_gateway_replace_reaps_old_gateway_children_posix(
     """--replace snapshots the old gateway's children before SIGTERM and
     reaps them after the main PID is confirmed dead (POSIX path)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "gateway.status._assert_test_isolation_signal_target", lambda pid: None
+    )
 
     events = []
     kids = [_FakeChild(401, ppid=1)]
@@ -244,5 +247,4 @@ async def test_start_gateway_replace_reaps_old_gateway_children_posix(
         ("terminate", 42, False),
         ("reap", 42, kids),
     ]
-
 

@@ -1725,7 +1725,11 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
         if _windows_scheduled_task_running(_task_name):
             return False
 
-    from gateway.status import _pid_exists, write_planned_stop_marker
+    from gateway.status import (
+        _pid_exists,
+        terminate_pid,
+        write_planned_stop_marker,
+    )
 
     own = {os.getpid()}
     if extra_exclude:
@@ -1790,7 +1794,7 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
         except Exception:
             pass
         try:
-            os.kill(pid, signal.SIGTERM)
+            terminate_pid(pid, force=False)
         except ProcessLookupError:
             continue
         except PermissionError:
@@ -1809,7 +1813,7 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
             time.sleep(0.2)
     for pid in survivors:
         try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            terminate_pid(pid, force=True)
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
@@ -1846,14 +1850,14 @@ def stop_profile_gateway() -> bool:
         return _reap_unsupervised_gateway_orphans()
 
     try:
-        from gateway.status import write_planned_stop_marker
+        from gateway.status import terminate_pid, write_planned_stop_marker
 
         write_planned_stop_marker(pid)
     except Exception:
         pass
 
     try:
-        os.kill(pid, signal.SIGTERM)
+        terminate_pid(pid, force=False)
     except ProcessLookupError:
         pass  # Already gone
     except PermissionError:
@@ -5210,12 +5214,15 @@ def _running_under_gateway_supervisor() -> bool:
 def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
     """Refuse a named-profile gateway when a multiplexer is already serving it.
 
-    When the default profile's gateway runs with gateway.multiplex_profiles=on,
-    it is the sole inbound process for EVERY profile on the host. Starting a
-    separate gateway for a named profile would double-bind that profile's
-    platforms (two pollers on one bot token, port fights). In that mode a
-    named-profile ``hermes gateway run`` is always a misconfiguration, so we
-    hard-error with a pointer to the multiplexer. ``--force`` overrides.
+    When the default profile's gateway runs with gateway.multiplex_profiles=on
+    and gateway.multiplex_secondary_adapters enabled, it is the sole inbound
+    process for every served profile on the host. Starting a separate gateway
+    for a named profile would double-bind that profile's platforms (two pollers
+    on one bot token, port fights). In that mode a named-profile
+    ``hermes gateway run`` is a misconfiguration, so we hard-error with a
+    pointer to the multiplexer. ``--force`` overrides. Command/control-only
+    multiplexers explicitly disable secondary adapters and therefore permit
+    standalone named-profile gateways.
 
     Inert unless ALL of: (a) this invocation is a named profile, (b) a default-
     profile gateway is running, (c) that gateway's config has multiplexing on.
@@ -5286,6 +5293,17 @@ def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
             return
 
         gateway_cfg = cfg.get("gateway", {}) or {}
+        if "multiplex_secondary_adapters" in cfg:
+            raw_secondary_adapters = cfg.get("multiplex_secondary_adapters")
+        else:
+            raw_secondary_adapters = gateway_cfg.get(
+                "multiplex_secondary_adapters", True
+            )
+        from gateway.config import _coerce_bool
+
+        if not _coerce_bool(raw_secondary_adapters, True):
+            return
+
         if "multiplex_profile_allowlist" in cfg:
             raw_allowlist = cfg.get("multiplex_profile_allowlist")
         else:
@@ -5655,13 +5673,20 @@ def run_gateway(
 
     success = False
     try:
-        success = asyncio.run(
-            start_gateway(
+        if startup_model_override is None:
+            # Preserve the legacy call contract for embedders/test doubles that
+            # predate process-local route metadata.
+            gateway_coro = start_gateway(
+                replace=replace,
+                verbosity=verbosity,
+            )
+        else:
+            gateway_coro = start_gateway(
                 replace=replace,
                 verbosity=verbosity,
                 model_override=startup_model_override,
             )
-        )
+        success = asyncio.run(gateway_coro)
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # On Windows-detached runs this shouldn't fire (we absorb SIGINT above),

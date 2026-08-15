@@ -517,6 +517,20 @@ _ensure_project_root_on_path_fast()
 # ---------------------------------------------------------------------------
 def _apply_profile_override() -> None:
     """Pre-parse --profile/-p and set HERMES_HOME before imports."""
+    # HERMES_TEST_ISOLATION is a path-valued subprocess contract, not just a
+    # boolean.  A child CLI that retained the marker but lost HERMES_HOME used
+    # to fall back through HOME and could resolve an operator's live named
+    # profile before pytest's in-process guards had any chance to run.
+    try:
+        from hermes_constants import get_hermes_test_isolated_home
+
+        isolated_home = get_hermes_test_isolated_home()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if isolated_home is not None:
+        os.environ["HERMES_HOME"] = str(isolated_home)
+
     argv = sys.argv[1:]
     profile_name = None
     consume = 0

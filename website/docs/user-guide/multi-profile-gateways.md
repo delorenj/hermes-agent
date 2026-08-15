@@ -105,29 +105,48 @@ credentials, and routes each inbound message to the profile it belongs to. Each
 turn resolves the routed profile's config, skills, memory, SOUL, **and provider
 keys** — credentials are never shared across profiles.
 
+If named profiles keep their own standalone messaging gateways, disable
+secondary adapter startup on the multiplexer:
+
+```yaml
+gateway:
+  multiplex_profiles: true
+  multiplex_secondary_adapters: false
+```
+
+This command/control mode keeps the served-profile registry, profile routing,
+shared HTTP prefixes, cron, and profile-scoped runtime behavior, while only the
+active profile's adapters connect in the multiplexing process. Standalone
+named-profile gateways can then own their Telegram, Slack, Discord, or other bot
+credentials without a second poller taking them over. The default is `true` for
+backward compatibility.
+
 You do **not** run `hermes gateway start` for the secondary profiles — the
-default gateway serves them. See the contract changes below.
+default gateway serves them unless `multiplex_secondary_adapters` is false. See
+the contract changes below.
 
 ### What changes when multiplexing is on
 
 Enabling the flag changes how a few things behave. All of these revert the
 moment the flag is off.
 
-#### 1. Secondary profiles must not start their own gateway
+#### 1. Secondary profiles share adapters by default
 
-With a multiplexer running, a named-profile `hermes gateway start` / `run` is a
-**hard error**, pointing you back at the multiplexer:
+With a multiplexer running its default adapter-sharing mode, a named-profile
+`hermes gateway start` / `run` is a **hard error**, pointing you back at the
+multiplexer:
 
 ```
 The default gateway is running as a profile multiplexer and already serves
 profile 'coder'. ...
 ```
 
-The multiplexer is the single inbound process; a second profile gateway would
-double-bind that profile's platforms. Pass `--force` only if you deliberately
-want a separate process for that profile (not recommended while the multiplexer
-is running). The cross-profile lifecycle wrapper script earlier on this page is
-therefore **not** used in multiplex mode — you only manage the default gateway.
+The multiplexer is the single inbound process in this mode; a second profile
+gateway would double-bind that profile's platforms. When
+`multiplex_secondary_adapters: false`, the guard permits standalone gateways for
+served named profiles because the multiplexer deliberately does not connect
+their messaging adapters. Otherwise, pass `--force` only for an intentional
+exception (not recommended while adapter sharing is enabled).
 
 #### 2. HTTP-inbound platforms are reached via a `/p/<profile>/` URL prefix
 

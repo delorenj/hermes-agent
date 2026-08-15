@@ -16,6 +16,7 @@ from hermes_constants import (
     get_default_hermes_root,
     get_hermes_dir,
     get_hermes_home,
+    get_hermes_test_isolated_home,
     get_process_hermes_home,
     heal_hermes_managed_node,
     hermes_managed_node_tree_present,
@@ -30,12 +31,43 @@ from hermes_constants import (
 )
 
 
+class TestHermesTestIsolationHome:
+    def test_marker_is_authoritative_when_child_loses_hermes_home(
+        self, tmp_path, monkeypatch
+    ):
+        isolation_root = tmp_path / "isolation"
+        isolation_root.mkdir()
+        monkeypatch.setenv("HERMES_TEST_ISOLATION", str(isolation_root))
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        assert get_hermes_test_isolated_home() == isolation_root.resolve()
+        assert get_hermes_home() == isolation_root.resolve()
+        assert get_process_hermes_home() == isolation_root.resolve()
+        assert get_default_hermes_root() == isolation_root.resolve()
+
+    def test_explicit_production_home_outside_marker_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        isolation_root = tmp_path / "isolation"
+        operator_home = tmp_path / "operator"
+        production_home = operator_home / ".hermes"
+        isolation_root.mkdir()
+        production_home.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: operator_home)
+        monkeypatch.setenv("HERMES_TEST_ISOLATION", str(isolation_root))
+        monkeypatch.setenv("HERMES_HOME", str(production_home))
+
+        with pytest.raises(RuntimeError, match="production HERMES_HOME"):
+            get_hermes_home()
+
+
 class TestGetDefaultHermesRoot:
     """Tests for get_default_hermes_root() — Docker/custom deployment awareness."""
 
     def test_no_hermes_home_returns_native(self, tmp_path, monkeypatch):
-        """When HERMES_HOME is not set, returns ~/.hermes."""
+        """Without either override, production falls back to ~/.hermes."""
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         assert get_default_hermes_root() == tmp_path / ".hermes"

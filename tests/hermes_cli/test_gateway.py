@@ -406,13 +406,11 @@ class TestStopProfileGateway:
         calls = {"kill": 0, "alive_probes": 0, "remove": 0, "reap_calls": 0}
 
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
-        # Post-#21561: the stop loop sends one SIGTERM via ``os.kill`` then
-        # polls liveness via ``gateway.status._pid_exists`` (safe on
-        # Windows — bpo-14484). Instrument both seams separately.
+        # The stop loop routes SIGTERM through the centralized, test-isolated
+        # terminate helper, then polls liveness separately.
         monkeypatch.setattr(
-            gateway.os,
-            "kill",
-            lambda pid, sig: calls.__setitem__("kill", calls["kill"] + 1),
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: calls.__setitem__("kill", calls["kill"] + 1),
         )
         monkeypatch.setattr(
             "gateway.status._pid_exists",
@@ -444,7 +442,9 @@ class TestStopProfileGateway:
         reap_extra_excludes = []
 
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: killed_pid)
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid", lambda pid, force=False: None
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
@@ -494,7 +494,10 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: killed_pids.append((pid, force)),
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
         monkeypatch.setattr("time.sleep", lambda _: None)
@@ -524,7 +527,10 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: killed_pids.append((pid, force)),
+        )
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
@@ -587,7 +593,10 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: killed_pids.append((pid, force)),
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
         monkeypatch.setattr("time.sleep", lambda _: None)
@@ -630,7 +639,10 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: killed_pids.append((pid, force)),
+        )
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
@@ -695,7 +707,10 @@ class TestReaperCandidateIsSupervisorOwned:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: killed_pids.append((pid, force)),
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
         monkeypatch.setattr("time.sleep", lambda _: None)
@@ -735,7 +750,10 @@ class TestReaperCandidateIsSupervisorOwned:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: killed_pids.append((pid, force)),
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
         monkeypatch.setattr("time.sleep", lambda _: None)
@@ -846,7 +864,10 @@ class TestWindowsScheduledTaskSupervisorGuard:
             ],
         )
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: killed_pids.append((pid, force)),
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
         monkeypatch.setattr("time.sleep", lambda _: None)

@@ -22,6 +22,10 @@ class TestServedProfilesStatus:
 
 def test_cron_profile_homes_follow_allowlist(tmp_path, monkeypatch):
     """The helper wired into in-process cron returns only selected profiles."""
+    # This fixture deliberately makes tmp_path the platform-native home. It is
+    # already isolated and therefore opts out of the exec-boundary marker,
+    # whose production-home guard correctly rejects that synthetic layout.
+    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     default_home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(default_home))
@@ -101,6 +105,33 @@ class TestNamedProfileMultiplexerGuard:
             gw._guard_named_profile_under_multiplexer(force=False)
 
     @pytest.mark.parametrize(
+        "config_yaml",
+        [
+            (
+                "gateway:\n"
+                "  multiplex_profiles: true\n"
+                "  multiplex_secondary_adapters: false\n"
+            ),
+            (
+                "multiplex_profiles: true\n"
+                "multiplex_secondary_adapters: false\n"
+                "gateway:\n"
+                "  multiplex_secondary_adapters: true\n"
+            ),
+        ],
+        ids=["nested", "top-level-precedence"],
+    )
+    def test_command_only_multiplexer_allows_standalone_profile(
+        self, monkeypatch, tmp_path, config_yaml
+    ):
+        self._fake_running_default_gateway(monkeypatch, tmp_path)
+        (tmp_path / "config.yaml").write_text(config_yaml, encoding="utf-8")
+
+        from hermes_cli import gateway as gw
+
+        gw._guard_named_profile_under_multiplexer(force=False)
+
+    @pytest.mark.parametrize(
         "allowlist_yaml",
         ["[]", "[worker]", "coder"],
     )
@@ -118,5 +149,3 @@ class TestNamedProfileMultiplexerGuard:
         from hermes_cli import gateway as gw
 
         gw._guard_named_profile_under_multiplexer(force=False)
-
-

@@ -970,6 +970,12 @@ class GatewayConfig:
     # phases) per-profile adapters/credentials are resolved. When False, the
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
+    # Whether a multiplexing gateway should also connect each served named
+    # profile's messaging adapters. True preserves the historical multiplex
+    # behavior. Set false when named profiles have their own standalone
+    # gateways: the multiplexer still provides shared routing, HTTP prefixes,
+    # cron, and profile runtime scope without claiming their bot credentials.
+    multiplex_secondary_adapters: bool = True
     # Optional named-profile allowlist for multiplex mode. None preserves the
     # historical serve-all behavior; [] serves only the default profile.
     multiplex_profile_allowlist: Optional[List[str]] = None
@@ -1121,6 +1127,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
+            "multiplex_secondary_adapters": self.multiplex_secondary_adapters,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
@@ -1187,6 +1194,14 @@ class GatewayConfig:
         multiplex_profiles = data.get("multiplex_profiles")
         raw_gateway = data.get("gateway")
         nested_gateway = raw_gateway if isinstance(raw_gateway, dict) else {}
+        if "multiplex_secondary_adapters" in data:
+            multiplex_secondary_adapters = data.get(
+                "multiplex_secondary_adapters"
+            )
+        else:
+            multiplex_secondary_adapters = nested_gateway.get(
+                "multiplex_secondary_adapters"
+            )
         if "multiplex_profile_allowlist" in data:
             multiplex_profile_allowlist = data.get("multiplex_profile_allowlist")
         else:
@@ -1266,6 +1281,9 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            multiplex_secondary_adapters=_coerce_bool(
+                multiplex_secondary_adapters, True
+            ),
             multiplex_profile_allowlist=multiplex_profile_allowlist,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
@@ -1410,6 +1428,11 @@ def load_gateway_config() -> GatewayConfig:
             if "multiplex_profiles" in yaml_cfg:
                 gw_data["multiplex_profiles"] = yaml_cfg["multiplex_profiles"]
 
+            if "multiplex_secondary_adapters" in yaml_cfg:
+                gw_data["multiplex_secondary_adapters"] = yaml_cfg[
+                    "multiplex_secondary_adapters"
+                ]
+
             if "multiplex_profile_allowlist" in yaml_cfg:
                 gw_data["multiplex_profile_allowlist"] = yaml_cfg[
                     "multiplex_profile_allowlist"
@@ -1435,6 +1458,13 @@ def load_gateway_config() -> GatewayConfig:
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]
+                if (
+                    "multiplex_secondary_adapters" in gateway_section
+                    and "multiplex_secondary_adapters" not in gw_data
+                ):
+                    gw_data["multiplex_secondary_adapters"] = gateway_section[
+                        "multiplex_secondary_adapters"
+                    ]
                 if "max_concurrent_sessions" in gateway_section:
                     gw_data["max_concurrent_sessions"] = gateway_section["max_concurrent_sessions"]
                 if "systemd_watchdog_seconds" in gateway_section:

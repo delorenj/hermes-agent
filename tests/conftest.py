@@ -86,7 +86,9 @@ def _hermes_home_points_at_production(value: str) -> bool:
     return resolved.parent.name == "profiles" and resolved.parent.parent == real_root
 
 
-if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
+if not os.environ.get("HERMES_HOME", "").strip() or _hermes_home_points_at_production(
+    os.environ.get("HERMES_HOME", "")
+):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
@@ -103,7 +105,7 @@ if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
 # Tests that legitimately need a child to look like a non-test process AND
 # open a real DB must export HERMES_STATE_DB_GUARD_BYPASS=1 in that child's
 # env instead of stripping markers.
-os.environ["HERMES_TEST_ISOLATION"] = os.environ.get("HERMES_HOME", "") or "1"
+os.environ["HERMES_TEST_ISOLATION"] = os.environ["HERMES_HOME"]
 
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
 #: module could import code that configures logging. Recorded so the guard in

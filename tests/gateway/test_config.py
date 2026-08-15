@@ -1170,6 +1170,45 @@ class TestMultiplexProfilesConfig:
             "loader must respect top-level precedence when key is present"
         )
 
+    def test_multiplex_secondary_adapters_defaults_true(self):
+        config = GatewayConfig.from_dict({"multiplex_profiles": True})
+
+        assert config.multiplex_secondary_adapters is True
+        assert GatewayConfig.from_dict(
+            config.to_dict()
+        ).multiplex_secondary_adapters is True
+
+    def test_multiplex_secondary_adapters_nested_false(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  multiplex_profiles: true\n"
+            "  multiplex_secondary_adapters: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.multiplex_profiles is True
+        assert config.multiplex_secondary_adapters is False
+
+    def test_multiplex_secondary_adapters_top_level_precedence(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "multiplex_secondary_adapters: false\n"
+            "gateway:\n"
+            "  multiplex_secondary_adapters: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        assert load_gateway_config().multiplex_secondary_adapters is False
+
 
 class TestApiServerEnvOverride:
     def test_env_key_does_not_reenable_explicitly_disabled_api_server(self):

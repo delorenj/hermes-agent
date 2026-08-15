@@ -108,10 +108,11 @@ def test_channel_route_wins_over_gateway_startup_route(monkeypatch):
 
 def test_override_is_rejected_for_profile_multiplexer(monkeypatch):
     import gateway.run as gateway_run
+    from gateway.config import GatewayConfig
 
     monkeypatch.setattr(gateway_run.GatewayRunner, "_warn_if_docker_media_delivery_is_risky", lambda _self: None)
     with pytest.raises(ValueError, match="multiplex_profiles"):
         gateway_run.GatewayRunner(
-            SimpleNamespace(multiplex_profiles=True),
+            GatewayConfig(multiplex_profiles=True),
             model_override=GatewayModelOverride.build(model="hermes"),
         )

@@ -17,6 +17,7 @@ _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
     "_HERMES_HOME_OVERRIDE", default=_UNSET
 )
+_TEST_ISOLATION_MARKER_ENV = "HERMES_TEST_ISOLATION"
 
 # ── TUI busy-indicator styles ─────────────────────────────────────────
 # Single source of truth shared by the CLI /indicator command, the TUI
@@ -59,6 +60,86 @@ def _get_platform_default_hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
+def get_hermes_test_isolation_root() -> Path | None:
+    """Return the subprocess-safe Hermes test root, when the marker is set.
+
+    ``tests/conftest.py`` exports ``HERMES_TEST_ISOLATION`` before collection
+    and points it at a disposable Hermes home.  Child processes sometimes
+    rebuild their environment and accidentally omit ``HERMES_HOME`` while
+    retaining the marker.  The marker is therefore an authoritative fallback,
+    not merely a boolean: a marked process must never fall through to the
+    operator's platform-default ``~/.hermes`` tree.
+
+    A marker that names the platform production root (or one of its named
+    profiles) is invalid and fails closed.  The value is never included in an
+    error message, so an unusual path cannot leak into test output.
+    """
+    raw = os.environ.get(_TEST_ISOLATION_MARKER_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        root = Path(raw).expanduser().resolve(strict=False)
+        production = _get_platform_default_hermes_home().expanduser().resolve(
+            strict=False
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            "HERMES_TEST_ISOLATION must name a resolvable disposable directory"
+        ) from exc
+
+    is_production_profile = (
+        root.parent.name == "profiles" and root.parent.parent == production
+    )
+    if root == production or is_production_profile:
+        raise RuntimeError(
+            "HERMES_TEST_ISOLATION refuses the platform production Hermes home"
+        )
+    return root
+
+
+def _is_platform_production_hermes_home(path: Path) -> bool:
+    """True for the platform Hermes root or one of its named profiles."""
+    production = _get_platform_default_hermes_home().expanduser().resolve(
+        strict=False
+    )
+    return path == production or (
+        path.parent.name == "profiles" and path.parent.parent == production
+    )
+
+
+def get_hermes_test_isolated_home() -> Path | None:
+    """Resolve the effective home under ``HERMES_TEST_ISOLATION``.
+
+    When the marker is absent this returns ``None`` and production resolution
+    is unchanged.  When present, a missing ``HERMES_HOME`` resolves to the
+    marker root.  An explicit production root/profile fails closed; explicit
+    non-production temp homes remain supported because many unit tests model
+    Docker and platform layouts in sibling temp directories.  This closes the
+    exec-boundary fallback without breaking those isolated fixtures.
+    """
+    root = get_hermes_test_isolation_root()
+    if root is None:
+        return None
+
+    raw_home = os.environ.get("HERMES_HOME", "").strip()
+    try:
+        home = (
+            Path(raw_home).expanduser().resolve(strict=False)
+            if raw_home
+            else root
+        )
+        try:
+            home.relative_to(root)
+        except ValueError:
+            if _is_platform_production_hermes_home(home):
+                raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            "HERMES_TEST_ISOLATION blocked a production HERMES_HOME"
+        ) from exc
+    return home
+
+
 def _hermes_home_from_env() -> Path:
     """Resolve HERMES_HOME from the process environment only.
 
@@ -68,6 +149,10 @@ def _hermes_home_from_env() -> Path:
     scope rather than a per-task profile.  Shared by :func:`get_hermes_home`
     and :func:`get_process_hermes_home` so the two never drift.
     """
+    isolated_home = get_hermes_test_isolated_home()
+    if isolated_home is not None:
+        return isolated_home
+
     val = os.environ.get("HERMES_HOME", "").strip()
     if val:
         return Path(val)
@@ -131,6 +216,21 @@ def get_hermes_home() -> Path:
     """
     override = get_hermes_home_override()
     if override:
+        isolation_root = get_hermes_test_isolation_root()
+        if isolation_root is not None:
+            try:
+                resolved_override = Path(override).expanduser().resolve(strict=False)
+                try:
+                    resolved_override.relative_to(isolation_root)
+                except ValueError:
+                    if _is_platform_production_hermes_home(resolved_override):
+                        raise
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    "HERMES_TEST_ISOLATION blocked a production context-local "
+                    "Hermes home"
+                ) from exc
+            return resolved_override
         return Path(override)
 
     if not os.environ.get("HERMES_HOME", "").strip():
@@ -177,7 +277,7 @@ def get_process_hermes_home() -> Path:
 # Its result depends only on (HERMES_HOME, platform native home), which are
 # compared for free on each call, so the memo is freshness-correct even if a
 # test or plugin mutates HERMES_HOME mid-process.
-_default_hermes_root_memo: "tuple[str, str, Path] | None" = None
+_default_hermes_root_memo: "tuple[str, str, str, Path] | None" = None
 
 
 def get_default_hermes_root() -> Path:
@@ -200,12 +300,22 @@ def get_default_hermes_root() -> Path:
     global _default_hermes_root_memo
     native_home = _get_platform_default_hermes_home()
     env_home = os.environ.get("HERMES_HOME", "")
+    isolation_marker = os.environ.get(_TEST_ISOLATION_MARKER_ENV, "")
     if _default_hermes_root_memo is not None:
-        memo_native, memo_env, memo_result = _default_hermes_root_memo
-        if memo_native == str(native_home) and memo_env == env_home:
+        memo_native, memo_env, memo_isolation, memo_result = _default_hermes_root_memo
+        if (
+            memo_native == str(native_home)
+            and memo_env == env_home
+            and memo_isolation == isolation_marker
+        ):
             return memo_result
 
-    if not env_home:
+    isolation_root = get_hermes_test_isolation_root()
+    if isolation_root is not None:
+        get_hermes_test_isolated_home()
+    if isolation_root is not None and not env_home:
+        result = isolation_root
+    elif not env_home:
         result = native_home
     else:
         env_path = Path(env_home)
@@ -223,7 +333,12 @@ def get_default_hermes_root() -> Path:
             else:
                 # Not a profile path — HERMES_HOME itself is the root
                 result = env_path
-    _default_hermes_root_memo = (str(native_home), env_home, result)
+    _default_hermes_root_memo = (
+        str(native_home),
+        env_home,
+        isolation_marker,
+        result,
+    )
     return result
 
 

@@ -14649,14 +14649,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns the number of secondary adapters that connected. No-op (returns
         0) unless ``gateway.multiplex_profiles`` is on.
 
-        Each profile's adapters are created and connected under that profile's
-        HERMES_HOME + secret scope (``_profile_runtime_scope``), stored in
+        When ``gateway.multiplex_secondary_adapters`` is true (the backward-
+        compatible default), each profile's adapters are created and connected
+        under that profile's HERMES_HOME + secret scope
+        (``_profile_runtime_scope``), stored in
         ``self._profile_adapters[profile]``, and given a message handler that
         stamps ``source.profile`` before delegating to the shared
-        ``_handle_message`` — so the agent turn resolves that profile's config,
-        skills, and credentials. Same-platform credential collisions (two
-        profiles polling the same bot token) are detected and refused here, the
-        only point that sees every profile's resolved credentials together.
+        ``_handle_message``. When it is false, served-profile routing and
+        pairing state are still projected, but only the active profile's
+        process-level adapters run.
         """
         if not getattr(self.config, "multiplex_profiles", False):
             return 0
@@ -14667,31 +14668,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
 
         active = get_active_profile_name() or "default"
+        connect_secondary_adapters = bool(
+            getattr(self.config, "multiplex_secondary_adapters", True)
+        )
         connected = 0
         # Resource claim -> profile that owns it. Credential claims prevent two
         # profiles polling the same account; listener claims prevent sidecars
         # with distinct credentials from binding the same endpoint.
         claimed: Dict[tuple, str] = {}
-        for _plat, _ad in self.adapters.items():
-            fp = self._adapter_credential_fingerprint(_ad)
-            if fp is not None:
-                claimed[(_plat, fp)] = active
-            listener_claim = self._adapter_listener_claim(_plat, _ad)
-            if listener_claim is not None:
-                claimed[listener_claim] = active
-        # A retryable primary still owns its configured credential and listener.
-        # Reserve both while it is queued so a secondary cannot take the endpoint
-        # before the reconnect watcher retries the primary adapter.
-        for retry_info in getattr(self, "_failed_platforms", {}).values():
-            for claim_name in ("credential_claim", "listener_claim"):
-                retry_claim = retry_info.get(claim_name)
-                if isinstance(retry_claim, tuple):
-                    claimed[retry_claim] = active
+        if connect_secondary_adapters:
+            for _plat, _ad in self.adapters.items():
+                fp = self._adapter_credential_fingerprint(_ad)
+                if fp is not None:
+                    claimed[(_plat, fp)] = active
+                listener_claim = self._adapter_listener_claim(_plat, _ad)
+                if listener_claim is not None:
+                    claimed[listener_claim] = active
+            # A retryable primary still owns its configured credential and listener.
+            # Reserve both while it is queued so a secondary cannot take the endpoint
+            # before the reconnect watcher retries the primary adapter.
+            for retry_info in getattr(self, "_failed_platforms", {}).values():
+                for claim_name in ("credential_claim", "listener_claim"):
+                    retry_claim = retry_info.get(claim_name)
+                    if isinstance(retry_claim, tuple):
+                        claimed[retry_claim] = active
 
         profile_homes = _multiplex_profile_homes(self.config)
         for profile_name, profile_home in profile_homes:
             if profile_name == active:
                 continue  # handled by the primary startup loop
+            if not connect_secondary_adapters:
+                continue
             try:
                 connected += await self._start_one_profile_adapters(
                     profile_name, profile_home, claimed
@@ -14741,6 +14748,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
     ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
+        if not getattr(self.config, "multiplex_secondary_adapters", True):
+            return 0
         from gateway.config import load_gateway_config
 
         with _profile_runtime_scope(profile_home):
@@ -14908,6 +14917,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, profile_name: str, platform: Platform
     ) -> None:
         """Reconnect a retryable secondary adapter under its own profile scope."""
+        if not getattr(self.config, "multiplex_secondary_adapters", True):
+            return
         attempts = 0
         current_task = asyncio.current_task()
         try:
@@ -15006,7 +15017,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, profile_name: str, platform: Platform, adapter: BasePlatformAdapter
     ) -> None:
         """Schedule one runner-owned reconnect without sharing primary secrets."""
-        if not self._running or not adapter.fatal_error_retryable:
+        if (
+            not self._running
+            or not adapter.fatal_error_retryable
+            or not getattr(self.config, "multiplex_secondary_adapters", True)
+        ):
             return
         pending = self._profile_failed_platforms
         if not isinstance(pending, dict):
@@ -29563,6 +29578,7 @@ async def start_gateway(
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
     from gateway.status import (
+        _assert_test_isolation_signal_target,
         acquire_gateway_runtime_lock,
         get_running_pid,
         get_process_start_time,
@@ -29573,6 +29589,15 @@ async def start_gateway(
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
+            try:
+                # The pytest monkeypatch guard does not survive a child CLI
+                # exec.  Fail before writing a takeover marker when the
+                # subprocess-level isolation contract cannot prove that the
+                # recorded PID belongs to its disposable process tree.
+                _assert_test_isolation_signal_target(existing_pid)
+            except PermissionError as exc:
+                logger.error("Refusing isolated-test gateway takeover: %s", exc)
+                return False
             existing_start_time = get_process_start_time(existing_pid)
             logger.info(
                 "Replacing existing gateway instance (PID %d) with --replace.",
