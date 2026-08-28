@@ -1167,6 +1167,31 @@ def write_runtime_status(
     except Exception:
         pass
 
+    # Mirror the same snapshot to systemd as a one-line STATUS=. This function
+    # is the single funnel every gateway state change already flows through, so
+    # all 13 call sites make `systemctl --user status` show real health instead
+    # of just "active (running)" — for free, with no new call sites to maintain.
+    # Inert today: under Type=simple NOTIFY_SOCKET is unset and notify() returns
+    # False before opening a socket. Wrapped because a status write must never
+    # be able to take down a gateway.
+    try:
+        from gateway.systemd_notify import notify as _sd_notify
+
+        parts = [f"state={payload.get('gateway_state') or 'unknown'}"]
+        agents = payload.get("active_agents")
+        if isinstance(agents, int):
+            parts.append(f"agents={agents}")
+        platforms = payload.get("platforms")
+        if isinstance(platforms, dict) and platforms:
+            states = []
+            for name, info in sorted(platforms.items()):
+                state = info.get("state", "?") if isinstance(info, dict) else "?"
+                states.append(f"{name}:{state}")
+            parts.append("platforms=" + ",".join(states))
+        _sd_notify("STATUS=" + " ".join(parts).replace("\n", " ")[:255])
+    except Exception:
+        pass
+
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information.

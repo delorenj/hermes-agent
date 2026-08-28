@@ -31702,6 +31702,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if callable(start_watchdog):
         start_watchdog()
 
+    # READY=1 is DELIBERATELY not gated on the watchdog. `systemd_watchdog_seconds`
+    # defaults to 0 and no fleet profile sets it, so the watchdog's own ready()
+    # never fired and Type=notify could never be adopted. Readiness and liveness
+    # are different questions: a unit wants to know startup finished even when it
+    # is not being pinged. Duplicate READY=1 (watchdog enabled AND this line) is
+    # idempotent to systemd. Under Type=simple NOTIFY_SOCKET is unset and notify()
+    # returns False before touching a socket, so this is inert until a unit opts in.
+    try:
+        from gateway.systemd_notify import notify as _sd_notify
+
+        _sd_notify("READY=1\nSTATUS=Hermes Gateway running")
+    except Exception:
+        logger.debug("sd_notify READY failed (non-fatal)", exc_info=True)
+
     # Wait for shutdown
     await runner.wait_for_shutdown()
 
