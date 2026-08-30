@@ -1,12 +1,12 @@
 ---
 sidebar_position: 8
 title: "Context Files"
-description: "Project context files — .hermes.md, AGENTS.md, CLAUDE.md, global SOUL.md, and .cursorrules — automatically injected into every conversation"
+description: "Global and project context files — configured fleet instructions, .hermes.md, AGENTS.md, CLAUDE.md, SOUL.md, and .cursorrules"
 ---
 
 # Context Files
 
-Hermes Agent automatically discovers and loads context files that shape how it behaves. Some are project-local and discovered from your working directory. `SOUL.md` is now global to the Hermes instance and is loaded from `HERMES_HOME` only.
+Hermes Agent automatically discovers and loads context files that shape how it behaves. `SOUL.md` supplies identity, explicitly configured global files supply fleet/operator rules, and project-local files specialize those rules for the active repository.
 
 ## Supported Context Files
 
@@ -17,14 +17,38 @@ Hermes Agent automatically discovers and loads context files that shape how it b
 | **AGENTS.md** | Project instructions, conventions, architecture | CWD at startup + subdirectories progressively |
 | **CLAUDE.md** | Claude Code context files (also detected) | CWD at startup + subdirectories progressively |
 | **SOUL.md** | Global personality and tone customization for this Hermes instance | `HERMES_HOME/SOUL.md` only |
+| **Configured global files** | Fleet/operator instructions shared across repositories | Ordered paths in `agent.global_instruction_files` |
 | **.cursorrules** | Cursor IDE coding conventions | CWD only |
 | **.cursor/rules/*.mdc** | Cursor IDE rule modules | CWD only |
 
 :::info Priority system
-Only **one** project context type is loaded per session (first match wins): `.hermes.md` → `AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** is always loaded independently as the agent identity (slot #1).
+Only **one** project context type is loaded per session (first match wins): `.hermes.md` → `AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** is always loaded independently as the agent identity (slot #1), and configured global files are an independent layer before project context.
 
 If an `AGENTS.override.md` exists next to an `AGENTS.md`, the override is loaded **instead of** the committed file — keep a personal (usually gitignored) `AGENTS.override.md` when you want different instructions than the ones checked into the repo, without editing the tracked `AGENTS.md`.
 :::
+
+## Configured Global Instructions
+
+Use `agent.global_instruction_files` when the same operator or fleet rules
+should apply in every workspace without copying them into each repository:
+
+```yaml
+# $HERMES_HOME/config.yaml
+agent:
+  global_instruction_files:
+    - ~/.agents/AGENTS.md
+```
+
+The list defaults to empty. Files load in list order after `SOUL.md` identity
+and before repository context, so the later git-root-to-CWD `AGENTS.md` chain
+can specialize global guidance. `~` expansion does not invoke a shell;
+relative paths are anchored to the active profile's `HERMES_HOME`.
+
+Global files use the same UTF-8 read, security scan, truncation, provenance,
+and content deduplication machinery as project files. If a configured path is
+missing or unreadable, Hermes starts normally, emits a visible warning, and
+places an `[UNAVAILABLE: ...]` marker in the context. Delegated workers inherit
+the parent agent's profile-scoped list when their workspace context is built.
 
 ## AGENTS.md
 
@@ -124,12 +148,13 @@ This means your existing Cursor conventions automatically apply when using Herme
 
 Context files are loaded by `build_context_files_prompt()` in `agent/prompt_builder.py`:
 
-1. **Scan working directory** — checks for `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules` (first match wins)
-2. **Content is read** — each file is read as UTF-8 text
-3. **Security scan** — content is checked for prompt injection patterns
-4. **Truncation** — files exceeding the character cap are head/tail truncated (70% head, 20% tail, with a marker in the middle). The cap is an explicit `context_file_max_chars` from config.yaml when set; otherwise it scales dynamically with the model's context window (floor 20,000 chars, ceiling 500,000)
-5. **Assembly** — all sections are combined under a `# Project Context` header
-6. **Injection** — the assembled content is added to the system prompt
+1. **Load configured globals** — resolves `agent.global_instruction_files` in list order
+2. **Scan working directory** — checks for `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules` (first project match wins)
+3. **Content is read** — each file is read as UTF-8 text
+4. **Security scan** — content is checked for prompt injection patterns
+5. **Truncation** — files exceeding the character cap are head/tail truncated (70% head, 20% tail, with a marker in the middle). The cap is an explicit `context_file_max_chars` from config.yaml when set; otherwise it scales dynamically with the model's context window (floor 20,000 chars, ceiling 500,000)
+6. **Assembly** — identity, globals, and project sections retain precedence/provenance under the context block
+7. **Injection** — the assembled content is added to the system prompt before volatile memory/session layers
 
 ### During the session (progressive discovery)
 

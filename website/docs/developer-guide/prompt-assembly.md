@@ -29,7 +29,7 @@ Primary files:
 The cached system prompt is assembled as three ordered tiers (see `agent/system_prompt.py`):
 
 1. **stable** — identity (`SOUL.md` or fallback), tool/model guidance, skills prompt, environment hints, platform hints
-2. **context** — caller-supplied `system_message` plus project context files (`.hermes.md` / `AGENTS.md` / `CLAUDE.md` / `.cursorrules`)
+2. **context** — caller-supplied `system_message`, configured global instruction files, then project context files (`.hermes.md` / `AGENTS.md` / `CLAUDE.md` / `.cursorrules`)
 3. **volatile** — built-in memory snapshot (`MEMORY.md`), user profile snapshot (`USER.md`), external memory-provider block, timestamp/session/model/provider line
 
 The final system prompt is then joined as: `stable` → `context` → `volatile`.
@@ -98,20 +98,26 @@ your task, load it with skill_view(name) and follow its instructions.
     - arxiv: Search and summarize arXiv papers
 </available_skills>
 
-# Layer 8: Context files (from project directory)
+# Layer 8: Configured global instructions (from agent.global_instruction_files)
 # Project Context
-The following project context files have been loaded and should be followed:
+The following configured global instruction files and project context
+have been evaluated. Later project sections specialize earlier globals:
+
+## ~/.agents/AGENTS.md
+These rules apply to every Hermes workspace in this fleet.
+
+# Layer 9: Context files (from project directory)
 
 ## AGENTS.md
 This is the atlas project. Use pytest for testing. The main
 entry point is src/atlas/main.py. Always run `make lint` before
 committing.
 
-# Layer 9: Timestamp + session
+# Layer 10: Timestamp + session
 Current time: 2026-03-30T14:30:00-07:00
 Session: abc123
 
-# Layer 10: Platform hint
+# Layer 11: Platform hint
 You are a CLI AI Agent. Try not to use markdown but simple text
 renderable inside a terminal.
 ```
@@ -189,26 +195,29 @@ Be targeted and efficient in your exploration and investigations.
 
 ```python
 # From agent/prompt_builder.py (simplified)
-def build_context_files_prompt(cwd=None, skip_soul=False):
+def build_context_files_prompt(
+    cwd=None,
+    skip_soul=False,
+    global_instruction_files=None,
+):
     cwd_path = Path(cwd).resolve()
 
-    # Priority: first match wins — only ONE project context loaded
-    project_context = (
-        _load_hermes_md(cwd_path)       # 1. .hermes.md / HERMES.md (walks to git root)
-        or _load_agents_md(cwd_path)    # 2. AGENTS.md (cwd only)
-        or _load_claude_md(cwd_path)    # 3. CLAUDE.md (cwd only)
-        or _load_cursorrules(cwd_path)  # 4. .cursorrules / .cursor/rules/*.mdc
-    )
-
     sections = []
-    if project_context:
-        sections.append(project_context)
-
-    # SOUL.md from HERMES_HOME (independent of project context)
     if not skip_soul:
-        soul_content = load_soul_md()
-        if soul_content:
-            sections.append(soul_content)
+        if soul_content := load_soul_md():
+            sections.append(soul_content)  # identity first
+
+    global_sections, seen_content = _load_global_instruction_files(
+        global_instruction_files
+    )
+    sections.extend(global_sections)       # fleet/operator layer second
+
+    # Priority: first match wins — only ONE project context loaded
+    project_context = load_first_matching_project_type(
+        cwd_path, seen_content=seen_content
+    )
+    if project_context:
+        sections.append(project_context)  # repository specialization last
 
     if not sections:
         return ""
@@ -225,8 +234,9 @@ def build_context_files_prompt(cwd=None, skip_soul=False):
 
 | Priority | Files | Search scope | Notes |
 |----------|-------|-------------|-------|
+| Global | Paths in `agent.global_instruction_files` | Explicit paths; list order | Independent layer before project context; empty by default |
 | 1 | `.hermes.md`, `HERMES.md` | CWD up to git root | Hermes-native project config |
-| 2 | `AGENTS.md` | CWD only | Common agent instruction file |
+| 2 | `AGENTS.override.md`, `AGENTS.md` | Git root down to CWD | Merged hierarchy; deeper sections appear later |
 | 3 | `CLAUDE.md` | CWD only | Claude Code compatibility |
 | 4 | `.cursorrules`, `.cursor/rules/*.mdc` | CWD only | Cursor compatibility |
 
@@ -234,6 +244,18 @@ All context files are:
 - **Security scanned** — checked for prompt injection patterns (invisible unicode, "ignore previous instructions", credential exfiltration attempts)
 - **Truncated** — capped at `context_file_max_chars` characters using a 70/20 head/tail split with a truncation marker. The cap scales with the model's context window (20,000-char floor, 500K ceiling); an explicit `context_file_max_chars` in `config.yaml` always wins.
 - **YAML frontmatter stripped** — `.hermes.md` frontmatter is removed (reserved for future config overrides)
+
+Configured global files also retain their configured path as provenance. Their
+contents participate in the same content-deduplication set as project files, so
+a global file that is copied or symlinked into the repository is injected only
+once. Missing/unreadable configured files fail open with an in-prompt
+`[UNAVAILABLE: ...]` marker plus the normal frontend status warning.
+
+`agent_init` freezes the list from the active profile onto the `AIAgent`.
+Prompt assembly consumes that snapshot instead of re-reading ambient config,
+which is required for profile-multiplexed gateway worker threads. Delegation
+passes the same snapshot into its workspace-context builder and stores it on
+the child for nested delegation.
 
 ## API-call-time-only layers
 
@@ -254,14 +276,17 @@ Local memory and user profile data are captured in the system prompt's **volatil
 
 ## Context files
 
-`agent/prompt_builder.py` scans and sanitizes project context files using a **priority system** — only one type is loaded (first match wins):
+`agent/prompt_builder.py` first loads the ordered paths from
+`agent.global_instruction_files`, then scans and sanitizes project context
+files using a **priority system** — only one project type is loaded (first
+match wins):
 
 1. `.hermes.md` / `HERMES.md` (walks to git root)
 2. `AGENTS.md` (CWD at startup; subdirectories discovered progressively during the session via `agent/subdirectory_hints.py`)
 3. `CLAUDE.md` (CWD only)
 4. `.cursorrules` / `.cursor/rules/*.mdc` (CWD only)
 
-`SOUL.md` is loaded separately via `load_soul_md()` for the identity slot. When it loads successfully, `build_context_files_prompt(skip_soul=True)` prevents it from appearing twice.
+`SOUL.md` is loaded separately via `load_soul_md()` for the identity slot. When it loads successfully, `build_context_files_prompt(skip_soul=True)` prevents it from appearing twice. The resulting precedence is identity → configured globals → repository context → volatile skills/memory/session data.
 
 Long files are truncated before injection.
 
@@ -276,6 +301,7 @@ Most users should treat `agent/prompt_builder.py` as implementation code, not a 
 ### Use these surfaces first
 
 - `~/.hermes/SOUL.md` — replace the built-in default identity block with your own agent persona and standing behavior.
+- `agent.global_instruction_files` — add ordered operator/fleet instruction files that should apply across repositories (for example `~/.agents/AGENTS.md`).
 - `~/.hermes/MEMORY.md` and `~/.hermes/USER.md` — provide durable cross-session facts and user profile data that should be snapshotted into new sessions.
 - Project context files such as `.hermes.md`, `HERMES.md`, `AGENTS.md`, `CLAUDE.md`, or `.cursorrules` — inject repo-specific working rules.
 - Skills — package reusable workflows and references without editing core prompt code.

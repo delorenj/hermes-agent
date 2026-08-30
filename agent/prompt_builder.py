@@ -20,7 +20,7 @@ from hermes_constants import (
     reset_hermes_home_override,
     set_hermes_home_override,
 )
-from typing import List, Optional
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
@@ -2132,19 +2132,24 @@ def _truncate_content(
     max_chars: Optional[int] = None,
     context_length: Optional[int] = None,
     read_path: Optional[str] = None,
+    read_remediation: Optional[str] = None,
 ) -> str:
     """Head/tail truncation with a marker in the middle.
 
     ``filename`` is the human label used in warnings. ``read_path`` is the
     concrete path the agent should ``read_file`` to recover the full content
-    (defaults to ``filename`` when not supplied). ``context_length`` lets the
-    cap scale to the model's window when no explicit config override is set.
+    (defaults to ``filename`` when not supplied). ``read_remediation`` can
+    replace that single-file instruction for an aggregate assembled from
+    multiple sources. ``context_length`` lets the cap scale to the model's
+    window when no explicit config override is set.
     """
     if max_chars is None:
         max_chars = _get_context_file_max_chars(context_length)
     if len(content) <= max_chars:
         return content
-    target = read_path or filename
+    if read_remediation is None:
+        target = read_path or filename
+        read_remediation = f"read the complete file with the read_file tool: {target}"
     msg = (
         f"⚠️  Context file {filename} TRUNCATED: "
         f"{len(content)} chars exceeds limit of {max_chars} — "
@@ -2160,10 +2165,227 @@ def _truncate_content(
     marker = (
         f"\n\n[...truncated {filename}: kept {head_chars}+{tail_chars} of "
         f"{len(content)} chars. The middle is omitted — if you need the full "
-        f"instructions, read the complete file with the read_file tool: "
-        f"{target}]\n\n"
+        f"instructions, {read_remediation}]\n\n"
     )
     return head + marker + tail
+
+
+def _context_content_is_duplicate(content: str, seen_content: set[str]) -> bool:
+    """Record *content* and report whether it was already loaded.
+
+    Context-file deduplication is content based rather than path based so a
+    symlink, copied file, or configured global file that is also present in an
+    AGENTS.md directory chain is injected only once. YAML frontmatter is
+    removed from the comparison key so global, HERMES, and AGENTS sources with
+    the same Markdown body compare consistently. The caller's content remains
+    untouched: in particular, a repo-only AGENTS.md is still injected byte for
+    byte after the loader's historical outer whitespace strip. The normalized
+    key is recorded before security scanning; if a file is blocked, an
+    identical copy must not get a second chance through a lower-precedence
+    source.
+    """
+    dedupe_key = _strip_yaml_frontmatter(content)
+    if dedupe_key in seen_content:
+        return True
+    seen_content.add(dedupe_key)
+    return False
+
+
+def _safe_global_instruction_path(
+    configured_path: str,
+    *,
+    home_override: "Path | None" = None,
+) -> Path:
+    """Resolve one configured global-instruction path without shell expansion.
+
+    ``Path.expanduser`` expands ``~`` through the platform account database and
+    never evaluates shell syntax. Relative paths are anchored to the owning
+    Hermes profile rather than the process cwd, keeping their meaning stable
+    across CLI, gateway, desktop, and delegated surfaces.
+    """
+    path = Path(configured_path).expanduser()
+    if not path.is_absolute():
+        base = Path(home_override) if home_override is not None else get_hermes_home()
+        path = base / path
+    return path.resolve(strict=False)
+
+
+def _visible_global_instruction_problem(
+    *,
+    label: str,
+    problem: str,
+) -> str:
+    """Return a prompt-visible placeholder and queue the same user warning.
+
+    The problem string describes the failure without a path. ``label`` already
+    carries the user-authored configured path, so repeating a resolved path in
+    the problem would duplicate an absolute configured path in both surfaces.
+    """
+    warning = f"⚠️  Configured global instruction file {label} {problem}."
+    logger.warning(warning)
+    # Reuse the context-file warning accumulator/status channel that already
+    # surfaces truncation problems on every Hermes frontend.
+    _record_truncation_warning(warning)
+    return (
+        f"## {label}\n\n"
+        f"[UNAVAILABLE: Configured global instruction file {problem}.]"
+    )
+
+
+def _load_global_instruction_files(
+    configured_paths: Optional[Sequence[str]],
+    *,
+    context_length: Optional[int] = None,
+    home_override: "Path | None" = None,
+    seen_content: Optional[set[str]] = None,
+) -> Tuple[List[str], set[str]]:
+    """Load ordered, explicitly configured global instruction files.
+
+    Each file uses the same UTF-8 read, prompt-injection scan, per-file
+    truncation, provenance heading, and content deduplication contract as the
+    repository context loaders. Missing, invalid, and unreadable entries are
+    represented in the prompt and queued for the normal status channel instead
+    of aborting prompt construction.
+    """
+    shared_seen = seen_content if seen_content is not None else set()
+    sections: List[str] = []
+    seen_paths: set[Path] = set()
+
+    if not configured_paths:
+        return sections, shared_seen
+
+    # Defensive support for direct Python callers. Config-backed agents only
+    # store tuples of strings, but treating a lone string as one path prevents
+    # accidental character-by-character iteration.
+    entries: Iterable[object]
+    if isinstance(configured_paths, (str, os.PathLike)):
+        entries = (configured_paths,)
+    else:
+        entries = configured_paths
+
+    for raw_entry in entries:
+        if not isinstance(raw_entry, (str, os.PathLike)):
+            label = repr(raw_entry)
+            sections.append(
+                _visible_global_instruction_problem(
+                    label=label,
+                    problem="has a non-path entry in agent.global_instruction_files",
+                )
+            )
+            continue
+
+        configured = os.fspath(raw_entry).strip()
+        if not configured:
+            sections.append(
+                _visible_global_instruction_problem(
+                    label="<empty path>",
+                    problem="contains an empty agent.global_instruction_files entry",
+                )
+            )
+            continue
+
+        # Keep the user-authored spelling (notably ``~``) as provenance, but
+        # make control characters inert inside the Markdown heading.
+        label = configured.replace("\r", "\\r").replace("\n", "\\n")
+        try:
+            path = _safe_global_instruction_path(
+                configured,
+                home_override=home_override,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.debug(
+                "Could not resolve configured global instruction file %r: %s",
+                configured,
+                exc,
+            )
+            sections.append(
+                _visible_global_instruction_problem(
+                    label=label,
+                    problem="could not be resolved",
+                )
+            )
+            continue
+
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+
+        if not path.exists():
+            logger.debug(
+                "Configured global instruction file %r was not found at %s",
+                configured,
+                path,
+            )
+            sections.append(
+                _visible_global_instruction_problem(
+                    label=label,
+                    problem="was not found",
+                )
+            )
+            continue
+        if not path.is_file():
+            logger.debug(
+                "Configured global instruction file %r is not a regular file at %s",
+                configured,
+                path,
+            )
+            sections.append(
+                _visible_global_instruction_problem(
+                    label=label,
+                    problem="is not a regular file",
+                )
+            )
+            continue
+
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            logger.debug("Could not read %s: %s", path, exc)
+            sections.append(
+                _visible_global_instruction_problem(
+                    label=label,
+                    problem="could not be read",
+                )
+            )
+            continue
+
+        # Strip YAML frontmatter before dedup check, matching the .hermes.md
+        # loader behavior so a global file with frontmatter can match a
+        # repository file with identical body content.
+        content = _strip_yaml_frontmatter(content)
+        if not content or _context_content_is_duplicate(content, shared_seen):
+            continue
+
+        scanned = _scan_context_content(content, label)
+        section = f"## {label}\n\n{scanned}"
+        sections.append(
+            _truncate_content(
+                section,
+                label,
+                context_length=context_length,
+                read_path=str(path),
+            )
+        )
+
+    # Cap the aggregate global layer to the same per-file budget. Each file
+    # was already capped above, but a long list could multiply the budget N
+    # times. Preserve headings/provenance as far as truncation permits.
+    if sections:
+        max_chars = _get_context_file_max_chars(context_length)
+        joined = "\n\n".join(sections)
+        if len(joined) > max_chars:
+            joined = _truncate_content(
+                joined,
+                "global instruction files (aggregate)",
+                context_length=context_length,
+                read_remediation=(
+                    "read the configured source files individually with the "
+                    "read_file tool"
+                ),
+            )
+            sections = [joined]
+
+    return sections, shared_seen
 
 
 def load_soul_md(
@@ -2207,16 +2429,26 @@ def load_soul_md(
         return None
 
 
-def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
-    """.hermes.md / HERMES.md — walk to git root."""
+def _load_hermes_md_with_match(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    seen_content: Optional[set[str]] = None,
+) -> Tuple[str, bool]:
+    """Load .hermes.md / HERMES.md and report whether the type matched."""
     hermes_md_path = _find_hermes_md(cwd_path)
     if not hermes_md_path:
-        return ""
+        return "", False
     try:
         content = hermes_md_path.read_text(encoding="utf-8").strip()
         if not content:
-            return ""
+            return "", False
         content = _strip_yaml_frontmatter(content)
+        if not content:
+            return "", False
+        if seen_content is not None and _context_content_is_duplicate(
+            content, seen_content
+        ):
+            return "", True
         rel = hermes_md_path.name
         try:
             rel = str(hermes_md_path.relative_to(cwd_path))
@@ -2224,13 +2456,31 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             pass
         content = _scan_context_content(content, rel)
         result = f"## {rel}\n\n{content}"
-        return _truncate_content(
-            result, ".hermes.md", context_length=context_length,
-            read_path=str(hermes_md_path),
+        return (
+            _truncate_content(
+                result,
+                ".hermes.md",
+                context_length=context_length,
+                read_path=str(hermes_md_path),
+            ),
+            True,
         )
     except Exception as e:
         logger.debug("Could not read %s: %s", hermes_md_path, e)
-        return ""
+        return "", False
+
+
+def _load_hermes_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    seen_content: Optional[set[str]] = None,
+) -> str:
+    """.hermes.md / HERMES.md — walk to git root."""
+    return _load_hermes_md_with_match(
+        cwd_path,
+        context_length,
+        seen_content,
+    )[0]
 
 
 def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
@@ -2260,7 +2510,11 @@ def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
     return chain
 
 
-def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_agents_md_with_match(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    seen_content: Optional[set[str]] = None,
+) -> Tuple[str, bool]:
     """AGENTS.md — merged directory chain from git root down to cwd.
 
     Each directory on the chain (see ``_agents_md_directory_chain``)
@@ -2276,7 +2530,8 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     """
     cwd_resolved = cwd_path.resolve()
     sections: List[str] = []
-    seen_content: set = set()
+    shared_seen = seen_content if seen_content is not None else set()
+    matched = False
     for directory in _agents_md_directory_chain(cwd_resolved):
         for name in ["AGENTS.override.md", "AGENTS.md", "agents.md"]:
             candidate = directory / name
@@ -2289,9 +2544,9 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
                 continue
             if not content:
                 continue
-            if content in seen_content:
+            matched = True
+            if _context_content_is_duplicate(content, shared_seen):
                 break  # identical copy along the chain — skip duplicate
-            seen_content.add(content)
             if directory == cwd_resolved:
                 label = name
             else:
@@ -2305,48 +2560,100 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             sections.append(section)
             break  # first name match wins per directory
     if not sections:
-        return ""
+        return "", matched
     if len(sections) == 1:
-        return sections[0]
+        return sections[0], matched
     # Per-file budgets were already applied above; also cap the merged chain
     # so a deep monorepo cannot multiply the context-file budget unbounded.
     merged = "\n\n".join(sections)
-    return _truncate_content(
-        merged, "AGENTS.md (directory chain)",
-        context_length=context_length,
-        read_path=str(cwd_resolved / "AGENTS.md"),
+    return (
+        _truncate_content(
+            merged,
+            "AGENTS.md (directory chain)",
+            context_length=context_length,
+            read_path=str(cwd_resolved / "AGENTS.md"),
+        ),
+        matched,
     )
 
 
-def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
-    """CLAUDE.md / claude.md — cwd only."""
+def _load_agents_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    seen_content: Optional[set[str]] = None,
+) -> str:
+    """AGENTS.md — merged directory chain from git root down to cwd."""
+    return _load_agents_md_with_match(
+        cwd_path,
+        context_length,
+        seen_content,
+    )[0]
+
+
+def _load_claude_md_with_match(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    seen_content: Optional[set[str]] = None,
+) -> Tuple[str, bool]:
+    """Load CLAUDE.md / claude.md and report whether the type matched."""
     for name in ["CLAUDE.md", "claude.md"]:
         candidate = cwd_path / name
         if candidate.exists():
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
+                    if seen_content is not None and _context_content_is_duplicate(
+                        content, seen_content
+                    ):
+                        return "", True
                     content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"
-                    return _truncate_content(
-                        result, "CLAUDE.md", context_length=context_length,
-                        read_path=str(candidate),
+                    return (
+                        _truncate_content(
+                            result,
+                            "CLAUDE.md",
+                            context_length=context_length,
+                            read_path=str(candidate),
+                        ),
+                        True,
                     )
             except Exception as e:
                 logger.debug("Could not read %s: %s", candidate, e)
-    return ""
+    return "", False
 
 
-def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> str:
-    """.cursorrules + .cursor/rules/*.mdc — cwd only."""
+def _load_claude_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    seen_content: Optional[set[str]] = None,
+) -> str:
+    """CLAUDE.md / claude.md — cwd only."""
+    return _load_claude_md_with_match(
+        cwd_path,
+        context_length,
+        seen_content,
+    )[0]
+
+
+def _load_cursorrules_with_match(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    seen_content: Optional[set[str]] = None,
+) -> Tuple[str, bool]:
+    """Load Cursor rules and report whether the context type matched."""
     cursorrules_content = ""
+    matched = False
     cursorrules_file = cwd_path / ".cursorrules"
     if cursorrules_file.exists():
         try:
             content = cursorrules_file.read_text(encoding="utf-8").strip()
             if content:
-                content = _scan_context_content(content, ".cursorrules")
-                cursorrules_content += f"## .cursorrules\n\n{content}\n\n"
+                matched = True
+                if seen_content is None or not _context_content_is_duplicate(
+                    content, seen_content
+                ):
+                    content = _scan_context_content(content, ".cursorrules")
+                    cursorrules_content += f"## .cursorrules\n\n{content}\n\n"
         except Exception as e:
             logger.debug("Could not read .cursorrules: %s", e)
 
@@ -2357,17 +2664,40 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
             try:
                 content = mdc_file.read_text(encoding="utf-8").strip()
                 if content:
+                    matched = True
+                    if seen_content is not None and _context_content_is_duplicate(
+                        content, seen_content
+                    ):
+                        continue
                     content = _scan_context_content(content, f".cursor/rules/{mdc_file.name}")
                     cursorrules_content += f"## .cursor/rules/{mdc_file.name}\n\n{content}\n\n"
             except Exception as e:
                 logger.debug("Could not read %s: %s", mdc_file, e)
 
     if not cursorrules_content:
-        return ""
-    return _truncate_content(
-        cursorrules_content, ".cursorrules", context_length=context_length,
-        read_path=str(cwd_path / ".cursorrules"),
+        return "", matched
+    return (
+        _truncate_content(
+            cursorrules_content,
+            ".cursorrules",
+            context_length=context_length,
+            read_path=str(cwd_path / ".cursorrules"),
+        ),
+        matched,
     )
+
+
+def _load_cursorrules(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    seen_content: Optional[set[str]] = None,
+) -> str:
+    """.cursorrules + .cursor/rules/*.mdc — cwd only."""
+    return _load_cursorrules_with_match(
+        cwd_path,
+        context_length,
+        seen_content,
+    )[0]
 
 
 def build_context_files_prompt(
@@ -2376,16 +2706,26 @@ def build_context_files_prompt(
     context_length: Optional[int] = None,
     allow_install_tree_fallback: bool = False,
     home_override: "Path | None" = None,
+    global_instruction_files: Optional[Sequence[str]] = None,
+    global_instruction_home_override: "Path | None" = None,
 ) -> str:
     """Discover and load context files for the system prompt.
 
-    Priority (first found wins — only ONE project context type is loaded):
+    Ordered layers:
+      1. SOUL.md identity (unless *skip_soul* is true)
+      2. Configured global instruction files, in list order
+      3. One project context type, selected by this priority:
+
+    Project priority (first found wins — only ONE type is loaded):
       1. .hermes.md / HERMES.md  (walk to git root)
       2. AGENTS.md / agents.md   (merged chain: git root → cwd)
       3. CLAUDE.md / claude.md   (cwd only)
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 
     SOUL.md from HERMES_HOME is independent and always included when present.
+    Configured globals are independent of project-type priority. Repository
+    context renders later so its more-specific guidance can specialize the
+    global layer. Identical content is deduplicated across both layers.
 
     Each context source is capped before injection. The cap defaults to the
     model's context window (scaled — see ``_dynamic_context_file_max_chars``)
@@ -2403,6 +2743,26 @@ def build_context_files_prompt(
 
     cwd_path = Path(cwd).resolve()
     sections = []
+
+    # SOUL.md is the identity layer and must precede all instruction files.
+    # Normal AIAgent prompt assembly loads it into the stable identity slot and
+    # passes skip_soul=True here; this branch preserves the same order for
+    # direct Python callers of this helper.
+    if not skip_soul:
+        soul_content = load_soul_md(context_length, home_override=home_override)
+        if soul_content:
+            sections.append(soul_content)
+
+    global_sections, seen_content = _load_global_instruction_files(
+        global_instruction_files,
+        context_length=context_length,
+        home_override=(
+            global_instruction_home_override
+            if global_instruction_home_override is not None
+            else home_override
+        ),
+    )
+    sections.extend(global_sections)
 
     # Never let a FALLBACK-picked directory inside the Hermes install/source
     # tree gain system-prompt authority. A backend that self-spawns into that
@@ -2427,22 +2787,39 @@ def build_context_files_prompt(
         )
         project_context = ""
     else:
-        # Priority-based project context: first match wins
-        project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
-        )
+        # Priority-based project context: first readable, non-empty type wins.
+        # A type whose content duplicates a configured global still counts as
+        # the match, preventing a lower-priority CLAUDE.md/.cursorrules file
+        # from being loaded merely because the higher-priority text deduped.
+        project_context = ""
+        for loader in (
+            _load_hermes_md_with_match,
+            _load_agents_md_with_match,
+            _load_claude_md_with_match,
+            _load_cursorrules_with_match,
+        ):
+            project_context, matched = loader(
+                cwd_path,
+                context_length,
+                seen_content,
+            )
+            if matched:
+                break
     if project_context:
         sections.append(project_context)
 
-    # SOUL.md from HERMES_HOME only — skip when already loaded as identity
-    if not skip_soul:
-        soul_content = load_soul_md(context_length, home_override=home_override)
-        if soul_content:
-            sections.append(soul_content)
-
     if not sections:
         return ""
-    return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+    if global_sections:
+        intro = (
+            "The following configured global instruction files and project "
+            "context have been evaluated. Follow all loaded instructions; "
+            "later project sections specialize earlier global sections:"
+        )
+    else:
+        # Byte-for-byte legacy wording when the new feature is unused.
+        intro = (
+            "The following project context files have been loaded and should "
+            "be followed:"
+        )
+    return "# Project Context\n\n" + intro + "\n\n" + "\n".join(sections)

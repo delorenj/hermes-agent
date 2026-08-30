@@ -2525,11 +2525,12 @@ agent:
 
 ## Context Files (SOUL.md, AGENTS.md)
 
-Hermes uses two different context scopes:
+Hermes uses three ordered context scopes:
 
 | File | Purpose | Scope |
 |------|---------|-------|
 | `SOUL.md` | **Primary agent identity** — defines who the agent is (slot #1 in the system prompt) | `~/.hermes/SOUL.md` or `$HERMES_HOME/SOUL.md` |
+| `agent.global_instruction_files` entries | Fleet/operator instructions shared across workspaces | Explicit paths from the active profile's `config.yaml` |
 | `.hermes.md` / `HERMES.md` | Project-specific instructions (highest priority) | Walks to git root |
 | `AGENTS.md` | Project-specific instructions, coding conventions | Recursive directory walk |
 | `CLAUDE.md` | Claude Code context files (also detected) | Working directory only |
@@ -2538,10 +2539,31 @@ Hermes uses two different context scopes:
 
 - **SOUL.md** is the agent's primary identity. It occupies slot #1 in the system prompt, completely replacing the built-in default identity. Edit it to fully customize who the agent is.
 - If SOUL.md is missing, empty, or cannot be loaded, Hermes falls back to a built-in default identity.
+- **Configured global instructions load after identity and before project context.** Repository files appear later, so repo-specific guidance can specialize fleet-wide rules.
 - **Project context files use a priority system** — only ONE type is loaded (first match wins): `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. SOUL.md is always loaded independently.
 - **AGENTS.md** is hierarchical: if subdirectories also have AGENTS.md, all are combined.
 - Hermes automatically seeds a default `SOUL.md` if one does not already exist.
 - All loaded context files are capped at `context_file_max_chars` characters (default 20,000) with smart truncation.
+
+Configure fleet-wide files as an ordered list. The default is empty, so existing
+installations keep their exact prompt behavior until they opt in:
+
+```yaml
+agent:
+  global_instruction_files:
+    - ~/.agents/AGENTS.md
+```
+
+`~` is expanded as a user path without invoking a shell. Absolute paths are
+recommended for fleet-managed config; relative paths resolve from the active
+profile's `HERMES_HOME`, never from a repository or daemon launch directory.
+Each file keeps a provenance heading and uses the same security scan,
+truncation, and content deduplication as repository context. A missing or
+unreadable configured file does not stop startup: Hermes places an
+`[UNAVAILABLE: ...]` marker in the context and emits a visible status warning.
+The list is captured from the active profile when the agent is constructed, so
+profile-multiplexed gateways and delegated workers cannot pick up another
+profile's paths later.
 
 See also:
 - [Personality & SOUL.md](/user-guide/features/personality)

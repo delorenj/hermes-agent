@@ -15,6 +15,7 @@ import threading
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -54,6 +55,8 @@ def _make_mock_parent(depth=0):
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
+    parent.global_instruction_files = ()
+    parent._global_instruction_home = None
     return parent
 
 
@@ -138,6 +141,129 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("Fix the tests", prompt)
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
+
+
+def test_child_agent_inherits_parent_global_instruction_snapshot(tmp_path):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    global_file = profile_home / "fleet.md"
+    global_file.write_text("Inherited fleet rule.", encoding="utf-8")
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text(
+        "Local repository rule.", encoding="utf-8"
+    )
+
+    parent = _make_mock_parent()
+    parent.enabled_toolsets = ["file"]
+    parent.disabled_toolsets = []
+    parent.global_instruction_files = ("fleet.md",)
+    parent._global_instruction_home = profile_home
+
+    with (
+        patch("tools.delegate_tool._load_config", return_value={}),
+        patch(
+            "tools.delegate_tool._resolve_workspace_hint",
+            return_value=str(workspace),
+        ),
+        patch("run_agent.AIAgent") as mock_agent,
+    ):
+        child = MagicMock()
+        mock_agent.return_value = child
+        _build_child_agent(
+            task_index=0,
+            goal="Inspect the workspace",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            task_count=1,
+            parent_agent=parent,
+        )
+
+    prompt = mock_agent.call_args.kwargs["ephemeral_system_prompt"]
+    assert prompt.index("Inherited fleet rule.") < prompt.index(
+        "Local repository rule."
+    )
+    assert child.global_instruction_files == ("fleet.md",)
+    assert child._global_instruction_home == profile_home
+    assert isinstance(child._global_instruction_home, Path)
+
+
+def test_build_child_system_prompt_preserves_carry_in_warnings(tmp_path):
+    """Parent's pre-existing truncation warnings must survive a child prompt
+    build untouched, while the child-local warnings it produces must not
+    leak into the parent's queue.
+
+    Regression: ``_build_child_system_prompt`` drains the context-file
+    warning accumulator to keep the child's own missing/truncated-file
+    warnings from resurfacing on a later, unrelated parent prompt rebuild.
+    Draining unconditionally would also discard whatever the parent had
+    already queued before the child build started.
+    """
+    from agent.prompt_builder import (
+        _record_truncation_warning,
+        drain_truncation_warnings,
+    )
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    drain_truncation_warnings()
+    _record_truncation_warning("PARENT PRE-EXISTING WARNING")
+    try:
+        prompt = _build_child_system_prompt(
+            "Fix the tests",
+            workspace_path=str(workspace),
+            global_instruction_files=("missing-global.md",),
+            global_instruction_home=str(tmp_path),
+        )
+
+        # The child's own missing-file warning is visible in its prompt...
+        assert "missing-global.md" in prompt
+
+        # ...but only the parent's carry-in warning remains queued — the
+        # child-local warning was discarded, not appended.
+        remaining = drain_truncation_warnings()
+        assert remaining == ["PARENT PRE-EXISTING WARNING"]
+    finally:
+        drain_truncation_warnings()
+
+
+def test_build_child_system_prompt_restores_carry_in_warnings_on_exception(
+    tmp_path,
+):
+    """Carry-in survives failure while warnings emitted by the child do not."""
+    from agent.prompt_builder import (
+        _record_truncation_warning,
+        drain_truncation_warnings,
+    )
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    def fail_context_build(**_kwargs):
+        _record_truncation_warning("CHILD-LOCAL WARNING")
+        raise RuntimeError("context build failed")
+
+    drain_truncation_warnings()
+    _record_truncation_warning("PARENT PRE-EXISTING WARNING")
+    try:
+        with patch(
+            "agent.prompt_builder.build_context_files_prompt",
+            side_effect=fail_context_build,
+        ):
+            prompt = _build_child_system_prompt(
+                "Fix the tests",
+                workspace_path=str(workspace),
+            )
+
+        assert "Fix the tests" in prompt
+        assert "CHILD-LOCAL WARNING" not in prompt
+        assert drain_truncation_warnings() == ["PARENT PRE-EXISTING WARNING"]
+    finally:
+        drain_truncation_warnings()
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

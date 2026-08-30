@@ -340,3 +340,60 @@ def test_routed_review_fork_does_not_inherit_reasoning_config():
             f"Routed review fork was passed parent-only kwarg {_gated!r}; "
             "cache-parity inheritance must stay behind the not-routed gate."
         )
+
+
+def test_routed_review_fork_inherits_parent_global_instruction_snapshot():
+    """Routed review fork must copy the parent's frozen global-instruction
+    list and home immediately after construction.
+
+    The routed path builds a fresh system prompt from scratch (no
+    cached-prompt reuse — see the ``not _routed`` gate on
+    ``_cached_system_prompt`` above), so it is exactly the path that would
+    silently reflect a mid-session ``global_instruction_files`` config edit
+    if the parent's frozen snapshot were not copied onto the fork.
+    """
+    from pathlib import Path
+
+    import run_agent
+    import agent.background_review as bg_review
+
+    agent_stub = _make_agent_stub(run_agent.AIAgent)
+    agent_stub.global_instruction_files = ("fleet/AGENTS.md",)
+    agent_stub._global_instruction_home = Path("/profile/home")
+
+    captured = {}
+    _Recorder = _make_recorder_class(
+        captured,
+        record_on_run=("global_instruction_files", "_global_instruction_home"),
+    )
+
+    routed_runtime = {
+        "provider": "openrouter",
+        "model": "aux-cheap-model",
+        "api_key": "test-key",
+        "base_url": None,
+        "api_mode": None,
+        "credential_pool": None,
+        "request_overrides": {},
+        "max_tokens": None,
+        "command": None,
+        "args": [],
+        "routed": True,
+    }
+
+    with patch.object(run_agent, "AIAgent", _Recorder), \
+         patch.object(bg_review, "_resolve_review_runtime",
+                      return_value=routed_runtime), \
+         patch("threading.Thread", _SyncThread):
+        agent_stub._spawn_background_review(
+            messages_snapshot=[],
+            review_memory=True,
+            review_skills=False,
+        )
+
+    assert captured.get("global_instruction_files") == agent_stub.global_instruction_files
+    assert captured.get("_global_instruction_home") == agent_stub._global_instruction_home
+    # Independent tuple/Path values, not aliasing concerns here (both are
+    # immutable), but the attribute must actually be copied onto the fork —
+    # not left at whatever AIAgent.__init__ defaulted to.
+    assert captured.get("global_instruction_files") is not None
