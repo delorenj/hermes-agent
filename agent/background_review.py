@@ -1315,6 +1315,16 @@ def _run_review_in_thread(
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
+            # Inherit the parent's frozen global instruction list immediately
+            # after construction so a mid-session config change cannot alter
+            # this review fork's prompt. The routed case builds a fresh system
+            # prompt (no cached-prompt reuse), so it needs the frozen list.
+            review_agent.global_instruction_files = getattr(
+                agent, "global_instruction_files", ()
+            )
+            review_agent._global_instruction_home = getattr(
+                agent, "_global_instruction_home", None
+            )
             # The review fork pins the parent's cached system prompt and keeps
             # ``tools[]`` byte-identical to the parent so its outbound request
             # hits the same provider cache prefix (see the toolset-parity note

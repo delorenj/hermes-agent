@@ -31,7 +31,8 @@ import weakref
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
@@ -1175,6 +1176,8 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    global_instruction_files: Optional[Sequence[str]] = None,
+    global_instruction_home: Optional[str] = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
@@ -1212,11 +1215,40 @@ def _build_child_system_prompt(
         # doesn't apply here. Best-effort: on any failure the child prompt is
         # simply built without the block.
         try:
-            from agent.prompt_builder import build_context_files_prompt
-
-            _ctx_files = build_context_files_prompt(
-                cwd=str(workspace_path), skip_soul=True
+            from agent.prompt_builder import (
+                _record_truncation_warning,
+                build_context_files_prompt,
+                drain_truncation_warnings,
             )
+
+            # Drain parent's pre-existing warnings before building child
+            # context so they don't leak into the child's own warning queue.
+            carry_in_warnings = drain_truncation_warnings()
+
+            try:
+                _ctx_files = build_context_files_prompt(
+                    cwd=str(workspace_path),
+                    skip_soul=True,
+                    global_instruction_files=global_instruction_files,
+                    global_instruction_home_override=(
+                        global_instruction_home or None
+                    ),
+                )
+            finally:
+                # This focused prompt bypasses build_system_prompt(), which is
+                # the normal owner of draining context-file warnings. Discard
+                # child-local warnings even when context construction fails,
+                # then restore the parent's carry-in queue through its public
+                # accumulator API.
+                child_warnings = drain_truncation_warnings()
+                logger.debug(
+                    "Child context build produced %d warnings; "
+                    "discarding and restoring %d carry-in warnings",
+                    len(child_warnings),
+                    len(carry_in_warnings),
+                )
+                for warning in carry_in_warnings:
+                    _record_truncation_warning(warning)
         except Exception:
             logger.debug(
                 "subagent: workspace context-files load failed", exc_info=True
@@ -1728,10 +1760,32 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    parent_global_instruction_files = getattr(
+        parent_agent, "global_instruction_files", ()
+    )
+    if not isinstance(parent_global_instruction_files, (list, tuple)):
+        parent_global_instruction_files = ()
+    else:
+        parent_global_instruction_files = tuple(parent_global_instruction_files)
+    parent_global_instruction_home = getattr(
+        parent_agent, "_global_instruction_home", None
+    )
+    # Keep as Path, not str — the child's system_prompt builder accepts both.
+    if not isinstance(parent_global_instruction_home, (Path, os.PathLike)):
+        parent_global_instruction_home = None
+    if parent_global_instruction_home is None:
+        try:
+            from agent.system_prompt import _agent_home
+
+            parent_global_instruction_home = _agent_home(parent_agent)
+        except Exception:
+            parent_global_instruction_home = None
     child_prompt = _build_child_system_prompt(
         goal,
         context,
         workspace_path=workspace_hint,
+        global_instruction_files=parent_global_instruction_files,
+        global_instruction_home=parent_global_instruction_home,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
@@ -2014,6 +2068,11 @@ def _build_child_agent(
                     pass
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Nested orchestrators must keep the originating profile's frozen global
+    # instruction list. The child constructor may have run after an ambient
+    # profile scope changed, so explicitly inherit the parent's snapshot.
+    child.global_instruction_files = parent_global_instruction_files
+    child._global_instruction_home = parent_global_instruction_home
     # Ownership transfer for the dedicated handle: the child's close() must
     # release it (nothing else holds a reference), and no parent teardown can
     # close it out from under a background child (#81267).

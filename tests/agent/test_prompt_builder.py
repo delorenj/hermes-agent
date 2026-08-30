@@ -402,6 +402,208 @@ class TestBuildContextFilesPrompt:
         assert "Ruff for linting" in result
         assert "Project Context" in result
 
+    def test_global_then_repo_order_after_soul(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        global_dir = home / ".agents"
+        global_dir.mkdir(parents=True)
+        (home / "SOUL.md").write_text("SOUL IDENTITY", encoding="utf-8")
+        (global_dir / "AGENTS.md").write_text(
+            "GLOBAL FLEET RULES", encoding="utf-8"
+        )
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        (repo / "AGENTS.md").write_text(
+            "REPOSITORY SPECIALIZATION", encoding="utf-8"
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        result = build_context_files_prompt(
+            cwd=str(repo),
+            home_override=home,
+            global_instruction_files=["~/.agents/AGENTS.md"],
+        )
+
+        assert result.index("SOUL IDENTITY") < result.index("GLOBAL FLEET RULES")
+        assert result.index("GLOBAL FLEET RULES") < result.index(
+            "REPOSITORY SPECIALIZATION"
+        )
+        assert "## ~/.agents/AGENTS.md" in result
+
+    def test_repo_only_prompt_is_byte_unchanged(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text(
+            "Repository only.", encoding="utf-8"
+        )
+        result = build_context_files_prompt(
+            cwd=str(tmp_path),
+            skip_soul=True,
+            global_instruction_files=[],
+        )
+        assert result == (
+            "# Project Context\n\n"
+            "The following project context files have been loaded and should "
+            "be followed:\n\n"
+            "## AGENTS.md\n\nRepository only."
+        )
+
+    def test_global_and_repo_duplicate_content_is_loaded_once(self, tmp_path):
+        global_file = tmp_path / "fleet-agents.md"
+        global_file.write_text("One shared rule set.", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        (repo / "AGENTS.md").write_text(
+            "One shared rule set.", encoding="utf-8"
+        )
+        # A duplicate AGENTS.md still owns project-type priority; deduplication
+        # must not fall through and unexpectedly load CLAUDE.md.
+        (repo / "CLAUDE.md").write_text(
+            "Lower-priority instructions.", encoding="utf-8"
+        )
+
+        result = build_context_files_prompt(
+            cwd=str(repo),
+            skip_soul=True,
+            global_instruction_files=[str(global_file)],
+        )
+
+        assert result.count("One shared rule set.") == 1
+        assert "Lower-priority instructions." not in result
+
+    def test_missing_global_file_is_visible_and_nonfatal(self, tmp_path):
+        missing = tmp_path / "missing-global.md"
+        result = build_context_files_prompt(
+            cwd=str(tmp_path),
+            skip_soul=True,
+            global_instruction_files=[str(missing)],
+        )
+
+        assert "UNAVAILABLE" in result
+        heading = f"## {missing}"
+        assert result.count(str(missing)) == 1
+        assert str(missing) not in result.split(heading, 1)[1]
+        warnings = drain_truncation_warnings()
+        assert len(warnings) == 1
+        assert warnings[0].count(str(missing)) == 1
+
+    def test_missing_global_file_listed_twice_warns_once(self, tmp_path):
+        """The same unresolvable entry configured twice must not double-warn.
+
+        Regression: entries are deduplicated by resolved path before the
+        existence/type/read checks run, so a repeated (or differently
+        spelled but identical) path only produces one missing/not-a-file/
+        unreadable placeholder and one queued warning.
+        """
+        missing = tmp_path / "missing-global.md"
+        result = build_context_files_prompt(
+            cwd=str(tmp_path),
+            skip_soul=True,
+            global_instruction_files=[str(missing), str(missing)],
+        )
+
+        assert result.count("UNAVAILABLE") == 1
+        warnings = drain_truncation_warnings()
+        assert len(warnings) == 1
+
+    @pytest.mark.parametrize("project_filename", [".hermes.md", "AGENTS.md"])
+    def test_frontmattered_global_dedupes_against_project_type(
+        self, tmp_path, project_filename
+    ):
+        """Dedupe compares frontmatter-stripped bodies for both project types.
+
+        The duplicate project file must still claim project-type priority so a
+        lower-priority CLAUDE.md does not enter the prompt.
+        """
+        global_file = tmp_path / "fleet.md"
+        global_file.write_text(
+            "---\nname: fleet\n---\nShared body text.", encoding="utf-8"
+        )
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        (repo / project_filename).write_text(
+            "---\nname: project\n---\nShared body text.", encoding="utf-8"
+        )
+        (repo / "CLAUDE.md").write_text(
+            "Lower-priority instructions.", encoding="utf-8"
+        )
+
+        result = build_context_files_prompt(
+            cwd=str(repo),
+            skip_soul=True,
+            global_instruction_files=[str(global_file)],
+        )
+
+        assert result.count("Shared body text.") == 1
+        assert "Lower-priority instructions." not in result
+
+    def test_frontmattered_repo_only_agents_md_injected_unchanged(self, tmp_path):
+        """Dedupe normalization must not rewrite repo-only AGENTS.md bytes."""
+        from agent.prompt_builder import _load_agents_md
+
+        content = "---\nname: project\n---\nRepository body."
+        (tmp_path / "AGENTS.md").write_text(content, encoding="utf-8")
+
+        assert _load_agents_md(tmp_path) == f"## AGENTS.md\n\n{content}"
+
+    def test_global_instruction_aggregate_cap_truncates_joined_layer(
+        self, tmp_path, monkeypatch
+    ):
+        """A long list of individually-small global files must still be
+        capped in aggregate, not multiply the per-file budget N times.
+
+        Regression: each file was already capped on its own, but nothing
+        stopped a long ``global_instruction_files`` list from injecting
+        N * per-file-budget characters in total.
+        """
+        # Resolved via sys.modules (not ``import agent.prompt_builder as pb``):
+        # an earlier reload test in this file
+        # (TestPromptBuilderImports::test_module_import_does_not_eagerly_import_skills_tool)
+        # leaves the ``agent`` package's ``prompt_builder`` attribute pointed at
+        # a stale reloaded module even after sys.modules is restored — a bare
+        # ``import ... as`` resolves through that stale attribute and silently
+        # patches/calls the wrong module object (its own ContextVar never sees
+        # our warning).
+        pb = sys.modules["agent.prompt_builder"]
+
+        max_chars = 5000
+        monkeypatch.setattr(
+            pb, "_get_context_file_max_chars", lambda *_a, **_k: max_chars
+        )
+
+        first = tmp_path / "first.md"
+        second = tmp_path / "second.md"
+        third = tmp_path / "third.md"
+        # Each file's rendered section (heading + content) stays comfortably
+        # under the per-file cap on its own; only the sum of all three
+        # crosses it.
+        first.write_text("A" * 2000, encoding="utf-8")
+        second.write_text("B" * 2000, encoding="utf-8")
+        third.write_text("C" * 2000, encoding="utf-8")
+
+        sections, _ = pb._load_global_instruction_files(
+            [str(first), str(second), str(third)],
+        )
+
+        assert len(sections) == 1
+        joined = sections[0]
+        assert len(joined) <= max_chars
+        assert "truncated" in joined
+        assert (
+            "read the configured source files individually with the read_file tool"
+            in joined
+        )
+        assert "(multiple)" not in joined
+        warnings = drain_truncation_warnings()
+        assert any("aggregate" in w for w in warnings)
+        # No individual file was truncated on its own — the truncation is
+        # solely a property of the joined aggregate.
+        assert not any(
+            "TRUNCATED: " in w and "aggregate" not in w for w in warnings
+        )
+
     # --- AGENTS.md directory chain (port of grok-cli instructions.ts) ---
 
     def test_agents_md_chain_merges_root_to_cwd(self, tmp_path):
@@ -1008,5 +1210,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-

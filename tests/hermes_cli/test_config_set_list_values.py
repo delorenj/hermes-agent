@@ -25,12 +25,31 @@ def user_home(tmp_path, monkeypatch):
     return home
 
 
+def test_global_instruction_files_default_is_empty():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["agent"]["global_instruction_files"] == []
+
+
 def test_list_literal_is_parsed_to_list(user_home):
     from hermes_cli.config import set_config_value, read_raw_config
 
     set_config_value("platform_toolsets.line", '["clarify", "file", "web"]')
     raw = read_raw_config()
     assert raw["platform_toolsets"]["line"] == ["clarify", "file", "web"]
+
+
+def test_global_instruction_files_is_a_real_list(user_home):
+    from hermes_cli.config import load_config, read_raw_config, set_config_value
+
+    set_config_value(
+        "agent.global_instruction_files",
+        '["~/.agents/AGENTS.md", "/etc/hermes/AGENTS.md"]',
+    )
+
+    expected = ["~/.agents/AGENTS.md", "/etc/hermes/AGENTS.md"]
+    assert read_raw_config()["agent"]["global_instruction_files"] == expected
+    assert load_config()["agent"]["global_instruction_files"] == expected
 
 
 def test_mapping_literal_is_parsed_to_dict(user_home):

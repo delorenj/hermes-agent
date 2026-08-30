@@ -41,6 +41,8 @@ def _captured_context_cwd(agent):
     def fake_context_files(
         cwd=None, skip_soul=False, context_length=None,
         allow_install_tree_fallback=False, home_override=None,
+        global_instruction_files=None,
+        global_instruction_home_override=None,
     ):
         captured["cwd"] = cwd
         return ""
@@ -274,6 +276,32 @@ def test_build_system_prompt_records_stable_prefix():
 
     assert prompt.startswith(agent._cached_system_prompt_static)
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
+
+
+def test_missing_global_instruction_file_emits_frontend_status(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    missing = tmp_path / "missing-global.md"
+    statuses = []
+    agent = _make_agent(
+        global_instruction_files=(str(missing),),
+        _global_instruction_home=tmp_path,
+        _emit_status=statuses.append,
+    )
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("agent.prompt_builder.load_soul_md", return_value=None),
+        patch("run_agent.build_environment_hints", return_value=""),
+    ):
+        prompt = build_system_prompt(agent)
+
+    assert "UNAVAILABLE" in prompt
+    assert len(statuses) == 1
+    assert str(missing) in statuses[0]
 
 
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):

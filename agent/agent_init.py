@@ -67,6 +67,36 @@ logger = logging.getLogger("run_agent")
 _warned_unavailable_providers: set[str] = set()
 
 
+def _normalize_global_instruction_files(raw: Any) -> tuple[str, ...]:
+    """Freeze ``agent.global_instruction_files`` into a safe agent snapshot.
+
+    Prompt assembly may happen on a worker thread after its profile ContextVar
+    has been lost. Resolving this config once during profile-scoped agent init
+    prevents a later ambient config read from leaking another profile's global
+    instructions into the session.
+    """
+    if raw is None or raw == []:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "Ignoring agent.global_instruction_files=%r: expected a list of paths",
+            raw,
+        )
+        return ()
+
+    normalized: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            logger.warning(
+                "Ignoring invalid agent.global_instruction_files entry %r: "
+                "expected a non-empty path string",
+                entry,
+            )
+            continue
+        normalized.append(entry.strip())
+    return tuple(normalized)
+
+
 def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     """Warn (once per provider) when a configured memory provider is unavailable.
 
@@ -1992,6 +2022,12 @@ def init_agent(
     _agent_section = _agent_cfg.get("agent", {})
     if not isinstance(_agent_section, dict):
         _agent_section = {}
+    # Immutable, per-agent snapshot: system-prompt and delegated workspace
+    # builders must not consult ambient config after profile-scoped init.
+    agent.global_instruction_files = _normalize_global_instruction_files(
+        _agent_section.get("global_instruction_files", ())
+    )
+    agent._global_instruction_home = get_hermes_home()
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
     # Execution-discipline guidance gate: "auto" (default — matches

@@ -15,8 +15,9 @@ Three tiers are joined with ``\\n\\n``:
   alibaba model-name workaround, environment hints, coding guidance,
   platform hints.
 * ``context``  — caller-supplied ``system_message`` plus context files
-  (AGENTS.md / .cursorrules / etc.) discovered under ``TERMINAL_CWD``,
-  plus the session's coding-workspace snapshot.
+  (configured global instruction files, then AGENTS.md / .cursorrules / etc.
+  discovered under ``TERMINAL_CWD``), plus the session's coding-workspace
+  snapshot.
 * ``volatile`` — skills index, memory snapshot, USER.md profile, external
   memory provider block, timestamp/session/model/provider line.
 
@@ -795,7 +796,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,
             allow_install_tree_fallback=agent.platform in ("cli", "tui"),
-            home_override=_agent_home(agent))
+            home_override=_agent_home(agent),
+            # Captured from this agent's profile-scoped config at init time.
+            # Never re-read ambient config here: prompt builds can run on a
+            # bare worker thread after the profile ContextVar is gone.
+            global_instruction_files=getattr(
+                agent, "global_instruction_files", ()
+            ),
+            global_instruction_home_override=getattr(
+                agent, "_global_instruction_home", _agent_home(agent)
+            ),
+        )
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 

@@ -217,6 +217,11 @@ DEFAULT_CONFIG = {
         # identity slot (SOUL.md). Empty by default. The HERMES_ENVIRONMENT_HINT
         # env var overrides this (build-time/container mechanism).
         "environment_hint": "",
+        # Ordered, session-stable instruction files loaded after SOUL identity
+        # and before repository context. Paths may be absolute or use ``~``;
+        # relative paths resolve from the active profile's HERMES_HOME. Empty
+        # by default for exact backward compatibility.
+        "global_instruction_files": [],
         # Coding posture — on interactive coding surfaces (CLI, TUI, desktop
         # app, ACP) in a code workspace, Hermes adds a coding operating brief
         # + a live git/workspace snapshot to the system prompt. See

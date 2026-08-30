@@ -403,6 +403,29 @@ def test_child_system_prompt_embeds_workspace_context(tmp_path):
     assert "binding for your work" in prompt
 
 
+def test_child_system_prompt_orders_inherited_globals_before_workspace(tmp_path):
+    from tools.delegate_tool import _build_child_system_prompt
+
+    global_file = tmp_path / "fleet.md"
+    global_file.write_text("Fleet-wide child rule.", encoding="utf-8")
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text(
+        "Repository-specific child rule.", encoding="utf-8"
+    )
+
+    prompt = _build_child_system_prompt(
+        "do the thing",
+        None,
+        workspace_path=str(workspace),
+        global_instruction_files=(str(global_file),),
+    )
+
+    assert prompt.index("Fleet-wide child rule.") < prompt.index(
+        "Repository-specific child rule."
+    )
+
+
 def test_child_system_prompt_no_context_block_without_files(tmp_path):
     from tools.delegate_tool import _build_child_system_prompt
 
