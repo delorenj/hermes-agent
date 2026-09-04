@@ -79,6 +79,17 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # generic user-facing opt-in exists, so this stays unset unless the user sets it
 # via the ``retain_source`` config key or HINDSIGHT_RETAIN_SOURCE (e.g. "hermes").
 _DEFAULT_RETAIN_SOURCE = ""
+
+# The novelty gate keeps a cron agent from paying to re-extract its own prompt.
+# Imported defensively: if it is missing, every retain proceeds unchanged.
+try:
+    from . import retain_gate as _retain_gate
+except Exception:  # pragma: no cover - only when the module is absent
+    _retain_gate = None
+
+_RG_WINDOW = getattr(_retain_gate, "DEFAULT_WINDOW", 20)
+_RG_THRESHOLD = getattr(_retain_gate, "DEFAULT_THRESHOLD", 3)
+_RG_MIN_NOVEL = getattr(_retain_gate, "DEFAULT_MIN_NOVEL_CHARS", 64)
 # Hindsight brand mark — the logo is an eye ringed by graph nodes. Used for
 # the deterministic recall/retain indicators (overrides the generic core default).
 _HINDSIGHT_GLYPH = "👁️"
@@ -835,6 +846,16 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_waits_for_retain = True
         self._prefetch_retain_drain_timeout = 10.0
         self._retain_context = "conversation between Hermes Agent and the User"
+        # Novelty gate. Cron agents re-send the whole prompt every tick — on
+        # 2026-09-03 that made one PM bank 98.4% of all Hindsight LLM spend,
+        # 99% of it the same six skill documents. See retain_gate.py.
+        self._retain_gate_enabled = True
+        self._retain_strip_injected = True
+        self._retain_drop_repeated = True
+        self._retain_skip_unchanged = True
+        self._retain_dedupe_window = _RG_WINDOW
+        self._retain_dedupe_threshold = _RG_THRESHOLD
+        self._retain_min_novel_chars = _RG_MIN_NOVEL
         self._turn_counter = 0
         self._session_turns: list[str] = []  # accumulates ALL turns for the session
         # How many turns the last append-mode retain already shipped. Used to
@@ -1201,6 +1222,13 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "prefetch_waits_for_retain", "description": "Have the background next-turn prefetch wait for the just-completed retain to become recall-visible on the server (local queue drain + async operation completion) before recalling, so recall includes the just-completed turn (runs off the reply path, adds no response latency)", "default": True},
             {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
+            {"key": "retain_gate", "description": "Refuse to retain a turn that carries nothing new. Cron agents re-send their whole prompt every tick; without this one PM bank was 98.4% of all Hindsight LLM spend, 99% of it the same skill documents pasted in by the harness. Turn off to retain every turn verbatim.", "default": True},
+            {"key": "retain_strip_injected_blocks", "description": "Drop harness-injected [IMPORTANT: ...] instruction blocks, and the skill documentation they paste in, before retaining. They are prompt scaffolding, never memory.", "default": True},
+            {"key": "retain_drop_repeated_paragraphs", "description": "Drop any paragraph already seen in several of the recent retains for this bank. Boilerplate is defined by repetition, so this needs no knowledge of the harness.", "default": True},
+            {"key": "retain_skip_unchanged", "description": "Skip the retain entirely when nothing survives that the previous retain did not already say", "default": True},
+            {"key": "retain_dedupe_window", "description": "How many past retains the repeated-paragraph filter remembers (per bank, on disk)", "default": _RG_WINDOW},
+            {"key": "retain_dedupe_threshold", "description": "A paragraph seen in this many of the remembered retains counts as boilerplate", "default": _RG_THRESHOLD},
+            {"key": "retain_min_novel_chars", "description": "Skip the retain when fewer than this many novel characters survive. Deliberately low — it only refuses the genuinely empty.", "default": _RG_MIN_NOVEL},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
@@ -1698,6 +1726,15 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_every_n_turns = max(1, int(self._config.get("retain_every_n_turns", 1)))
         self._retain_context = self._config.get("retain_context", "conversation between Hermes Agent and the User")
 
+        # Novelty gate (see retain_gate.py for the measurement that motivated it)
+        self._retain_gate_enabled = bool(self._config.get("retain_gate", True)) and _retain_gate is not None
+        self._retain_strip_injected = bool(self._config.get("retain_strip_injected_blocks", True))
+        self._retain_drop_repeated = bool(self._config.get("retain_drop_repeated_paragraphs", True))
+        self._retain_skip_unchanged = bool(self._config.get("retain_skip_unchanged", True))
+        self._retain_dedupe_window = max(1, int(self._config.get("retain_dedupe_window", _RG_WINDOW)))
+        self._retain_dedupe_threshold = max(1, int(self._config.get("retain_dedupe_threshold", _RG_THRESHOLD)))
+        self._retain_min_novel_chars = max(0, int(self._config.get("retain_min_novel_chars", _RG_MIN_NOVEL)))
+
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)
         self._recall_sync = bool(self._config.get("recall_sync", False))
@@ -1974,20 +2011,82 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()
 
+    def _strip_scaffolding(self, text: str) -> str:
+        """Drop harness-injected instruction blocks from a turn.
+
+        Applied where the turn is built, so every retain path — sync_turn and
+        on_session_switch alike — stores the same shape. Idempotent, and any
+        failure returns the text untouched.
+        """
+        if not (self._retain_gate_enabled and self._retain_strip_injected and _retain_gate):
+            return text
+        try:
+            return _retain_gate.strip_injected_blocks(text)
+        except Exception:
+            logger.debug("retain: strip_injected_blocks failed (non-fatal)", exc_info=True)
+            return text
+
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
         now = datetime.now(timezone.utc).isoformat()
         return [
             {
                 "role": "user",
-                "content": f"{self._retain_user_prefix}: {user_content}",
+                "content": f"{self._retain_user_prefix}: {self._strip_scaffolding(user_content)}",
                 "timestamp": now,
             },
             {
                 "role": "assistant",
-                "content": f"{self._retain_assistant_prefix}: {assistant_content}",
+                "content": f"{self._retain_assistant_prefix}: {self._strip_scaffolding(assistant_content)}",
                 "timestamp": now,
             },
         ]
+
+    def _evaluate_retain_gate(self, turns: List[str]):
+        """Ask the novelty gate whether these turns are worth an LLM call.
+
+        Returns ``(decision, payload)``. A ``decision`` of None means the gate
+        is off or could not read the turns, and the retain proceeds unchanged.
+        A ``payload`` of None means store what was already built. Never raises:
+        losing a memory is worse than paying to extract a duplicate one.
+        """
+        if not (self._retain_gate_enabled and _retain_gate):
+            return None, None
+        try:
+            parsed = [json.loads(turn) for turn in turns]
+            combined = "\n\n".join(
+                str(message.get("content") or "")
+                for turn in parsed
+                for message in turn
+            )
+            gate = _retain_gate.RetainGate(
+                self._bank_id,
+                window=self._retain_dedupe_window,
+                threshold=self._retain_dedupe_threshold,
+                min_novel_chars=self._retain_min_novel_chars,
+                strip_injected=self._retain_strip_injected,
+                drop_repeated=self._retain_drop_repeated,
+                skip_unchanged=self._retain_skip_unchanged,
+            )
+            decision = gate.decide(combined)
+            if not decision.retain or not decision.dropped_keys:
+                return decision, None
+            kept_turns = []
+            for turn in parsed:
+                messages = []
+                for message in turn:
+                    text = _retain_gate.filter_paragraphs(
+                        str(message.get("content") or ""), decision.dropped_keys
+                    )
+                    if text.strip():
+                        messages.append({**message, "content": text})
+                if messages:
+                    kept_turns.append(messages)
+            if not kept_turns:
+                return decision, None
+            return decision, json.dumps(kept_turns, ensure_ascii=False)
+        except Exception:
+            logger.debug("retain gate failed (non-fatal); retaining unchanged", exc_info=True)
+            return None, None
 
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
@@ -2094,6 +2193,25 @@ class HindsightMemoryProvider(MemoryProvider):
                      len(turns_to_retain), len(self._session_turns),
                      sum(len(t) for t in turns_to_retain))
         content = "[" + ",".join(turns_to_retain) + "]"
+
+        # Nothing below this line is free: every retain that gets past here
+        # buys an LLM extraction. Refuse the ones that carry nothing new.
+        decision, filtered = self._evaluate_retain_gate(turns_to_retain)
+        if decision is not None and not decision.retain:
+            logger.info(
+                "Hindsight retain skipped (bank=%s): %s; %d chars not sent to the extractor",
+                self._bank_id, decision.reason, decision.original_chars,
+            )
+            # The append watermark deliberately does NOT advance: if the next
+            # turn is worth keeping, these turns ride along with it as context
+            # and the gate strips whatever still repeats.
+            return
+        if filtered is not None:
+            logger.debug(
+                "Hindsight retain filtered (bank=%s): %d -> %d chars, %d repeated paragraph(s) dropped",
+                self._bank_id, len(content), len(filtered), len(decision.dropped_keys),
+            )
+            content = filtered
 
         lineage_tags: list[str] = []
         if self._session_id:
