@@ -4871,6 +4871,12 @@ def _block_and_pause_job(
 BLOCKED_CONFIG_MARKER = "[blocked_config]"
 BLOCKED_CONFIG_SILENT_MARKER = "[blocked_config:silent]"
 
+# Marker prefix for unattended-run economics admission. The scheduler records
+# every decision in usage_audit.jsonl; the silent variant suppresses repeat
+# notifications for the same unchanged condition.
+ECONOMICS_SKIP_MARKER = "[economics_skip]"
+ECONOMICS_SKIP_SILENT_MARKER = "[economics_skip:silent]"
+
 # Marker prefix for a #44585 drift-guard skip. Same alert-once contract as
 # blocked_config: run_one_job keys off it to record last_status and the
 # ``:silent`` variant means "already alerted on a previous tick — do not
@@ -5680,6 +5686,8 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    _economics_admission = None
+    _runtime_provider = ""
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -6269,6 +6277,79 @@ def run_job(
         fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
+        _runtime_provider = runtime_provider
+
+        # Cost/ROI admission is deliberately after prompt assembly and model
+        # resolution, but before credential-pool loading, MCP startup, or
+        # AIAgent construction. An unchanged expanded prompt therefore costs
+        # one cheap scheduler read and zero provider tokens.
+        from cron.economics import admit as admit_economics
+
+        _economics_admission = admit_economics(
+            job=job,
+            prompt=prompt,
+            model=str(model),
+            provider=runtime_provider,
+            config=_cfg,
+            current_max_iterations=max_iterations,
+            audit_path=_usage_audit_path(),
+        )
+        if not _economics_admission.allowed:
+            _economics_reason = _economics_admission.reason or "background-run budget policy refused this run"
+            _economics_marker = (
+                ECONOMICS_SKIP_MARKER
+                if _economics_admission.alert
+                else ECONOMICS_SKIP_SILENT_MARKER
+            )
+            _economics_outcome = (
+                "no_change"
+                if _economics_reason.startswith("identical expanded prompt")
+                else "blocked"
+            )
+            _write_usage_audit({
+                "ts": _utcnow_iso_ms(),
+                "job_id": job_id,
+                "fire_id": None,
+                "status": "skipped",
+                "outcome": _economics_outcome,
+                "prompt_fingerprint": _economics_admission.prompt_fingerprint,
+                "prompt_tokens": _economics_admission.estimated_prompt_tokens,
+                "estimated_tokens": _economics_admission.estimated_tokens,
+                "total_tokens": 0,
+                "response_silent": _economics_outcome == "no_change",
+                "deliver_target": job.get("deliver"),
+                "model": model or None,
+                "provider": runtime_provider or None,
+                "economics_reason": _economics_reason,
+                "economics_alert": _economics_admission.alert,
+                "duration_ms": 0,
+                "error": _economics_reason,
+            })
+            if _economics_admission.alert:
+                logger.error(
+                    "Job '%s': economics tripwire — %s",
+                    job_id,
+                    _economics_reason,
+                )
+            _economics_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Status:** skipped before inference\n\n"
+                f"{_economics_reason}\n"
+            )
+            _economics_error = (
+                f"{_economics_marker} {_economics_reason}. "
+                "No inference call was made."
+            )
+            return (
+                False if _economics_admission.alert else True,
+                _economics_doc,
+                "" if _economics_admission.alert else SILENT_MARKER,
+                _economics_error if _economics_admission.alert else None,
+            )
+        # Existing jobs may request an unlimited/high turn count. The
+        # economics policy is the hard upper bound for unattended work.
+        max_iterations = _economics_admission.effective_max_iterations
         if runtime_provider:
             try:
                 from agent.credential_pool import load_pool
@@ -6600,16 +6681,61 @@ def run_job(
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
         _audit_response_silent = _is_cron_silence_response(final_response or "")
+        _audit_prompt_tokens = result.get("prompt_tokens")
+        _audit_completion_tokens = result.get("completion_tokens")
+        _audit_total_tokens = result.get("total_tokens")
+        _audit_cost_usd = None
+        try:
+            from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+            _usage = CanonicalUsage(
+                input_tokens=int(_audit_prompt_tokens or 0),
+                output_tokens=int(_audit_completion_tokens or 0),
+            )
+            _cost = estimate_usage_cost(
+                str(model),
+                _usage,
+                provider=_runtime_provider or None,
+                base_url=runtime.get("base_url") if isinstance(runtime, dict) else None,
+            )
+            if _cost.amount_usd is not None:
+                _audit_cost_usd = str(_cost.amount_usd)
+        except Exception:
+            logger.debug("Job '%s': could not estimate cron run cost", job_id, exc_info=True)
+        _audit_tripwires = ()
+        try:
+            from cron.economics import cost_tripwire
+
+            _audit_tripwires = cost_tripwire(
+                total_tokens=int(_audit_total_tokens or 0),
+                cost_usd=_audit_cost_usd,
+                config=_cfg,
+                job=job,
+            )
+        except Exception:
+            logger.debug("Job '%s': economics tripwire evaluation failed", job_id, exc_info=True)
+        if _audit_tripwires:
+            logger.error(
+                "Job '%s': post-run economics tripwire — %s",
+                job_id,
+                "; ".join(_audit_tripwires),
+            )
         _write_usage_audit({
             "ts": _utcnow_iso_ms(),
             "job_id": job_id,
             "fire_id": _audit_fire_id,
-            "prompt_tokens": result.get("prompt_tokens"),
-            "completion_tokens": result.get("completion_tokens"),
-            "total_tokens": result.get("total_tokens"),
+            "status": "completed",
+            "outcome": "completed",
+            "prompt_fingerprint": _economics_admission.prompt_fingerprint if _economics_admission else None,
+            "prompt_tokens": _audit_prompt_tokens,
+            "completion_tokens": _audit_completion_tokens,
+            "total_tokens": _audit_total_tokens,
+            "cost_usd": _audit_cost_usd,
+            "economics_tripwires": list(_audit_tripwires),
             "response_silent": _audit_response_silent,
             "deliver_target": job.get("deliver"),
             "model": model or None,
+            "provider": _runtime_provider or None,
             "duration_ms": _audit_duration_ms,
             "error": None,
         })
@@ -6627,12 +6753,17 @@ def run_job(
                 "ts": _utcnow_iso_ms(),
                 "job_id": job_id,
                 "fire_id": _audit_fire_id,
+                "status": "failed",
+                "outcome": "failed",
+                "prompt_fingerprint": _economics_admission.prompt_fingerprint if _economics_admission else None,
                 "prompt_tokens": None,
                 "completion_tokens": None,
                 "total_tokens": None,
+                "cost_usd": None,
                 "response_silent": False,
                 "deliver_target": job.get("deliver"),
                 "model": model or None,
+                "provider": _runtime_provider or None,
                 "duration_ms": _audit_duration_ms,
                 "error": error_msg,
             })
@@ -7179,6 +7310,12 @@ def _run_one_job_body(
             drift_skip = drift_skip_silent or (
                 bool(error) and DRIFT_SKIP_MARKER in str(error)
             )
+            economics_skip_silent = (
+                bool(error) and ECONOMICS_SKIP_SILENT_MARKER in str(error)
+            )
+            economics_skip = economics_skip_silent or (
+                bool(error) and ECONOMICS_SKIP_MARKER in str(error)
+            )
             if blocked_config and not success:
                 # Blocked-config alert: bypass the generic failure summarizer
                 # (whose auth/timeout heuristics would mislabel this as a
@@ -7193,6 +7330,15 @@ def _run_one_job_body(
                     f"{_pf_text} "
                     "This alert is sent once; the job stays blocked until "
                     "the configuration is fixed."
+                )
+            elif economics_skip and not success:
+                _economics_text = re.sub(
+                    r"\[economics_skip[^\]]*\]\s*", "", str(error)
+                ).strip()
+                deliver_content = (
+                    f"⚠️ Cron '{job.get('name') or job['id']}' blocked by "
+                    f"background-run economics guard (no LLM call was made): "
+                    f"{_economics_text}"
                 )
             else:
                 if success:
@@ -7235,7 +7381,7 @@ def _run_one_job_body(
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
-            if blocked_config_silent or drift_skip_silent:
+            if blocked_config_silent or drift_skip_silent or economics_skip_silent:
                 should_deliver = False
             unresolved_origin = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
