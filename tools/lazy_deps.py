@@ -165,9 +165,16 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "wake.openwakeword.tflite": (
         "ai-edge-litert==2.1.6",
     ),
+    # openwakeword 0.6.0's PyPI metadata declares tflite-runtime for Linux,
+    # but tflite-runtime has no wheels for CPython 3.12+ on Linux. On that
+    # combination we install openwakeword with --no-deps and rely on the ONNX
+    # backend (see _venv_pip_install). scipy/scikit-learn are runtime deps not
+    # already covered by Hermes core, so pin them here explicitly.
     "wake.openwakeword": (
         "openwakeword==0.6.0",
         "onnxruntime==1.27.0",
+        "scipy==1.17.1",
+        "scikit-learn==1.9.0",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),
@@ -698,6 +705,36 @@ def _core_constraints_file() -> Optional[Path]:
         return None
 
 
+def _openwakeword_linux_py312_groups(specs: tuple[str, ...]) -> list[tuple[str, ...]]:
+    """Return install-phase groups for openwakeword on Linux CPython 3.12+.
+
+    openwakeword 0.6.0's published wheel declares ``tflite-runtime`` for
+    ``platform_system == "Linux"``, but tflite-runtime only ships wheels up
+    to CPython 3.11. On Linux with Python 3.12+ the resolver therefore fails
+    with no matching wheel. openwakeword itself runs fine on the ONNX backend;
+    the tflite dependency is only needed for the optional tflite inference
+    framework. Work around it by installing openwakeword with ``--no-deps``
+    first, then installing its runtime deps (which we now pin explicitly in
+    :data:`LAZY_DEPS`) normally.
+
+    Returns ``[specs]`` unchanged on any other platform/Python combination.
+    """
+    if sys.platform != "linux" or sys.version_info < (3, 12):
+        return [specs]
+    oww_spec: Optional[str] = None
+    rest: list[str] = []
+    for spec in specs:
+        if _pkg_name_from_spec(spec) == "openwakeword":
+            oww_spec = spec
+        else:
+            rest.append(spec)
+    if not oww_spec:
+        return [specs]
+    # Phase 1: openwakeword without dependencies.
+    # Phase 2: everything else (onnxruntime, scipy, scikit-learn, ...).
+    return [(oww_spec, "--no-deps"), tuple(rest)]
+
+
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
@@ -734,6 +771,10 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     if constraints is not None:
         constraint_args = ["--constraint", str(constraints)]
 
+    # On Linux CPython 3.12+ openwakeword's tflite-runtime dependency has no
+    # wheels, so split it into a --no-deps phase followed by the rest.
+    install_groups = _openwakeword_linux_py312_groups(specs)
+
     try:
         venv_root = Path(sys.executable).parent.parent
         from tools.environments.local import hermes_subprocess_env
@@ -755,21 +796,24 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             uv_bin = shutil.which("uv")
         if uv_bin:
             try:
-                r = subprocess.run(
-                    [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=windows_hide_flags(),
-                )
-                if r.returncode == 0:
-                    if target is not None:
-                        _activate_target_on_syspath(target)
-                    return _InstallResult(True, r.stdout or "", r.stderr or "")
-                logger.debug("uv pip install failed: %s", r.stderr)
-                # A resolver failure is authoritative. Falling through to pip
-                # here would silently discard uv policy such as exclude-newer
-                # and could install a release that the project quarantined.
-                return _InstallResult(False, r.stdout or "", r.stderr or "")
+                last_result: Optional[_InstallResult] = None
+                for group in install_groups:
+                    r = subprocess.run(
+                        [uv_bin, "pip", "install", *target_args, *constraint_args, *group],
+                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
+                        stdin=subprocess.DEVNULL,
+                        creationflags=windows_hide_flags(),
+                    )
+                    if r.returncode != 0:
+                        logger.debug("uv pip install failed: %s", r.stderr)
+                        # A resolver failure is authoritative. Falling through to pip
+                        # here would silently discard uv policy such as exclude-newer
+                        # and could install a release that the project quarantined.
+                        return _InstallResult(False, r.stdout or "", r.stderr or "")
+                    last_result = _InstallResult(True, r.stdout or "", r.stderr or "")
+                if target is not None:
+                    _activate_target_on_syspath(target)
+                return last_result or _InstallResult(True, "", "")
             except subprocess.TimeoutExpired as e:
                 logger.debug("uv invocation failed: %s", e)
                 return _InstallResult(False, "", f"uv pip install timed out: {e}")
@@ -803,15 +847,20 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                                       f"pip not available and ensurepip failed: {e}")
 
         try:
-            r = subprocess.run(
-                pip_cmd + ["install", *target_args, *constraint_args, *specs],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
-                stdin=subprocess.DEVNULL,
-                creationflags=windows_hide_flags(),
-            )
-            if r.returncode == 0 and target is not None:
+            last_result = None
+            for group in install_groups:
+                r = subprocess.run(
+                    pip_cmd + ["install", *target_args, *constraint_args, *group],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=windows_hide_flags(),
+                )
+                if r.returncode != 0:
+                    return _InstallResult(False, r.stdout or "", r.stderr or "")
+                last_result = _InstallResult(True, r.stdout or "", r.stderr or "")
+            if target is not None:
                 _activate_target_on_syspath(target)
-            return _InstallResult(r.returncode == 0, r.stdout or "", r.stderr or "")
+            return last_result or _InstallResult(True, "", "")
         except subprocess.TimeoutExpired as e:
             return _InstallResult(False, "", f"pip install timed out: {e}")
         except Exception as e:
