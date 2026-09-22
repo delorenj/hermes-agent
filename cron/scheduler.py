@@ -2418,9 +2418,34 @@ class _CronAgentSetup:
     fallback_model: Any = None
     credential_pool: Any = None
     fallback_notice: Optional[str] = None
+    admission: Any = None  # cron.economics.Admission for this fire (fingerprint rides the audit row)
 
 
-def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
+def _economics_skip_result(admission, job: dict, job_id: str, job_name: str, model: str, provider: str) -> _RunResult:
+    """Audit + result tuple for a run refused by economics admission (no provider call was made).
+    An unchanged prompt is a silent success; a tripwire (alert) is a failure that is delivered once."""
+    reason = admission.reason or "background-run budget policy refused this run"
+    outcome = "no_change" if reason.startswith("identical expanded prompt") else "blocked"
+    _write_usage_audit({
+        "ts": _utcnow_iso_ms(), "job_id": job_id, "fire_id": None, "status": "skipped",
+        "outcome": outcome, "prompt_fingerprint": admission.prompt_fingerprint,
+        "prompt_tokens": admission.estimated_prompt_tokens, "estimated_tokens": admission.estimated_tokens,
+        "total_tokens": 0, "response_silent": outcome == "no_change",
+        "deliver_target": job.get("deliver"), "model": model or None, "provider": provider or None,
+        "economics_reason": reason, "economics_alert": admission.alert, "duration_ms": 0, "error": reason,
+    })
+    if admission.alert:
+        logger.error("Job '%s': economics tripwire — %s", job_id, reason)
+    doc = (
+        f"# Cron Job: {job_name}\n\n**Job ID:** {job_id}\n"
+        f"**Status:** skipped before inference\n\n{reason}\n"
+    )
+    if admission.alert:
+        return False, doc, "", f"{ECONOMICS_SKIP_MARKER} {reason}. No inference call was made."
+    return True, doc, SILENT_MARKER, None
+
+
+def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc, prompt: str = "") -> _CronAgentSetup:
     """Resolve model/runtime/reasoning/pool for the run, in the original gate order: exfil guard ->
     preflight (may block) -> runtime (+ fallback chain) -> credential pool -> MCP."""
     _cfg = jc.cfg
@@ -2450,6 +2475,21 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     # Mid-run provider ladder: same rule as resolution above, so a pinned job cannot be swapped
     # onto the global chain by a 5xx/429 either.
     setup.fallback_model = _job_fallback_chain(job, _cfg)
+    # Fork: cost/ROI admission lands after prompt assembly and model resolution but BEFORE credential-pool
+    # loading, MCP startup and AIAgent construction, so an unchanged expanded prompt costs one cheap
+    # scheduler read and zero provider tokens.
+    from cron.economics import admit as admit_economics
+    _runtime_provider = str(setup.runtime.get("provider") or "").strip().lower()
+    setup.admission = admit_economics(
+        job=job, prompt=prompt, model=str(setup.model), provider=_runtime_provider, config=_cfg,
+        current_max_iterations=setup.max_iterations, audit_path=_usage_audit_path())
+    if not setup.admission.allowed:
+        setup.blocked = _economics_skip_result(
+            setup.admission, job, job_id, job_name, str(setup.model), _runtime_provider)
+        return setup
+    # Existing jobs may request an unlimited/high turn count; the economics policy is the hard upper
+    # bound for unattended work.
+    setup.max_iterations = setup.admission.effective_max_iterations
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
     _init_cron_mcp_tools(job_id)
@@ -2502,22 +2542,58 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
 class _FireAudit:
     """One usage_audit.jsonl line per fire (created once the agent exists; fire id + start clock)."""
 
-    def __init__(self, job: dict, job_id: str, model: str):
+    def __init__(self, job: dict, job_id: str, model: str, *, admission=None, runtime: Optional[dict] = None, cfg=None):
         self.job, self.job_id, self.model = job, job_id, model
+        self.admission, self.runtime, self.cfg = admission, runtime or {}, cfg
         self.fire_id = uuid.uuid4().hex
         self.t_start = time.monotonic()
 
+    def _cost_usd(self, result: dict) -> Optional[str]:
+        """Estimated USD for the fire (None when unpriced); never raises."""
+        try:
+            from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+            usage = CanonicalUsage(
+                input_tokens=int(result.get("prompt_tokens") or 0),
+                output_tokens=int(result.get("completion_tokens") or 0))
+            cost = estimate_usage_cost(
+                str(self.model), usage, provider=(self.runtime.get("provider") or None),
+                base_url=self.runtime.get("base_url"))
+            return str(cost.amount_usd) if cost.amount_usd is not None else None
+        except Exception:
+            logger.debug("Job '%s': could not estimate cron run cost", self.job_id, exc_info=True)
+            return None
+
     def write(self, result: dict, error: Optional[str]) -> None:
+        cost_usd = None if error else self._cost_usd(result)
+        tripwires: tuple = ()
+        if not error:
+            try:
+                from cron.economics import cost_tripwire
+
+                tripwires = tuple(cost_tripwire(
+                    total_tokens=int(result.get("total_tokens") or 0), cost_usd=cost_usd,
+                    config=self.cfg, job=self.job))
+            except Exception:
+                logger.debug("Job '%s': economics tripwire evaluation failed", self.job_id, exc_info=True)
+            if tripwires:
+                logger.error("Job '%s': post-run economics tripwire — %s", self.job_id, "; ".join(tripwires))
         _write_usage_audit({
             "ts": _utcnow_iso_ms(),
             "job_id": self.job_id,
             "fire_id": self.fire_id,
+            "status": "failed" if error else "completed",
+            "outcome": "failed" if error else "completed",
+            "prompt_fingerprint": getattr(self.admission, "prompt_fingerprint", None),
             "prompt_tokens": result.get("prompt_tokens"),
             "completion_tokens": result.get("completion_tokens"),
             "total_tokens": result.get("total_tokens"),
+            "cost_usd": cost_usd,
+            "economics_tripwires": list(tripwires),
             "response_silent": bool(result.get("response_silent")),
             "deliver_target": self.job.get("deliver"),
             "model": self.model or None,
+            "provider": self.runtime.get("provider") or None,
             "duration_ms": int((time.monotonic() - self.t_start) * 1000),
             "error": error})
 
@@ -2569,7 +2645,7 @@ def run_job(
         jc = _load_cron_job_config(job, job_id, job_name)
         _cfg = jc.cfg
         model = jc.model
-        setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)
+        setup = _resolve_cron_agent_setup(job, job_id, job_name, jc, prompt)
         if setup.blocked is not None:
             return setup.blocked
         model = setup.model
@@ -2579,7 +2655,7 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
-        _audit = _FireAudit(job, job_id, model)
+        _audit = _FireAudit(job, job_id, model, admission=setup.admission, runtime=setup.runtime, cfg=_cfg)
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
@@ -2940,6 +3016,12 @@ def _compose_run_delivery(
         _pf_text = re.sub(r"\[blocked_config[^\]]*\]\s*", "", err).strip()
         from cron.scheduler_failure_copy import blocked_config_notice
         deliver_content = blocked_config_notice(job.get("name") or job["id"], _pf_text)
+    elif ECONOMICS_SKIP_MARKER in err and not success:
+        _economics_text = re.sub(r"\[economics_skip[^\]]*\]\s*", "", err).strip()
+        deliver_content = (
+            f"⚠️ Cron '{job.get('name') or job['id']}' blocked by background-run economics guard "
+            f"(no LLM call was made): {_economics_text}"
+        )
     elif success:
         deliver_content = final_response
         _resolve_incidents_for_recovered_job(job)
@@ -4405,7 +4487,7 @@ from cron.scheduler_prompt import (
     _parse_wake_gate,
 )
 from cron.scheduler_preflight import (
-    BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,
+    BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, ECONOMICS_SKIP_MARKER, _cron_preflight_enabled,
     _empty_requested_mcp_toolsets, _is_transient_provider_resolve_error, _preflight_job_config,
 )
 
