@@ -24,6 +24,10 @@ logger = logging.getLogger("cron.scheduler")
 BLOCKED_CONFIG_MARKER = "[blocked_config]"
 BLOCKED_CONFIG_SILENT_MARKER = "[blocked_config:silent]"
 
+# Fork: unattended-run economics admission (cron/economics.py). An ``[economics_skip]`` error means the
+# run was refused BEFORE any provider call; every decision is recorded in usage_audit.jsonl.
+ECONOMICS_SKIP_MARKER = "[economics_skip]"
+
 _TRANSIENT_NET_EXC_NAMES = frozenset({
     "ConnectError", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout", "NetworkError",
     "TimeoutException", "ClientConnectorError", "ClientConnectorDNSError", "ServerTimeoutError",
