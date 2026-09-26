@@ -61,8 +61,21 @@ Config file: `~/.hermes/hindsight/config.json`
 |-----|---------|-------------|
 | `bank_id` | `hermes` | Memory bank name (static fallback used when `bank_id_template` is unset or resolves empty) |
 | `bank_id_template` | — | Optional template to derive the bank name dynamically. Placeholders: `{profile}`, `{workspace}`, `{platform}`, `{user}`, `{session}`. Example: `hermes-{profile}` isolates memory per active Hermes profile. Empty placeholders collapse cleanly (e.g. `hermes-{user}` with no user becomes `hermes`). |
-| `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Applied via Banks API. |
-| `bank_retain_mission` | — | Retain mission (steers what gets extracted). Applied via Banks API. |
+| `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Applied via the bank config API, once, and only while the bank has no mission of its own. |
+| `bank_retain_mission` | — | Retain mission (steers what gets extracted). Applied the same way as `bank_mission`. |
+| `bank_template` | — | Path to a Hindsight bank-template manifest (JSON; `~` and `$VARS` expand). Imported once into a bank that has no mission yet, which also creates its mental models and directives. Wins over `bank_mission`/`bank_retain_mission`. The manifest must set a mission in its `bank` block. Env fallback: `HINDSIGHT_BANK_TEMPLATE`. |
+
+**How bank steering works.** On `initialize`, the provider queues one check on
+its writer thread, ahead of any retain: `GET /v1/default/banks/{bank}/config`.
+If the bank's own `overrides` already carry a `retain_mission`,
+`reflect_mission` or `observations_mission`, nothing happens; a template
+imported by hand or a mission somebody set is never replaced. Otherwise it
+imports `bank_template` (`POST .../import`) or PATCHes the configured missions
+(creating the bank first if it does not exist). The result is cached per
+`(api_url, bank)` for the life of the process, so this costs one GET per bank
+per process. A network or 5xx failure lets a session five minutes later retry;
+a 4xx is logged once and not retried. With none of the three keys set, no
+request is made. Not applied in `local_embedded` mode.
 
 ### Recall
 
@@ -71,7 +84,7 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
-| `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
+| `recall_max_input_chars` | `800` | Maximum recall query length, for auto-recall and the `hindsight_recall` tool. The server rejects queries over its token limit (500 by default) with a 400. |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
@@ -97,6 +110,17 @@ Config file: `~/.hermes/hindsight/config.json`
 | `retain_every_n_turns` | `1` | Retain every N turns (1 = every turn) |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
+| `observation_scopes` | — | How consolidation scopes observations: `combined` (server default), `per_tag`, `all_combinations`, `shared` (one scope for the whole bank regardless of tags; server >= 0.9, fully effective from 0.10), or a JSON list of tag-lists. Env fallback: `HINDSIGHT_RETAIN_OBSERVATION_SCOPES`. |
+
+**Lineage tags.** Every auto-retain (and the flush on a session switch) also
+carries `session:<session_id>` and, when the session has a parent,
+`parent:<parent_session_id>`. They are added in `sync_turn()` and
+`on_session_switch()`, merged with `retain_tags`, and date from upstream
+#6602 (2026-04-09). Consolidation scopes observations by a fact's full tag set,
+so under the default scoping each session gets its own observation scope and
+consolidation cannot dedupe across sessions. `observation_scopes: shared` is
+the fix. Tool retains (`hindsight_retain`) carry only `retain_tags` plus the
+call's own `tags`.
 | `retain_source` | — | Opt-in `metadata.source` attached to retained memories (identifies the storing client, e.g. `hermes`). Empty by default — no attribution tag ships unless you set it. |
 | `retain_indicator` | `true` | Show a `👁️ Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |

@@ -19,7 +19,8 @@ Config via environment variables:
   HINDSIGHT_IDLE_TIMEOUT           — embedded daemon idle timeout seconds; 0 disables shutdown (default: 300)
   HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT — seconds to wait for a slow embedded daemon /health before treating it as stale (default: 30; set via config.json port_health_grace_timeout)
   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
-  HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: per_tag/combined/all_combinations, or a JSON list of tag-lists for custom scopes
+  HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: per_tag/combined/all_combinations/shared, or a JSON list of tag-lists for custom scopes
+  HINDSIGHT_BANK_TEMPLATE          — bank-template manifest (JSON path) imported once into a bank that has no mission yet
   HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories (default: hermes)
   HINDSIGHT_RETAIN_USER_PREFIX     — label used before user turns in retained transcripts
   HINDSIGHT_RETAIN_ASSISTANT_PREFIX — label used before assistant turns in retained transcripts
@@ -500,7 +501,11 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
-_OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
+# "shared" (Hindsight server >= 0.9) consolidates every retain into one scope
+# regardless of its tags. Hermes stamps each retain with session:/parent:
+# lineage tags, so without it a long-lived agent gets one observation scope per
+# session and consolidation can never dedupe across sessions.
+_OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations", "shared"}
 
 
 def _normalize_observation_scopes(value: Any) -> Any:
@@ -508,7 +513,8 @@ def _normalize_observation_scopes(value: Any) -> Any:
 
     Returns one of:
       * ``None`` — nothing configured; Hindsight applies its ``combined`` default.
-      * a keyword string — ``"per_tag"`` / ``"combined"`` / ``"all_combinations"``.
+      * a keyword string — ``"per_tag"`` / ``"combined"`` / ``"all_combinations"``
+        / ``"shared"``.
       * ``list[list[str]]`` — custom scopes, one inner list per consolidation pass.
 
     Accepts a keyword string, a JSON-encoded list, a flat list of tags (treated as
@@ -548,6 +554,144 @@ def _normalize_observation_scopes(value: Any) -> Any:
         return scopes or None
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Bank steering: give a bank with no mission its template or configured
+# missions, once. Missions already on the bank always win, so this never
+# clobbers a template import or a hand-set mission.
+# ---------------------------------------------------------------------------
+
+# Bank-level overrides that mean "somebody already steered this bank".
+_MISSION_OVERRIDE_KEYS = ("retain_mission", "reflect_mission", "observations_mission")
+# After a transient failure (network, 5xx) the next session may try again.
+_BANK_STEERING_RETRY_S = 300.0
+# (api_url, bank_id) -> ("in-flight" | "done" | "retry", retry_at_monotonic)
+_bank_steering_state: dict[tuple[str, str], tuple[str, float]] = {}
+_bank_steering_lock = threading.Lock()
+
+
+class _BankSteeringRefused(RuntimeError):
+    """The server refused the change (4xx); retrying this process won't help."""
+
+
+def _hindsight_http(method: str, url: str, api_key: str | None = None,
+                    body: Any = None, timeout: float = 15.0) -> tuple[int, Any]:
+    """One JSON request. Returns (status, parsed body or None); raises on network errors."""
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        status, raw = exc.code, exc.read()
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="replace")) if raw else None
+    except ValueError:
+        parsed = None
+    return status, parsed
+
+
+def _load_bank_template(path: str) -> dict:
+    """Read a Hindsight bank-template manifest and check it can be applied once.
+
+    The manifest must set at least one mission in its ``bank`` block. That
+    mission is how a later session knows the import already happened; a
+    manifest without one would be re-imported, and re-queue its mental-model
+    refreshes, on every process start.
+    """
+    from pathlib import Path
+
+    resolved = Path(os.path.expandvars(os.path.expanduser(str(path))))
+    manifest = json.loads(resolved.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("bank"), dict):
+        raise ValueError(f"{resolved} has no 'bank' block")
+    if not any(manifest["bank"].get(key) for key in _MISSION_OVERRIDE_KEYS):
+        raise ValueError(
+            f"{resolved} sets none of {', '.join(_MISSION_OVERRIDE_KEYS)}, so an import "
+            "could not be told apart from an unsteered bank"
+        )
+    return manifest
+
+
+def _raise_for_steering_status(what: str, status: int, body: Any) -> None:
+    if 200 <= status < 300:
+        return
+    detail = body.get("detail") if isinstance(body, dict) else body
+    message = f"{what} -> HTTP {status}: {str(detail)[:200]}"
+    if 400 <= status < 500 and status not in (404, 408, 429):
+        raise _BankSteeringRefused(message)
+    raise RuntimeError(message)
+
+
+def _steer_bank(api_url: str, api_key: str | None, bank_id: str, *,
+                template_path: str = "", reflect_mission: str = "",
+                retain_mission: str = "", timeout: float = 15.0) -> str:
+    """Apply a bank template, or the configured missions, to a bank that has none.
+
+    Returns what happened: ``already-steered``, ``template-imported``,
+    ``missions-applied`` or ``nothing-to-apply``. Reads the bank's own
+    overrides, not its resolved config, so a server-wide default mission does
+    not count as steering this bank.
+    """
+    import urllib.parse
+
+    base = f"{api_url.rstrip('/')}/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}"
+    status, body = _hindsight_http("GET", f"{base}/config", api_key, timeout=timeout)
+    if status == 404:
+        exists, overrides = False, {}
+    else:
+        _raise_for_steering_status("GET bank config", status, body)
+        overrides = (body.get("overrides") if isinstance(body, dict) else None) or {}
+        exists = True
+    if any(overrides.get(key) for key in _MISSION_OVERRIDE_KEYS):
+        return "already-steered"
+
+    manifest = None
+    if template_path:
+        try:
+            manifest = _load_bank_template(template_path)
+        except Exception as exc:
+            fallback = ("falling back to the configured missions" if (reflect_mission or retain_mission)
+                        else f"bank {bank_id} stays unsteered")
+            logger.warning("Hindsight bank_template %s is unusable (%s); %s", template_path, exc, fallback)
+    if manifest is not None:
+        status, body = _hindsight_http("POST", f"{base}/import", api_key, body=manifest, timeout=timeout)
+        _raise_for_steering_status("import bank template", status, body)
+        body = body if isinstance(body, dict) else {}
+        logger.info(
+            "Hindsight bank %s had no mission: imported bank template %s "
+            "(mental models created=%s updated=%s, directives created=%s updated=%s)",
+            bank_id, template_path,
+            body.get("mental_models_created"), body.get("mental_models_updated"),
+            body.get("directives_created"), body.get("directives_updated"),
+        )
+        return "template-imported"
+
+    updates = {}
+    if reflect_mission:
+        updates["reflect_mission"] = reflect_mission
+    if retain_mission:
+        updates["retain_mission"] = retain_mission
+    if not updates:
+        return "nothing-to-apply"
+    if not exists:
+        status, body = _hindsight_http("PUT", base, api_key, body={}, timeout=timeout)
+        _raise_for_steering_status("create bank", status, body)
+    status, body = _hindsight_http("PATCH", f"{base}/config", api_key,
+                                   body={"updates": updates}, timeout=timeout)
+    _raise_for_steering_status("PATCH bank config", status, body)
+    logger.info("Hindsight bank %s had no mission: applied configured %s",
+                bank_id, " and ".join(sorted(updates)))
+    return "missions-applied"
 
 
 def _utc_timestamp() -> str:
@@ -882,6 +1026,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Bank
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
+        self._bank_template = ""
         self._bank_id_template = ""
 
     @property
@@ -1199,13 +1344,14 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
             {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
             {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
-            {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
-            {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
+            {"key": "bank_mission", "description": "Reflect mission for the memory bank. Applied once, and only while the bank has no mission of its own (never overwrites one)"},
+            {"key": "bank_retain_mission", "description": "Retain mission (steers what gets extracted). Applied once, and only while the bank has no mission of its own (never overwrites one)"},
+            {"key": "bank_template", "description": "Path to a Hindsight bank-template manifest (JSON). Imported once into a bank that has no mission yet; wins over bank_mission/bank_retain_mission. The manifest must set a mission in its 'bank' block", "default": ""},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
-            {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
+            {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), 'shared' (one scope for the whole bank regardless of tags; Hindsight server >= 0.9, best on >= 0.10), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
             {"key": "retain_source", "description": "Metadata source value attached to retained memories (identifies the client that stored them)", "default": _DEFAULT_RETAIN_SOURCE},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
@@ -1230,7 +1376,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_dedupe_threshold", "description": "A paragraph seen in this many of the remembered retains counts as boilerplate", "default": _RG_THRESHOLD},
             {"key": "retain_min_novel_chars", "description": "Skip the retain when fewer than this many novel characters survive. Deliberately low — it only refuses the genuinely empty.", "default": _RG_MIN_NOVEL},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
-            {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "recall_max_input_chars", "description": "Maximum recall query length, for auto-recall and the hindsight_recall tool", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -1590,6 +1736,63 @@ class HindsightMemoryProvider(MemoryProvider):
             return self._session_id, "append"
         return fallback_document_id, None
 
+    def _schedule_bank_steering(self) -> None:
+        """Queue a one-time check that the bank has a mission, applying ours if not.
+
+        ``bank_template`` (a bank-template manifest) wins over
+        ``bank_mission``/``bank_retain_mission``. Either is applied only while
+        the bank has no retain/reflect/observations mission of its own, so a
+        template imported by hand, or a mission someone set, is never replaced.
+
+        Costs one GET per (api_url, bank) per process, on the writer thread,
+        and runs before any retain queued after it, so the first extraction
+        into a brand-new bank is already steered. Nothing configured means no
+        request at all. Embedded mode is skipped: its daemon URL is not known
+        until the daemon starts.
+        """
+        template = self._bank_template
+        reflect_mission = str(self._bank_mission or "").strip()
+        retain_mission = str(self._bank_retain_mission or "").strip()
+        if not (template or reflect_mission or retain_mission):
+            return
+        if self._mode not in {"cloud", "local_external"} or not self._api_url or not self._bank_id:
+            return
+        key = (self._api_url.rstrip("/"), self._bank_id)
+        with _bank_steering_lock:
+            state, retry_at = _bank_steering_state.get(key, ("", 0.0))
+            if state in {"in-flight", "done"} or (state == "retry" and time.monotonic() < retry_at):
+                return
+            _bank_steering_state[key] = ("in-flight", 0.0)
+
+        api_url, api_key, bank_id = self._api_url, self._api_key, self._bank_id
+        timeout = float(min(self._timeout or _DEFAULT_TIMEOUT, 15))
+
+        def _steer() -> None:
+            outcome = ("retry", time.monotonic() + _BANK_STEERING_RETRY_S)
+            try:
+                result = _steer_bank(
+                    api_url, api_key, bank_id,
+                    template_path=template,
+                    reflect_mission=reflect_mission,
+                    retain_mission=retain_mission,
+                    timeout=timeout,
+                )
+                logger.debug("Hindsight bank steering for %s: %s", bank_id, result)
+                outcome = ("done", 0.0)
+            except _BankSteeringRefused as exc:
+                logger.warning("Hindsight bank %s was not steered; the server refused: %s", bank_id, exc)
+                outcome = ("done", 0.0)
+            except Exception as exc:
+                logger.warning("Hindsight bank steering for %s failed (%s); a session after %ds retries",
+                               bank_id, exc, int(_BANK_STEERING_RETRY_S))
+            finally:
+                with _bank_steering_lock:
+                    _bank_steering_state[key] = outcome
+
+        self._ensure_writer()
+        self._register_atexit()
+        self._retain_queue.put(_steer)
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
@@ -1695,9 +1898,13 @@ class HindsightMemoryProvider(MemoryProvider):
         prefetch_method = self._config.get("recall_prefetch_method") or self._config.get("prefetch_method", "recall")
         self._prefetch_method = prefetch_method if prefetch_method in {"recall", "reflect"} else "recall"
 
-        # Bank options
+        # Bank options. Applied to the bank by _schedule_bank_steering(), and
+        # only while the bank has no mission of its own.
         self._bank_mission = self._config.get("bank_mission", "")
         self._bank_retain_mission = self._config.get("bank_retain_mission") or None
+        self._bank_template = str(
+            self._config.get("bank_template") or os.environ.get("HINDSIGHT_BANK_TEMPLATE", "")
+        ).strip()
 
         # Tags
         self._retain_tags = _normalize_retain_tags(
@@ -1783,6 +1990,8 @@ class HindsightMemoryProvider(MemoryProvider):
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
                      self._tags, self._recall_tags)
+
+        self._schedule_bank_steering()
 
         # For local mode, start the embedded daemon in the background so it
         # doesn't block the chat. Redirect stdout/stderr to a log file to
@@ -1889,6 +2098,17 @@ class HindsightMemoryProvider(MemoryProvider):
             return True
         return False
 
+    def _cap_recall_query(self, query: str) -> str:
+        """Truncate a recall query to ``recall_max_input_chars``.
+
+        The server rejects recall queries over its token limit (500 by
+        default) with a 400, and long queries also buy the most expensive
+        rerank. Auto-recall and the hindsight_recall tool share this cap.
+        """
+        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+            return query[:self._recall_max_input_chars]
+        return query
+
     def _do_recall(self, query: str) -> _RecallResult:
         """Run one recall/reflect for *query*.
 
@@ -1898,9 +2118,7 @@ class HindsightMemoryProvider(MemoryProvider):
         text. Shared by the background prefetch worker (``queue_prefetch``) and
         the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
         """
-        # Truncate query to max chars
-        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
-            query = query[:self._recall_max_input_chars]
+        query = self._cap_recall_query(query)
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
@@ -2320,6 +2538,7 @@ class HindsightMemoryProvider(MemoryProvider):
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
+            query = self._cap_recall_query(query)
             try:
                 recall_kwargs: dict = {
                     "bank_id": self._bank_id, "query": query, "budget": self._budget,

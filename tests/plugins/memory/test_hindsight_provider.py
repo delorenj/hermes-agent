@@ -58,6 +58,24 @@ def _clean_env(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: isolated_home))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_bank_steering(monkeypatch):
+    """No test reaches a real server, and each starts with an empty steering cache.
+
+    Bank steering runs on the writer thread whenever a mission or template is
+    configured. Tests that exercise it install their own fake transport.
+    """
+    import plugins.memory.hindsight as hs
+
+    def _no_network(method, url, api_key=None, body=None, timeout=15.0):
+        raise RuntimeError("network disabled in tests")
+
+    monkeypatch.setattr(hs, "_hindsight_http", _no_network)
+    hs._bank_steering_state.clear()
+    yield
+    hs._bank_steering_state.clear()
+
+
 def _make_mock_client():
     """Create a mock Hindsight client with async methods."""
     async def _aretain(
@@ -170,6 +188,9 @@ def provider(tmp_path, monkeypatch):
         "bank_id": "test-bank",
         "budget": "mid",
         "memory_mode": "hybrid",
+        # Retain mechanics are under test here, with turns the novelty gate
+        # would refuse; the gate has its own suite (test_hindsight_retain_gate).
+        "retain_gate": False,
     }
     config_path = tmp_path / "hindsight" / "config.json"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,6 +217,7 @@ def provider_with_config(tmp_path, monkeypatch):
             "bank_id": "test-bank",
             "budget": "mid",
             "memory_mode": "hybrid",
+            "retain_gate": False,
         }
         config.update(overrides)
         config_path = tmp_path / "hindsight" / "config.json"
@@ -279,6 +301,17 @@ class TestConfig:
     def test_observation_scopes_keyword_config(self, provider_with_config):
         p = provider_with_config(observation_scopes="per_tag")
         assert p._observation_scopes == "per_tag"
+
+    def test_observation_scopes_shared_is_sent_on_retain(self, provider_with_config):
+        p = provider_with_config(observation_scopes="shared", retain_async=False)
+        assert p._observation_scopes == "shared"
+        p.sync_turn("remember the deploy window is Tuesday", "noted")
+        p._retain_queue.join()
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert item["observation_scopes"] == "shared"
+        # Lineage tags still ride along; "shared" is what stops them from
+        # splitting consolidation into one scope per session.
+        assert "session:test-session" in item["tags"]
 
 
     def test_custom_config_values(self, provider_with_config):
@@ -461,6 +494,22 @@ class TestToolHandlers:
         ))
         assert "Memory 1" in result["result"]
         assert "Memory 2" in result["result"]
+
+
+    def test_recall_tool_caps_query_like_auto_recall(self, provider_with_config):
+        p = provider_with_config(recall_max_input_chars=50)
+        p.handle_tool_call("hindsight_recall", {"query": "q" * 5000})
+        assert p._client.arecall.call_args.kwargs["query"] == "q" * 50
+
+
+    def test_recall_tool_default_cap_is_800(self, provider):
+        provider.handle_tool_call("hindsight_recall", {"query": "x" * 2000})
+        assert len(provider._client.arecall.call_args.kwargs["query"]) == 800
+
+
+    def test_recall_tool_short_query_untouched(self, provider):
+        provider.handle_tool_call("hindsight_recall", {"query": "dark mode"})
+        assert provider._client.arecall.call_args.kwargs["query"] == "dark mode"
 
 
     def test_reflect_success(self, provider):
@@ -1243,7 +1292,7 @@ class TestConfigSchema:
             "auto_recall", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
             "recall_max_tokens", "recall_max_input_chars",
-            "recall_prompt_preamble",
+            "recall_prompt_preamble", "bank_template", "observation_scopes",
         }
         assert expected_keys.issubset(keys), f"Missing: {expected_keys - keys}"
 
@@ -1561,3 +1610,245 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
         assert len(calls) == 1  # attempted exactly once, init still completed
         assert any("runtime installs are disabled" in r.getMessage()
                    for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# observation_scopes normalizer
+# ---------------------------------------------------------------------------
+
+
+class TestObservationScopesNormalizer:
+    @pytest.mark.parametrize("keyword", ["per_tag", "combined", "all_combinations", "shared"])
+    def test_keywords_pass_through(self, keyword):
+        assert _normalize_observation_scopes(keyword) == keyword
+        assert _normalize_observation_scopes(f"  {keyword}  ") == keyword
+
+    def test_unknown_keyword_is_dropped(self):
+        assert _normalize_observation_scopes("everything") is None
+
+    def test_custom_scopes_still_parse(self):
+        assert _normalize_observation_scopes('[["a", "b"], ["c"]]') == [["a", "b"], ["c"]]
+
+
+# ---------------------------------------------------------------------------
+# Bank steering: template / missions applied once, only to an unsteered bank
+# ---------------------------------------------------------------------------
+
+
+IDENTITY_TEMPLATE = {
+    "version": "1",
+    "bank": {
+        "retain_mission": "Remember who this agent is.",
+        "reflect_mission": "You are the private identity memory of one agent.",
+    },
+    "mental_models": [{"id": "briefing", "name": "Profile", "source_query": "Who is this agent?"}],
+}
+
+
+class _FakeBankServer:
+    """Stands in for _hindsight_http: records calls, answers from a bank table."""
+
+    def __init__(self, banks=None, fail_with=None):
+        # bank_id -> overrides dict; absent bank -> 404
+        self.banks = dict(banks or {})
+        self.calls = []
+        self.fail_with = fail_with
+
+    def __call__(self, method, url, api_key=None, body=None, timeout=15.0):
+        self.calls.append((method, url, body))
+        if self.fail_with is not None:
+            status_or_exc = self.fail_with
+            if isinstance(status_or_exc, Exception):
+                raise status_or_exc
+            return status_or_exc, {"detail": "nope"}
+        path = url.split("/v1/default/banks/", 1)[1]
+        bank, _, rest = path.partition("/")
+        if method == "GET" and rest == "config":
+            if bank not in self.banks:
+                return 404, {"detail": f"Bank '{bank}' not found"}
+            return 200, {"bank_id": bank, "config": {}, "overrides": self.banks[bank]}
+        if method == "POST" and rest.startswith("import"):
+            self.banks[bank] = {k: v for k, v in body["bank"].items() if k.endswith("mission")}
+            return 200, {"bank_id": bank, "mental_models_created": ["briefing"], "mental_models_updated": [],
+                         "directives_created": [], "directives_updated": []}
+        if method == "PUT" and rest == "":
+            self.banks.setdefault(bank, {})
+            return 200, {"bank_id": bank}
+        if method == "PATCH" and rest == "config":
+            self.banks.setdefault(bank, {}).update(body["updates"])
+            return 200, {"bank_id": bank, "overrides": self.banks[bank]}
+        return 500, {"detail": f"unexpected {method} {url}"}
+
+    def methods(self):
+        return [method for method, _, _ in self.calls]
+
+
+@pytest.fixture()
+def bank_server(monkeypatch):
+    import plugins.memory.hindsight as hs
+
+    server = _FakeBankServer()
+    monkeypatch.setattr(hs, "_hindsight_http", server)
+    return server
+
+
+@pytest.fixture()
+def template_file(tmp_path):
+    path = tmp_path / "identity.json"
+    path.write_text(json.dumps(IDENTITY_TEMPLATE))
+    return path
+
+
+def _steered(p):
+    """Wait for the queued steering job to finish."""
+    p._retain_queue.join()
+    return p
+
+
+class TestBankSteering:
+    def test_nothing_configured_makes_no_request(self, provider, bank_server):
+        _steered(provider)
+        assert bank_server.calls == []
+        assert provider._writer_thread is None
+
+    def test_template_imported_into_missing_bank(self, provider_with_config, bank_server, template_file):
+        _steered(provider_with_config(bank_template=str(template_file)))
+        assert bank_server.methods() == ["GET", "POST"]
+        method, url, body = bank_server.calls[1]
+        assert url == "http://localhost:9999/v1/default/banks/test-bank/import"
+        assert body == IDENTITY_TEMPLATE
+        assert bank_server.banks["test-bank"]["retain_mission"] == "Remember who this agent is."
+
+    def test_template_path_expands_home(self, provider_with_config, bank_server, tmp_path, monkeypatch):
+        home = tmp_path / "user-home"
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HOME", str(home))
+        (home / "tpl.json").write_text(json.dumps(IDENTITY_TEMPLATE))
+        _steered(provider_with_config(bank_template="~/tpl.json"))
+        assert bank_server.methods() == ["GET", "POST"]
+
+    def test_existing_mission_is_never_clobbered(self, provider_with_config, bank_server, template_file):
+        bank_server.banks["test-bank"] = {"retain_mission": "set by a template on 09-04"}
+        _steered(provider_with_config(
+            bank_template=str(template_file),
+            bank_mission="reflect", bank_retain_mission="retain",
+        ))
+        assert bank_server.methods() == ["GET"]
+        assert bank_server.banks["test-bank"] == {"retain_mission": "set by a template on 09-04"}
+
+    @pytest.mark.parametrize("key", ["retain_mission", "reflect_mission", "observations_mission"])
+    def test_any_one_mission_counts_as_steered(self, provider_with_config, bank_server, key):
+        bank_server.banks["test-bank"] = {key: "already here"}
+        _steered(provider_with_config(bank_retain_mission="retain"))
+        assert bank_server.methods() == ["GET"]
+
+    def test_non_mission_overrides_do_not_count(self, provider_with_config, bank_server):
+        bank_server.banks["test-bank"] = {"disposition_empathy": 2}
+        _steered(provider_with_config(bank_retain_mission="retain"))
+        assert bank_server.methods() == ["GET", "PATCH"]
+
+    def test_missions_patched_onto_existing_unsteered_bank(self, provider_with_config, bank_server):
+        bank_server.banks["test-bank"] = {}
+        _steered(provider_with_config(bank_mission="Reflect as the agent", bank_retain_mission="Keep identity"))
+        assert bank_server.methods() == ["GET", "PATCH"]
+        assert bank_server.calls[1][2] == {"updates": {"reflect_mission": "Reflect as the agent",
+                                                       "retain_mission": "Keep identity"}}
+
+    def test_missions_create_missing_bank_first(self, provider_with_config, bank_server):
+        _steered(provider_with_config(bank_retain_mission="Keep identity"))
+        assert bank_server.methods() == ["GET", "PUT", "PATCH"]
+        assert bank_server.calls[2][2] == {"updates": {"retain_mission": "Keep identity"}}
+
+    def test_template_without_mission_falls_back_to_missions(self, provider_with_config, bank_server, tmp_path, caplog):
+        tpl = tmp_path / "models-only.json"
+        tpl.write_text(json.dumps({"version": "1", "bank": {"disposition_empathy": 2}}))
+        with caplog.at_level("WARNING", logger="plugins.memory.hindsight"):
+            _steered(provider_with_config(bank_template=str(tpl), bank_retain_mission="Keep identity"))
+        assert bank_server.methods() == ["GET", "PUT", "PATCH"]
+        assert "is unusable" in caplog.text
+
+    def test_missing_template_file_leaves_bank_alone(self, provider_with_config, bank_server, tmp_path, caplog):
+        with caplog.at_level("WARNING", logger="plugins.memory.hindsight"):
+            _steered(provider_with_config(bank_template=str(tmp_path / "nope.json")))
+        assert bank_server.methods() == ["GET"]
+        assert "stays unsteered" in caplog.text
+
+    def test_cached_per_process_across_providers(self, provider_with_config, bank_server, template_file):
+        _steered(provider_with_config(bank_template=str(template_file)))
+        _steered(provider_with_config(bank_template=str(template_file)))
+        assert bank_server.methods() == ["GET", "POST"]
+
+    def test_cache_is_per_bank(self, provider_with_config, bank_server, template_file):
+        _steered(provider_with_config(bank_template=str(template_file)))
+        _steered(provider_with_config(bank_template=str(template_file), bank_id="other-bank"))
+        assert bank_server.methods() == ["GET", "POST", "GET", "POST"]
+
+    def test_transient_failure_retries_after_backoff(self, provider_with_config, bank_server, template_file, monkeypatch):
+        import plugins.memory.hindsight as hs
+
+        bank_server.fail_with = ConnectionRefusedError("down")
+        _steered(provider_with_config(bank_template=str(template_file)))
+        _steered(provider_with_config(bank_template=str(template_file)))
+        assert bank_server.methods() == ["GET"], "a retry inside the backoff window"
+        state, retry_at = hs._bank_steering_state[("http://localhost:9999", "test-bank")]
+        assert state == "retry"
+
+        bank_server.fail_with = None
+        hs._bank_steering_state[("http://localhost:9999", "test-bank")] = ("retry", 0.0)
+        _steered(provider_with_config(bank_template=str(template_file)))
+        assert bank_server.methods() == ["GET", "GET", "POST"]
+
+    def test_server_error_is_retried(self, provider_with_config, bank_server, template_file):
+        import plugins.memory.hindsight as hs
+
+        bank_server.fail_with = 503
+        _steered(provider_with_config(bank_template=str(template_file)))
+        assert hs._bank_steering_state[("http://localhost:9999", "test-bank")][0] == "retry"
+
+    def test_refusal_is_not_retried(self, provider_with_config, bank_server, template_file, caplog):
+        import plugins.memory.hindsight as hs
+
+        bank_server.fail_with = 403
+        with caplog.at_level("WARNING", logger="plugins.memory.hindsight"):
+            _steered(provider_with_config(bank_template=str(template_file)))
+        assert hs._bank_steering_state[("http://localhost:9999", "test-bank")][0] == "done"
+        assert "server refused" in caplog.text
+        _steered(provider_with_config(bank_template=str(template_file)))
+        assert bank_server.methods() == ["GET"]
+
+    def test_runs_before_the_first_retain(self, provider_with_config, bank_server, template_file, monkeypatch):
+        import plugins.memory.hindsight as hs
+
+        order = []
+
+        def _record(*a, **kw):
+            order.append("steer")
+            return bank_server(*a, **kw)
+
+        monkeypatch.setattr(hs, "_hindsight_http", _record)
+        p = provider_with_config(bank_template=str(template_file), retain_async=False)
+        p._client.aretain_batch.side_effect = lambda **kw: order.append("retain")
+        p.sync_turn("remember the deploy window is Tuesday", "noted")
+        p._retain_queue.join()
+        assert order[0] == "steer" and "retain" in order
+
+    def test_embedded_mode_is_skipped(self, provider_with_config, bank_server, template_file, monkeypatch):
+        p = HindsightMemoryProvider()
+        p._mode = "local_embedded"
+        p._api_url = "http://localhost:8888"
+        p._bank_id = "test-bank"
+        p._bank_template = str(template_file)
+        p._schedule_bank_steering()
+        assert bank_server.calls == []
+
+    def test_env_fallback_for_template(self, tmp_path, monkeypatch, bank_server, template_file):
+        config = {"mode": "cloud", "api_url": "http://localhost:9999", "bank_id": "env-bank", "retain_gate": False}
+        (tmp_path / "hindsight").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "hindsight" / "config.json").write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("HINDSIGHT_BANK_TEMPLATE", str(template_file))
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="s", hermes_home=str(tmp_path), platform="cli")
+        _steered(p)
+        assert bank_server.methods() == ["GET", "POST"]
+        assert bank_server.calls[1][1].endswith("/banks/env-bank/import")
