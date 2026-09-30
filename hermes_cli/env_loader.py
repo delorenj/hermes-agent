@@ -451,6 +451,21 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def reassert_secret_source_values(home_path: Path | None = None) -> None:
+    """Put back the values an external secret source resolved for ``home_path`` (default: the active
+    HERMES_HOME) after a raw ``.env`` copy wrote its ``op://`` placeholder over them (fork: ``/reload``
+    via ``hermes_cli.config.reload_env`` re-installed the literal reference as the bearer token)."""
+    if not _SECRET_SOURCE_RESTORE_BY_HOME:
+        return
+    if home_path is None:
+        from hermes_constants import get_hermes_home
+
+        home_path = Path(get_hermes_home())
+    for name, value in _SECRET_SOURCE_RESTORE_BY_HOME.get(str(Path(home_path).resolve()), {}).items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
@@ -522,10 +537,7 @@ def load_hermes_dotenv(
     # token) back over a value an external source resolved on an earlier call, and the source pass below is a
     # once-per-home no-op — so the clobber stuck for the life of the process (#74265). Re-assert only what the
     # source is authoritative for; managed scope, applied last with override=True, still wins on purpose.
-    if _SECRET_SOURCE_RESTORE_BY_HOME:
-        for name, value in _SECRET_SOURCE_RESTORE_BY_HOME.get(str(home_path.resolve()), {}).items():
-            if os.environ.get(name) != value:
-                os.environ[name] = value
+    reassert_secret_source_values(home_path)
 
     # External sources are skipped for the updater (dotenv + managed env still load): ``update`` must not
     # import optional secret-manager libs (Bitwarden → cryptography → _rust.pyd) into the process replacing
