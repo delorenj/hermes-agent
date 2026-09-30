@@ -9203,9 +9203,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
         return history_snapshot
 
-    def new_session(self, silent=False, title=None):
-        """Start a fresh session with a new session ID and cleared agent state."""
+    def new_session(self, silent=False, title=None, *, reset_model=True):
+        """Start a fresh session with a new session ID and cleared agent state.
+
+        ``reset_model`` (keyword-only, default True) re-derives model/provider
+        from config.yaml, which is what ``/new`` and ``/clear`` mean. Callers
+        that rotate the session without the user asking for a model reset (the
+        wake word) pass ``reset_model=False`` so the running model choice
+        survives. When a reset actually changes the model it is always
+        announced, even when ``silent``: a silent model change is how a
+        ``/model`` switch vanished under a false wake trigger (fork fix).
+
+        Returns the model-reset notice that was printed, or None.
+        """
         old_session_id = self.session_id
+        self._last_model_reset_notice = None
         _boundary_snapshot = None
         if self.agent and self.conversation_history:
             # Deliver the context-engine boundary synchronously and get back
@@ -9252,8 +9264,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._resumed = False
         # /new clears the -m / --model override flag: an explicit CLI model
         # was for the previous session only, not for every session spawned
-        # afterwards.
-        self._explicit_model_override = False
+        # afterwards.  A rotation that keeps the model keeps the flag too.
+        if reset_model:
+            self._explicit_model_override = False
         self.reasoning_config = _parse_reasoning_config(
             CLI_CONFIG["agent"].get("reasoning_effort", "")
         )
@@ -9262,14 +9275,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # forward.  Re-derive model/provider and service tier from config.yaml
         # so a session-only switch never leaks into the next session (#48055,
         # #23131).
-        self._pending_one_turn_model_restore = None
+        #
+        # Queued one-shot notes belong to the conversation being closed: a
+        # "[Note: model was just switched ... to X]" that survives into the
+        # next session is prepended to a turn that may no longer run on X
+        # (fork fix: the note outlived the reset below and lied to the model).
+        # The fresh session's system prompt already names the live model.
+        self._pending_model_switch_note = None
+        self._pending_model_switch_target = None
+        self._pending_skills_reload_note = None
+        if reset_model:
+            # A one-turn override is only discarded together with the model
+            # it would restore; a rotation that keeps the model keeps it.
+            self._pending_one_turn_model_restore = None
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
         _model_config = CLI_CONFIG.get("model", {})
         _raw_default2 = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
         _config_model, _ = _split_model_config_default(_raw_default2)
-        if _config_model and _config_model != getattr(self, "model", None):
+        if reset_model and _config_model and _config_model != getattr(self, "model", None):
             _config_provider = (
                 _model_config.get("provider", "")
                 if isinstance(_model_config, dict)
@@ -9307,11 +9332,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self.base_url = _reset_result.base_url
                     if _reset_result.api_mode:
                         self.api_mode = _reset_result.api_mode
-                    if not silent:
-                        _cprint(
-                            f"  (model reset to config default: "
-                            f"{_reset_result.new_model})"
-                        )
+                    # Always announce: ``silent`` suppresses the session
+                    # banner, never a change to which model answers next.
+                    self._last_model_reset_notice = (
+                        f"  (model reset to config default: "
+                        f"{_reset_result.new_model})"
+                    )
+                    _cprint(self._last_model_reset_notice)
             except Exception:
                 # Best-effort: an unreachable config default must never block
                 # /new. The session keeps the current working model.
@@ -9409,6 +9436,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"(^_^)v New session started: {title}")
             else:
                 print("(^_^)v New session started!")
+        return self._last_model_reset_notice
 
 
     def _consume_pending_resume_selection(self, text: str) -> bool:
@@ -10332,6 +10360,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             f"via {result.provider_label or result.target_provider}. "
             f"Adjust your self-identification accordingly.]"
         )
+        # The note is only true while the agent still runs this model; chat()
+        # checks before prepending it (fork fix, defense in depth).
+        self._pending_model_switch_target = result.new_model
 
         provider_label = result.provider_label or result.target_provider
         _cprint(f"  ✓ Model switched: {_display_new}")
@@ -10712,6 +10743,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             f"{'This override applies to the next turn only. ' if one_turn else ''}"
             f"Adjust your self-identification accordingly.]"
         )
+        self._pending_model_switch_target = result.new_model
         if one_turn:
             self._pending_one_turn_model_restore = _one_turn_restore_snapshot
         else:
@@ -10816,6 +10848,56 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     else f"    {line}")
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
+
+    def _take_pending_model_switch_note(self) -> Optional[str]:
+        """Pop the queued /model note, returning it only if it is still true.
+
+        The note names the switch target. If the agent that is about to run
+        this turn is on a different model (the switch was undone between the
+        /model and this turn -- a /new, /clear or wake-word reset, a failed
+        rebuild), prepending it would tell the model it is something it is
+        not. Drop it and log a WARNING instead, so the lost switch is visible.
+        Notes queued without a target (older callers, tests) are passed on.
+        """
+        note = getattr(self, "_pending_model_switch_note", None)
+        target = getattr(self, "_pending_model_switch_target", None)
+        self._pending_model_switch_note = None
+        self._pending_model_switch_target = None
+        if not note:
+            return None
+        agent = getattr(self, "agent", None)
+        live = getattr(agent, "model", None) if agent is not None else None
+        if not target or not isinstance(live, str) or not live or live == target:
+            return note
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+
+            if normalize_model_for_provider(target, getattr(agent, "provider", "") or "") == live:
+                return note
+        except Exception:
+            pass
+        logger.warning(
+            "/model switch to %s did not survive to this turn (agent is on %s); "
+            "dropping the stale switch note",
+            target,
+            live,
+        )
+        return None
+
+    def _run_inline_model_command(self, buffer, text: str) -> bool:
+        """Dispatch an inline ``/model`` submission, recording it in prompt history first.
+
+        A bare ``/model`` opens the picker, which snapshots and clears the
+        input buffer (``_capture_modal_input_snapshot``), so the post-dispatch
+        ``reset(append_to_history=True)`` found an empty buffer and the command
+        never reached ``.hermes_history``. Append before dispatch; prompt_toolkit
+        skips a repeat of the last entry, so the later reset cannot double it.
+        """
+        try:
+            buffer.append_to_history()
+        except Exception:
+            logger.debug("could not record /model in prompt history", exc_info=True)
+        return self.process_command(text)
 
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
@@ -11104,7 +11186,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 cmd_original=cmd_original,
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
-            self.new_session(silent=True)
+            _model_reset_notice = self.new_session(silent=True)
             _clear_output_history()
             # Clear terminal screen.  Inside the TUI, Rich's console.clear()
             # goes through patch_stdout's StdoutProxy which swallows the
@@ -11143,6 +11225,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         provider=self.provider,
                     )
                 _cprint("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
+                if _model_reset_notice:
+                    # Printed during new_session() but wiped by the clear above.
+                    _cprint(_model_reset_notice)
                 # Show a random tip on new session
                 try:
                     from hermes_cli.tips import get_random_tip
@@ -11158,6 +11243,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             else:
                 self.show_banner()
                 print("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
+                if _model_reset_notice:
+                    # Printed during new_session() but wiped by the clear above.
+                    print(_model_reset_notice)
                 # Show a random tip on new session
                 try:
                     from hermes_cli.tips import get_random_tip
@@ -14402,7 +14490,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if getattr(self, "_wake_start_new_session", True):
             try:
-                self.new_session(silent=True)
+                # reset_model=False: a wake trigger (often a false positive)
+                # rotates the conversation but must never discard the model
+                # the user picked with /model (fork fix).
+                self.new_session(silent=True, reset_model=False)
             except Exception as e:
                 logger.debug("wake word new_session failed: %s", e)
 
@@ -15397,10 +15488,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # messages. Naive ``note + "\n\n" + agent_message`` crashed with
                 # TypeError when an image was attached (agent_message is a list)
                 # and a /model or /reload-skills note was queued for the turn.
-                _msn = getattr(self, '_pending_model_switch_note', None)
+                _msn = self._take_pending_model_switch_note()
                 if _msn:
                     agent_message = _prepend_note_to_message(agent_message, _msn)
-                    self._pending_model_switch_note = None
                 # Prepend pending /reload-skills note so the model sees which
                 # skills were added/removed before handling this turn. Same
                 # one-shot queue pattern as the model-switch note above.
@@ -16795,7 +16885,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Handle /model directly on the UI thread so interactive pickers
                 # can safely use prompt_toolkit terminal handoff helpers.
                 if self._should_handle_model_command_inline(text, has_images=has_images):
-                    if not self.process_command(text):
+                    if not self._run_inline_model_command(event.app.current_buffer, text):
                         self._should_exit = True
                         if event.app.is_running:
                             event.app.exit()
