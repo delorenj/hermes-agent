@@ -878,6 +878,18 @@ def _load_user_dotenv(path: Path, *, load_pass: int, override: bool = True) -> b
     return True
 
 
+def reassert_secret_source_values(home_path: Path | None = None) -> None:
+    """Put back the values an external secret source resolved for ``home_path`` (default: the active
+    HERMES_HOME) after a raw ``.env`` copy wrote its ``op://`` placeholder over them (fork: ``/reload``
+    via ``hermes_cli.config.reload_env`` re-installed the literal reference as the bearer token)."""
+    if not _SECRET_SOURCE_RESTORE_BY_HOME:
+        return
+    # Upstream keys the snapshot by hermes_home_key(); None means the active HERMES_HOME there too.
+    for name, value in _SECRET_SOURCE_RESTORE_BY_HOME.get(hermes_home_key(home_path), {}).items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
@@ -969,10 +981,7 @@ def load_hermes_dotenv(
     # token) back over a value an external source resolved on an earlier call, and the source pass below is a
     # once-per-home no-op — so the clobber stuck for the life of the process (#74265). Re-assert only what the
     # source is authoritative for; managed scope, applied last with override=True, still wins on purpose.
-    if _SECRET_SOURCE_RESTORE_BY_HOME:
-        for name, value in _SECRET_SOURCE_RESTORE_BY_HOME.get(hermes_home_key(home_path), {}).items():
-            if os.environ.get(name) != value:
-                os.environ[name] = value
+    reassert_secret_source_values(home_path)
 
     # The config backend is selected here — after the .env files, before the first config.yaml read
     # (``_apply_external_secret_sources`` reads ``secrets:``) — so an unavailable backend stops the
