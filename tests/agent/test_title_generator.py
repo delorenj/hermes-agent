@@ -560,3 +560,35 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+
+def test_auto_title_thread_sees_the_callers_context_vars():
+    """The gateway installs a per-turn secret scope in a ContextVar. A bare Thread starts with an
+    empty context, so the title call missed the scope and read os.environ (fork fix)."""
+    import contextvars
+    import threading
+
+    from agent.secret_scope import current_secret_scope, reset_secret_scope, set_secret_scope
+
+    db = MagicMock()
+    db.get_session_title.return_value = None
+    seen = {}
+    done = threading.Event()
+    marker = contextvars.ContextVar("title_marker", default=None)
+
+    def _capture(*_a, **_k):
+        seen["scope"] = current_secret_scope()
+        seen["marker"] = marker.get()
+        done.set()
+
+    token = set_secret_scope({"OPENROUTER_API_KEY": "sk-scoped"})
+    marker_token = marker.set("turn-42")
+    try:
+        with patch("agent.title_generator.auto_title_session", side_effect=_capture):
+            maybe_auto_title(db, "sess-ctx", "hello there", [{"role": "user", "content": "hello there"}])
+            assert done.wait(timeout=10), "auto_title thread never ran"
+    finally:
+        marker.reset(marker_token)
+        reset_secret_scope(token)
+    assert seen["marker"] == "turn-42"
+    assert dict(seen["scope"] or {}) == {"OPENROUTER_API_KEY": "sk-scoped"}
