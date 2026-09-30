@@ -40,6 +40,14 @@ _SECRET_SOURCES: dict[str, str] = {}
 # Applied values are immutable per-home snapshots.  ``os.environ`` is shared
 # across profiles and may be overwritten by a later home's source apply.
 _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
+# Per home: the subset of that snapshot a dotenv reload may re-assert -- only
+# names the source is authoritative for (``AppliedVar.authoritative``).  The
+# import-time reloads (hermes_cli/main.py, cli.py, run_agent.py, ...) run
+# ``load_dotenv(override=True)`` again, which writes a raw ``op://`` /
+# ``__BITWARDEN_MANAGED__`` .env line back over the resolved value while the
+# once-per-home source pass is a no-op; this map undoes that clobber
+# (upstream 303d839133 #74283 + da2e571b98 #74265, ported to the fork).
+_SECRET_SOURCE_RESTORE_BY_HOME: dict[str, dict[str, str]] = {}
 
 # HERMES_HOME paths we've already pulled external secrets for during this
 # process.  ``load_hermes_dotenv()`` is called at module-import time from
@@ -251,6 +259,36 @@ def reset_secret_source_cache() -> None:
     _APPLIED_HOMES.clear()
     _SECRET_SOURCES.clear()
     _SECRET_SOURCE_VALUES_BY_HOME.clear()
+    _SECRET_SOURCE_RESTORE_BY_HOME.clear()
+
+
+def reassert_secret_source_values(
+    hermes_home: str | os.PathLike | None = None,
+) -> int:
+    """Re-assert external-source values a raw ``.env`` reload wrote over.
+
+    Only names the source is authoritative for are restored (see
+    ``_SECRET_SOURCE_RESTORE_BY_HOME``).  Returns the number of vars changed.
+    Called by ``load_hermes_dotenv()`` after its override=True loads and by
+    ``hermes_cli.config.reload_env()`` (``/reload``), which re-reads ``.env``
+    the same way.
+    """
+    if not _SECRET_SOURCE_RESTORE_BY_HOME:
+        return 0
+    if hermes_home is None:
+        home_path = _process_hermes_home()
+    else:
+        home_path = Path(hermes_home)
+    try:
+        home_key = str(home_path.resolve())
+    except Exception:
+        return 0
+    changed = 0
+    for name, value in _SECRET_SOURCE_RESTORE_BY_HOME.get(home_key, {}).items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
+            changed += 1
+    return changed
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -517,6 +555,16 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 
+    # The override=True loads above wrote the raw .env line (an ``op://``
+    # reference, the ``__BITWARDEN_MANAGED__`` placeholder, a stale token)
+    # back over a value an external source resolved on an earlier call, and
+    # the source pass below is a once-per-home no-op -- so the clobber stuck
+    # for the life of the process and the literal ``op://...`` string went
+    # out as a bearer token (#74265).  Re-assert only what the source is
+    # authoritative for; managed scope, applied last with override=True,
+    # still wins on purpose.
+    reassert_secret_source_values(home_path)
+
     # A fresh ``hermes update`` retry may have completed a deferred dependency
     # install before importing this module.  Do not remap native secret-source
     # dependencies in that same updater process or the self-lock preflight will
@@ -700,6 +748,11 @@ def _apply_external_secret_sources(home_path: Path) -> None:
             if name in os.environ:
                 values[name] = os.environ[name]
         _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+        _SECRET_SOURCE_RESTORE_BY_HOME[home_key] = {
+            name: values[name]
+            for name, applied in report.provenance.items()
+            if getattr(applied, "authoritative", False) and name in values
+        }
 
     for src in report.sources:
         if src.applied:

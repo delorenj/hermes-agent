@@ -66,6 +66,10 @@ class AppliedVar:
     source: str          # SecretSource.name
     shape: str           # "mapped" | "bulk"
     overrode_env: bool   # replaced a pre-existing .env/shell value
+    # The source may beat .env/shell for this var (``override_existing`` and
+    # not ``preserve_existing``), so a dotenv reload may re-assert it; a
+    # gap-filled or preserved name must keep following .env edits (#74265).
+    authoritative: bool = False
 
 
 @dataclass
@@ -543,6 +547,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
                 source=source.name,
                 shape=source.shape,
                 overrode_env=existed,
+                authoritative=bool(override) and var not in preserve,
             )
             return True
 
