@@ -126,16 +126,25 @@ def test_credential_pool_still_prefers_dotenv_for_non_op_values(monkeypatch):
     assert token == "dotenv-value"
 
 
-def test_credential_pool_falls_back_to_env_when_dotenv_is_only_op_ref(monkeypatch):
-    """An unresolved op:// in .env with no resolved env value yields the raw ref.
+def test_credential_pool_never_seeds_an_unresolved_op_ref(monkeypatch):
+    """An unresolved op:// in .env with no resolved env value seeds nothing.
 
-    This is the pre-resolution / misconfigured edge: there is nothing better
-    to return, so behaviour is unchanged (the raw reference is surfaced rather
-    than silently dropping the credential).
+    Fork change: surfacing the raw reference made it the bearer token (Kimi /
+    OpenRouter 401s that read like a dead key). ``get_env_prefer_dotenv`` now
+    treats it as unset and logs a WARNING naming the variable instead.
     """
-    token = _seed_openrouter_token(
-        monkeypatch,
-        dotenv_value="op://Vault/Item/field",
-        environ_value=None,
+    monkeypatch.setattr(
+        credential_pool,
+        "load_env",
+        lambda: {"OPENROUTER_API_KEY": "op://Vault/Item/field"},
     )
-    assert token == "op://Vault/Item/field"
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_source_suppressed", lambda _p, _s: False
+    )
+    entries: list = []
+    credential_pool._seed_from_env("openrouter", entries)
+    assert not any(
+        str(getattr(e, "access_token", "")).startswith("op://") for e in entries
+    )
+    assert credential_pool.get_env_prefer_dotenv("OPENROUTER_API_KEY") == ""

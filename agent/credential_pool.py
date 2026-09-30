@@ -2860,8 +2860,15 @@ def get_env_prefer_dotenv(key: str) -> str:
     raw = env_file.get(key, "").strip()
     scoped_value = (_get_secret(key, "") or "").strip()
     if raw.startswith("op://") and scoped_value:
-        return scoped_value
-    return raw or scoped_value
+        value = scoped_value
+    else:
+        value = raw or scoped_value
+    # Fork: never hand out an unresolved op:// reference as a credential --
+    # when 1Password did not resolve it (or a reload clobbered the resolved
+    # value) the scoped value is op:// too and would become the bearer.
+    from agent.op_ref_guard import refuse_op_ref
+
+    return refuse_op_ref(key, value, reader="credential_pool") or ""
 
 
 # Providers already warned about env-key -> pool ingestion, once per process

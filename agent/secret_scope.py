@@ -251,7 +251,16 @@ def get_secret_str(name: str, default: str = "") -> str:
     """``get_secret`` for callers that want a ``str``: ``default`` only when the secret is genuinely
     unset. Still raises ``UnscopedSecretError`` — swallowing it hides a spawn-site bug."""
     val = get_secret(name, default)
-    return default if val is None else val
+    if val is None:
+        return default
+    # Fork: an unresolved ``op://`` reference is a pointer, never a credential (or URL);
+    # sending it as a bearer token produced the Kimi/OpenRouter 401s. Treat it as unset.
+    from agent.op_ref_guard import is_unresolved_op_ref, refuse_op_ref
+
+    if is_unresolved_op_ref(val):
+        refuse_op_ref(name, val, reader="runtime_provider")
+        return default
+    return val
 
 
 def _strip_inline_comment(value: str) -> str:

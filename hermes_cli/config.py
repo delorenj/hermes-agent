@@ -2906,12 +2906,19 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
     active secret scope (set by the 1Password secret source) — otherwise a provider auth attempt
     would receive a URL instead of a key. Same carve-out as
     ``agent.credential_pool.get_env_prefer_dotenv``."""
+    from agent.op_ref_guard import is_unresolved_op_ref, refuse_op_ref
+
     raw = load_env().get(key) or ""
-    if str(raw).lstrip().startswith("op://"):
+    if is_unresolved_op_ref(raw):
         scoped = _scoped_environ_get(key)
-        if scoped:
+        if scoped and not is_unresolved_op_ref(scoped):
             return scoped
-    return raw or _scoped_environ_get(key)
+        # Fork: an unresolved op:// pointer is never a credential; refuse it.
+        return refuse_op_ref(key, scoped or raw, reader="config")
+    resolved = raw or _scoped_environ_get(key)
+    if is_unresolved_op_ref(resolved):
+        return refuse_op_ref(key, resolved, reader="config")
+    return resolved
 
 
 # ---- Config display ----
