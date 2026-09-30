@@ -2793,6 +2793,14 @@ def reload_env() -> int:
     for key in known - set(env_vars):
         if os.environ.pop(key, None) is not None:
             count += 1
+    # The raw .env copy above writes an ``op://`` reference back over the
+    # value 1Password resolved at startup; put the resolved value back.
+    try:
+        from hermes_cli.env_loader import reassert_secret_source_values
+
+        reassert_secret_source_values()
+    except Exception:
+        pass
     return count
 
 
