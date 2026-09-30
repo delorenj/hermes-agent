@@ -4390,9 +4390,14 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
     is scope-checked rather than leaking another profile's raw ``os.environ``
     value — matching the credential-pool seeding path's behaviour.
     """
+    from agent.op_ref_guard import is_unresolved_op_ref, refuse_op_ref
+
     env_vars = load_env()
     val = env_vars.get(key)
-    if val:
+    # Fork: a raw ``op://`` line in .env is a pointer, not the key. Fall
+    # through to the value 1Password resolved into the environment/scope,
+    # and never return an unresolved reference (it became the bearer token).
+    if val and not is_unresolved_op_ref(val):
         return val
     try:
         from agent.secret_scope import (
@@ -4400,14 +4405,22 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
             get_secret as _get_secret,
         )
     except Exception:
-        return os.environ.get(key)
+        _get_secret = None
 
-    try:
-        return _get_secret(key)
-    except UnscopedSecretError:
-        raise
-    except Exception:
-        return os.environ.get(key)
+    if _get_secret is None:
+        resolved = os.environ.get(key)
+    else:
+        try:
+            resolved = _get_secret(key)
+        except UnscopedSecretError:
+            raise
+        except Exception:
+            resolved = os.environ.get(key)
+    if is_unresolved_op_ref(resolved) or (not resolved and is_unresolved_op_ref(val)):
+        return refuse_op_ref(
+            key, resolved if is_unresolved_op_ref(resolved) else val, reader="config"
+        )
+    return resolved
 
 
 # =============================================================================

@@ -1435,16 +1435,19 @@ def _scoped_key_env(name: str) -> str:
     """
     if not name:
         return ""
+    from agent.op_ref_guard import refuse_op_ref
+
     try:
         from agent.secret_scope import UnscopedSecretError, get_secret
 
         try:
-            return (get_secret(name) or "").strip()
+            # Fork: an unresolved op:// reference is never a usable key.
+            return refuse_op_ref(name, (get_secret(name) or "").strip(), reader="auxiliary") or ""
         except UnscopedSecretError:
             pass
     except Exception:
         pass
-    return (os.getenv(name) or "").strip()
+    return refuse_op_ref(name, (os.getenv(name) or "").strip(), reader="auxiliary") or ""
 
 
 # ── Codex Responses → chat.completions adapter ─────────────────────────────

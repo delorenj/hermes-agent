@@ -61,7 +61,16 @@ def _getenv(name: str, default: str = "") -> str:
     call site here already relies on.
     """
     val = _get_secret(name, default)
-    return val if val is not None else default
+    if val is None:
+        return default
+    # Fork: an unresolved op:// reference is not a credential (or a URL);
+    # treat it as unset instead of sending it as a bearer token.
+    from agent.op_ref_guard import is_unresolved_op_ref, refuse_op_ref
+
+    if is_unresolved_op_ref(val):
+        refuse_op_ref(name, val, reader="runtime_provider")
+        return ""
+    return val
 
 
 def _normalize_custom_provider_name(value: str) -> str:
