@@ -7804,6 +7804,12 @@ def _get_cached_client(
         is_vision=is_vision,
         task=task,
     )
+    if isinstance(client, _AuxProbeClientStub):
+        # Availability probe (fork): mirror _store_cached_client's guard. A
+        # cached stub is handed to the next caller — the next probe's
+        # _compat_model touches it and raises (vision tools randomly gated off
+        # at startup), and a real runtime call gets a non-functional client.
+        return client, model or default_model
     if client is not None:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
