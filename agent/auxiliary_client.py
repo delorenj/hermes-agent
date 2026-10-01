@@ -4632,6 +4632,20 @@ _ROUTE_LIMIT_MARKERS = (
 )
 
 
+# Fork: 429 bodies that say a route's upstream account ran out of quota or
+# budget (OpenAI-style ``insufficient_quota``, OpenRouter workspace budgets
+# relayed by the gateway), as opposed to a request-rate throttle.
+_QUOTA_429_MARKERS = (
+    "insufficient_quota",
+    "quota",
+    "budget",
+    "spend limit",
+    "spending limit",
+    "usage limit",
+    "usage cap",
+)
+
+
 def _is_named_gateway_route(provider: Optional[str], base_url: Optional[str] = None) -> bool:
     """Does this route go through a named custom provider (fork)?
 
@@ -4672,7 +4686,7 @@ def _is_route_limit_error(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
 ) -> bool:
-    """Detect a 403 that closes ONE route, not the credential (fork).
+    """Detect a 403/429 that closes ONE route, not the credential (fork).
 
     * Named gateway route (``_is_named_gateway_route(provider, base_url)``):
       every 403 except a bad-credentials auth failure. Each model behind the
@@ -4680,11 +4694,17 @@ def _is_route_limit_error(
       usage limit") or a token-scope miss ("This token has no access to model
       X") on one model says nothing about the gateway key or its sibling
       models. A dead gateway key is a 401.
+    * Named gateway route: a 429 that says quota / budget exhaustion
+      (``insufficient_quota``, "Workspace daily budget of $12.00 exceeded",
+      or any body ``_is_payment_error`` claims). The gateway relays one
+      upstream account's exhaustion that way; read as a payment error it was
+      credential scope (siblings skipped, gateway benched, walk stopped). A
+      plain gateway 429 rate limit keeps its rate-limit handling.
     * Any provider: a 403 whose body says a usage window / quota / budget ran
       out, when ``_is_payment_error`` does not already own it (those keep
       their credential-scope handling on direct providers).
 
-    Both map to reason ``route limit`` = MODEL scope
+    All map to reason ``route limit`` = MODEL scope
     (``backend_identity._REASON_SCOPES``): the fallback chain skips only the
     failed deployment and still tries same-provider siblings.
     """
@@ -4692,8 +4712,16 @@ def _is_route_limit_error(
         getattr(exc, "response", None), "status_code", None
     )
     err_lower = str(exc).lower()
-    if status is None and "error code: 403" in err_lower:
-        status = 403
+    if status is None:
+        if "error code: 403" in err_lower:
+            status = 403
+        elif "error code: 429" in err_lower:
+            status = 429
+    if status == 429:
+        return _is_named_gateway_route(provider, base_url) and (
+            _is_payment_error(exc)
+            or any(marker in err_lower for marker in _QUOTA_429_MARKERS)
+        )
     if status != 403 or _is_auth_error(exc):
         return False
     if _is_named_gateway_route(provider, base_url):
@@ -5631,8 +5659,9 @@ def _call_fallback_walk_sync(
     """Call a fallback candidate; on a MODEL-scoped capacity failure walk on.
 
     ``select_next(exclude)`` re-runs the caller's declared selection (task
-    ``fallback_chain``, then the main ``fallback_providers`` chain or the
-    main-model safety net) with every tried deployment excluded. ``tried``
+    ``fallback_chain``, then for auto the main ``fallback_providers`` chain,
+    for an explicit provider the main-model safety net and then
+    ``fallback_providers``) with every tried deployment excluded. ``tried``
     seeds the exclusions with the deployment that failed first. Returns what
     the last candidate returned (None = stale credential, quarantined).
     """
@@ -6149,7 +6178,9 @@ def _try_main_fallback_chain(
     main fallback policy before dropping into Hermes' built-in discovery
     chain. The top-level chain is read through ``get_fallback_chain`` so
     both modern ``fallback_providers`` and legacy ``fallback_model`` entries
-    participate in the same order as the main agent.
+    participate in the same order as the main agent. Explicit-provider tasks
+    (fork) reach it after their ``fallback_chain`` and the main-model safety
+    net, with ``failed_provider`` = the task's provider.
 
     Which entries are skipped follows the failure scope (fork), taken from
     ``scope`` or else ``agent.backend_identity.classify_failure_scope(reason)``:
@@ -6193,7 +6224,19 @@ def _try_main_fallback_chain(
     if not isinstance(scope, FailureScope):
         scope = classify_failure_scope(reason)
     failed_ident = None
-    skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    skip = {p for p in (failed_norm, "auto") if p}
+    # The main provider shares the failed credential only when the failed
+    # route IS the main one: ``auto`` (every auto-mode caller), the main
+    # label, or the same configured entry behind both. An explicit aux task
+    # failing on another provider (fork) keeps the main provider's entries.
+    if main_norm and (
+        failed_norm in {"", "auto"}
+        or (
+            ({main_norm} | _named_route_labels(main_norm, _read_main_base_url()))
+            & ({failed_norm} | _named_route_labels(failed_label, failed_base_url))
+        )
+    ):
+        skip.add(main_norm)
     if scope is not FailureScope.CREDENTIAL and (failed_model or "").strip():
         failed_ident = BackendIdentity.build(
             provider=failed_label,
@@ -10542,7 +10585,8 @@ def _call_llm_impl(
             #   1. User-configured fallback_chain (per-task) if set
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
-            #   4. For explicit aux providers: main agent model safety net
+            #   4. For explicit aux providers: main agent model safety net,
+            #      then (fork) the main fallback_providers chain
             #   (fork) A candidate that fails with a model-scoped capacity
             #   error hands off to the next declared route
             #   (_call_fallback_walk_sync re-runs this selection with every
@@ -10568,6 +10612,14 @@ def _call_llm_impl(
                     picked = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
                         failed_model=_chain_failed_model,
+                        failed_base_url=_failed_base_url, exclude=exclude)
+                if picked[0] is None:
+                    # (fork) Then the main agent's own fallback_providers:
+                    # a pinned task whose route AND main model are capped
+                    # (same model) still reaches the declared gateway routes.
+                    picked = _try_main_fallback_chain(
+                        task, resolved_provider, reason=reason,
+                        failed_model=final_model,
                         failed_base_url=_failed_base_url, exclude=exclude)
                 return picked
 
@@ -10613,7 +10665,8 @@ def _call_llm_impl(
             # (#26882) The error itself is re-raised below.
             logger.warning(
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(fallback_chain + main agent model + fallback_providers). "
+                "Raising original error.",
                 task or "call", reason, resolved_provider,
             )
         # Connection/timeout errors leave the cached client poisoned (closed
@@ -11260,7 +11313,8 @@ async def _async_call_llm_impl(
             #   1. User-configured fallback_chain (per-task) if set
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
-            #   4. For explicit aux providers: main agent model safety net
+            #   4. For explicit aux providers: main agent model safety net,
+            #      then (fork) the main fallback_providers chain
             #   (fork) A candidate that fails with a model-scoped capacity
             #   error hands off to the next declared route — mirrors sync.
             def _select_fallback(exclude=()):
@@ -11284,6 +11338,14 @@ async def _async_call_llm_impl(
                     picked = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
                         failed_model=_chain_failed_model,
+                        failed_base_url=_failed_base_url, exclude=exclude)
+                if picked[0] is None:
+                    # (fork) Then the main agent's own fallback_providers:
+                    # a pinned task whose route AND main model are capped
+                    # (same model) still reaches the declared gateway routes.
+                    picked = _try_main_fallback_chain(
+                        task, resolved_provider, reason=reason,
+                        failed_model=final_model,
                         failed_base_url=_failed_base_url, exclude=exclude)
                 return picked
 
@@ -11332,7 +11394,8 @@ async def _async_call_llm_impl(
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(fallback_chain + main agent model + fallback_providers). "
+                "Raising original error.",
                 task or "call", reason, resolved_provider,
             )
         # Mirror the sync path: drop poisoned clients on connection/timeout

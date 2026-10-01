@@ -41,6 +41,32 @@ def _permission_denied(message):
     )
 
 
+# The gateway relays an upstream account's quota/budget exhaustion (OpenRouter
+# workspace "daily budget of $12.00 exceeded") as 429 insufficient_quota.
+QUOTA_OPENAI = (
+    "You exceeded your current quota, please check your plan and billing details."
+)
+QUOTA_BUDGET = "Workspace daily budget of $12.00 exceeded"
+
+
+def _insufficient_quota(message):
+    request = httpx.Request("POST", f"{GATEWAY}/chat/completions")
+    body = {"error": {"message": message, "type": "insufficient_quota",
+                      "param": None, "code": "insufficient_quota"}}
+    return openai.RateLimitError(
+        f"Error code: 429 - {body}",
+        response=httpx.Response(429, request=request),
+        body=body,
+    )
+
+
+CAPPED_ERRORS = {
+    "403-weekly-cap": lambda: _permission_denied(KIMI_WEEKLY),
+    "429-insufficient-quota-billing-worded": lambda: _insufficient_quota(QUOTA_OPENAI),
+    "429-insufficient-quota-budget": lambda: _insufficient_quota(QUOTA_BUDGET),
+}
+
+
 def _response(content):
     message = SimpleNamespace(content=content, tool_calls=None)
     choice = SimpleNamespace(message=message, finish_reason="stop")
@@ -107,7 +133,21 @@ def test_gateway_route_limit_403_is_fallback_eligible(message):
     assert classified.should_fallback is True
 
 
-def _gateway_clients():
+@pytest.mark.parametrize("message", [QUOTA_OPENAI, QUOTA_BUDGET], ids=["billing-worded", "budget"])
+def test_gateway_insufficient_quota_429_is_fallback_eligible(message):
+    """429 insufficient_quota is a rate-limit-class failure on the main path:
+    eager fallback, and try_activate_fallback skips only the exact deployment
+    (MODEL scope), so same-gateway siblings stay candidates."""
+    from agent.error_classifier import FailoverReason
+
+    classified = classify_api_error(
+        _insufficient_quota(message), provider="custom", model=KIMI,
+    )
+    assert classified.should_fallback is True
+    assert classified.reason in {FailoverReason.rate_limit, FailoverReason.billing}
+
+
+def _gateway_clients(make_error=lambda: _permission_denied(KIMI_WEEKLY)):
     """resolve_provider_client stub: one recorder client per gateway model."""
     calls = []
 
@@ -119,7 +159,7 @@ def _gateway_clients():
         def _create(**kw):
             calls.append(kw.get("model"))
             if kw.get("model") == KIMI:
-                raise _permission_denied(KIMI_WEEKLY)
+                raise make_error()
             return _response(f"ok:{kw.get('model')}")
 
         client.chat.completions.create.side_effect = _create
@@ -140,12 +180,14 @@ def _gateway_clients():
     ],
     ids=["next-entry", "skips-capped-entry"],
 )
-def test_main_turn_on_capped_route_falls_back_to_gateway_sibling(chain, expected):
+@pytest.mark.parametrize("error_id", list(CAPPED_ERRORS))
+def test_main_turn_on_capped_route_falls_back_to_gateway_sibling(chain, expected, error_id):
+    make_error = CAPPED_ERRORS[error_id]
     agent = _make_agent(KIMI, chain)
     agent.client = MagicMock()
     agent.client.base_url = GATEWAY
-    agent.client.chat.completions.create.side_effect = _permission_denied(KIMI_WEEKLY)
-    calls, resolve = _gateway_clients()
+    agent.client.chat.completions.create.side_effect = lambda **_kw: (_ for _ in ()).throw(make_error())
+    calls, resolve = _gateway_clients(make_error)
 
     with (
         patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve),

@@ -317,8 +317,11 @@ When you set an explicit auxiliary provider (e.g. `auxiliary.vision.provider: gl
 
 1. **Primary aux provider** — the one you configured (tried first, always)
 2. **`auxiliary.<task>.fallback_chain`** — your per-task override list, if you wrote one
-3. **Main agent provider + model** — last-resort safety net (always tried, even if you didn't write a chain)
-4. **Warn + re-raise** — if every layer fails, Hermes logs `Auxiliary <task>: ... all fallbacks exhausted` at WARNING level and re-raises the original error
+3. **Main agent provider + model** — safety net (always tried, even if you didn't write a chain)
+4. **Top-level `fallback_providers`** — the main agent's own chain, in order, skipping the deployment that failed (so a task pinned to the same capped model as the main agent still reaches the other declared routes)
+5. **Warn + re-raise** — if every layer fails, Hermes logs `Auxiliary <task>: ... all fallbacks exhausted` at WARNING level and re-raises the original error
+
+A candidate that fails with a model-scoped capacity error (usage cap, quota/budget exhaustion on one gateway route, 429, no available channel) hands off to the next layer; auth, payment and connection failures on a candidate are raised.
 
 Transient HTTP 429 rate limits (`Retry-After: ...`) are treated as request constraints, not capacity problems — they respect your explicit provider choice and do **not** trigger the fallback ladder. Only daily/monthly quota exhaustion, payment errors, and connection failures bypass the explicit-provider gate.
 
@@ -422,7 +425,7 @@ See [Scheduled Tasks (Cron)](/user-guide/features/cron) for full configuration d
 |---------|-------------------|----------------|
 | Main agent model | `fallback_providers` in config.yaml — per-turn failover on errors (primary restored each turn) | `fallback_providers:` (top-level list) |
 | Auxiliary tasks (any) — auto users | Full auto-detection chain (main agent model first, then provider chain) on capacity errors | `auxiliary.<task>.provider: auto` |
-| Auxiliary tasks (any) — explicit provider | `fallback_chain` (if set) → main agent model → warn + raise, on capacity errors only | `auxiliary.<task>.fallback_chain` |
+| Auxiliary tasks (any) — explicit provider | `fallback_chain` (if set) → main agent model → `fallback_providers` → warn + raise, on capacity errors only | `auxiliary.<task>.fallback_chain` |
 | Vision | Layered (see above) + internal OpenRouter retry | `auxiliary.vision` |
 | Web extraction | Layered (see above) + internal OpenRouter retry | `auxiliary.web_extract` |
 | Context compression | Layered (see above); degrades to no-summary if all layers unavailable | `auxiliary.compression` |
