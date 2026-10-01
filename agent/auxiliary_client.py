@@ -3986,6 +3986,41 @@ def _named_provider_base_url(slug: str) -> str:
     return str((entry or {}).get("base_url") or "")
 
 
+def _named_route_labels(provider: str, base_url: Optional[str] = None) -> set:
+    """Every label that names the configured provider entry behind a route.
+
+    ``provider`` is a slug, ``custom:<name>``, or the runtime ``custom`` a
+    named custom provider reports once a turn ran; the latter maps back to
+    the configured main provider when ``base_url`` is that entry's endpoint
+    (the same mapping ``/model`` uses). Returns the entry's slug/name and
+    their ``custom:`` forms, or an empty set when no configured entry is
+    behind the route.
+    """
+    label = (provider or "").strip().lower()
+    entry = _named_provider_entry(label)
+    if entry is None and label == "custom" and (base_url or "").strip():
+        main_entry = _named_provider_entry(_configured_main_provider())
+        if main_entry is not None:
+            try:
+                from hermes_cli.route_identity import normalize_route_base_url
+
+                route_url = normalize_route_base_url(str(base_url).strip()).rstrip("/")
+                entry_url = normalize_route_base_url(
+                    str(main_entry.get("base_url") or "").strip()
+                ).rstrip("/")
+            except Exception:
+                route_url = entry_url = ""
+            if route_url and route_url == entry_url:
+                entry = main_entry
+    if entry is None:
+        return set()
+    names = {
+        str(entry.get("provider_key") or "").strip().lower(),
+        str(entry.get("name") or "").strip().lower(),
+    } - {""}
+    return names | {f"custom:{name}" for name in names}
+
+
 def _aux_discovery_enabled() -> bool:
     """``auxiliary.discovery`` (fork): may aux walk the discovery chain?
 
@@ -4521,6 +4556,39 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
         and "llm returned invalid response" in msg
         and "choices[0].message" in msg
     )
+
+
+# Fork: bodies a gateway sends when ONE model's route has no live upstream.
+# NewAPI: "No available channel for model X under group Y (distributor)",
+# "No available channel keys", zh "无可用渠道".
+_MODEL_UNAVAILABLE_MARKERS = (
+    "no available channel",
+    "无可用渠道",
+    "model unavailable",
+    "model is unavailable",
+    "model is currently unavailable",
+    "model_unavailable",
+)
+
+
+def _is_model_unavailable_error(exc: Exception) -> bool:
+    """Detect a 503 that says this MODEL's route is down, not the endpoint.
+
+    An inference gateway answers 503 "no available channel for model X" when
+    every upstream channel for that one model is disabled or cooling down.
+    The gateway itself is healthy and serves its other models, so this is a
+    model-scoped capacity failure: try the next declared model (a
+    ``fallback_providers`` sibling on the same gateway) instead of raising
+    after the same-target transient retries. A generic 503 without these
+    markers keeps its transient-only behaviour.
+    """
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if status != 503:
+        return False
+    err_lower = str(exc).lower()
+    return any(marker in err_lower for marker in _MODEL_UNAVAILABLE_MARKERS)
 
 
 def _evict_cached_clients(provider: str) -> None:
@@ -5752,6 +5820,7 @@ def _try_main_fallback_chain(
     reason: str = "error",
     failed_model: Optional[str] = None,
     failed_base_url: Optional[str] = None,
+    scope: Optional[Any] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -5761,15 +5830,21 @@ def _try_main_fallback_chain(
     both modern ``fallback_providers`` and legacy ``fallback_model`` entries
     participate in the same order as the main agent.
 
-    ``failed_model`` (fork): skip an entry only when its (provider, model)
-    is the deployment that just failed. ``failed_provider`` ``auto``/empty
-    means the main provider served the failed call. A fallback entry on the
-    SAME provider with a DIFFERENT model is a valid candidate — on an
-    inference gateway every model is its own upstream route, so skipping the
-    whole provider sent aux traffic straight into the discovery chain
-    (direct-provider keys) while healthy gateway routes sat unused. Without
-    ``failed_model`` every entry on the failed/main provider is skipped (the
-    original behaviour).
+    Which entries are skipped follows the failure scope (fork), taken from
+    ``scope`` or else ``agent.backend_identity.classify_failure_scope(reason)``:
+
+    - MODEL (timeout, connection, 429, model-incompatible, gateway 503 "no
+      available channel") with ``failed_model``: skip only the exact
+      (provider, model, base_url) deployment that failed. A fallback entry
+      on the SAME provider with a DIFFERENT model is a valid candidate — on
+      an inference gateway every model is its own upstream route.
+    - CREDENTIAL (auth 401, payment 402), or no ``failed_model``: skip every
+      entry on the failed/main provider (upstream behaviour), including the
+      configured slug behind a runtime ``custom`` route at the failed URL.
+      The caller then walks discovery (when ``auxiliary.discovery`` allows).
+
+    ``failed_provider`` ``auto``/empty means the main provider served the
+    failed call.
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -5783,22 +5858,31 @@ def _try_main_fallback_chain(
     if not chain:
         return None, None, ""
 
+    from agent.backend_identity import (
+        BackendIdentity,
+        FailureScope,
+        classify_failure_scope,
+        should_skip_candidate,
+    )
+
     failed_norm = (failed_provider or "").strip().lower()
     main_norm = (_read_main_provider() or "").strip().lower()
-    skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    failed_label = main_norm if failed_norm in {"", "auto"} else failed_norm
+    if not isinstance(scope, FailureScope):
+        scope = classify_failure_scope(reason)
     failed_ident = None
-    if (failed_model or "").strip():
-        from agent.backend_identity import (
-            BackendIdentity,
-            FailureScope,
-            should_skip_candidate,
-        )
-
+    skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    if scope is not FailureScope.CREDENTIAL and (failed_model or "").strip():
         failed_ident = BackendIdentity.build(
-            provider=main_norm if failed_norm in {"", "auto"} else failed_norm,
+            provider=failed_label,
             model=failed_model,
             base_url=failed_base_url or "",
         )
+    else:
+        # Credential scope: the key/account behind the failed route is dead,
+        # so every entry configured on it is too — including the configured
+        # slug a runtime ``custom`` route projects (same entry, same key).
+        skip |= _named_route_labels(failed_label, failed_base_url)
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -5825,11 +5909,11 @@ def _try_main_fallback_chain(
                 base_url=str(entry.get("base_url") or "")
                 or _named_provider_base_url(fb_norm),
             )
-            if should_skip_candidate(fb_ident, failed_ident, FailureScope.MODEL):
-                tried.append(f"{label} (skipped: same deployment as the failed call)")
+            if should_skip_candidate(fb_ident, failed_ident, scope):
+                tried.append(f"{label} (skipped: same {scope.value} as the failed call)")
                 continue
         elif fb_norm in skip:
-            tried.append(f"{label} (skipped)")
+            tried.append(f"{label} (skipped: same provider as the failed call)")
             continue
         if _is_provider_unhealthy(fb_norm):
             _log_skip_unhealthy(fb_norm, task)
@@ -5944,6 +6028,7 @@ def _resolve_auto_route(
     # config.yaml (auxiliary.<task>.provider) still win over this.
     main_provider = str(runtime_provider or _read_main_provider() or "")
     main_model = str(runtime_model or _read_main_model() or "")
+    main_quarantined = False
 
     # Latency-critical tasks can explicitly prefer the provider's registered
     # fast model over the main chat model. Titling is the only eligible task:
@@ -6034,6 +6119,7 @@ def _resolve_auto_route(
         main_chain_label = _normalize_chain_label(resolved_provider)
         if main_chain_label and _is_provider_unhealthy(main_chain_label):
             _log_skip_unhealthy(main_chain_label)
+            main_quarantined = True
         else:
             client, resolved = resolve_provider_client(
                 resolved_provider,
@@ -6057,10 +6143,17 @@ def _resolve_auto_route(
             task, main_provider or "auto", reason="main provider unavailable")
         if fb_client is not None:
             return fb_client, fb_model, _fallback_provider_from_label(fb_label)
+    # A quarantined main provider was marked after a payment/credential
+    # failure: credential scope, so no entry on that provider is tried.
+    # Otherwise no client could be built for the main model; declared
+    # sibling routes are still candidates (model scope).
+    from agent.backend_identity import FailureScope
+
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable",
         failed_model=main_model or None,
-        failed_base_url=runtime_base_url or None)
+        failed_base_url=runtime_base_url or None,
+        scope=FailureScope.CREDENTIAL if main_quarantined else None)
     if fb_client is not None:
         return fb_client, fb_model, fb_label
 
@@ -10017,6 +10110,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_model_unavailable_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -10040,6 +10134,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_model_unavailable_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -10059,6 +10154,8 @@ def _call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_model_unavailable_error(first_err):
+                reason = "model unavailable"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -10070,8 +10167,15 @@ def _call_llm_impl(
             # account behind every model on that provider are the same — so
             # a sibling model can't recover; keep skipping the whole
             # provider so the main-agent-model safety net is still reached.
+            # The scope comes from agent.backend_identity, the single owner
+            # of that decision; _try_main_fallback_chain derives the same
+            # scope from ``reason`` (fork).
+            from agent.backend_identity import FailureScope, classify_failure_scope
+
             _chain_failed_model = (
-                None if reason in ("auth error", "payment error") else final_model
+                final_model
+                if classify_failure_scope(reason) is FailureScope.MODEL
+                else None
             )
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
@@ -10700,6 +10804,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_model_unavailable_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -10715,6 +10820,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_model_unavailable_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -10730,6 +10836,8 @@ async def _async_call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_model_unavailable_error(first_err):
+                reason = "model unavailable"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
@@ -10741,8 +10849,15 @@ async def _async_call_llm_impl(
             # account behind every model on that provider are the same — so
             # a sibling model can't recover; keep skipping the whole
             # provider so the main-agent-model safety net is still reached.
+            # The scope comes from agent.backend_identity, the single owner
+            # of that decision; _try_main_fallback_chain derives the same
+            # scope from ``reason`` (fork).
+            from agent.backend_identity import FailureScope, classify_failure_scope
+
             _chain_failed_model = (
-                None if reason in ("auth error", "payment error") else final_model
+                final_model
+                if classify_failure_scope(reason) is FailureScope.MODEL
+                else None
             )
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set

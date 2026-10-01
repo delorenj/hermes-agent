@@ -64,6 +64,9 @@ _REASON_SCOPES = {
     "invalid provider response": FailureScope.MODEL,
     "connection error": FailureScope.MODEL,
     "timeout": FailureScope.MODEL,
+    # Fork: a gateway 503 "no available channel for model X" — that model's
+    # route has no live upstream; sibling models on the gateway are fine.
+    "model unavailable": FailureScope.MODEL,
 }
 
 

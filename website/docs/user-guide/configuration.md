@@ -1368,7 +1368,7 @@ auxiliary:
   discovery: false
 ```
 
-With `discovery: false` an auxiliary call is only ever served by the task's configured provider (and its `fallback_chain`), the main provider/model, or an entry in `fallback_providers`. A `fallback_providers` entry on the same provider as the failed call but with a different model is a valid fallback (each model on a gateway is its own upstream route); only the exact provider + model that failed is skipped. When none of those can serve the call, the call fails instead of reaching a direct provider through an ambient `GEMINI_API_KEY` / `OPENROUTER_API_KEY`. The default (`true`) keeps the discovery chain.
+With `discovery: false` an auxiliary call is only ever served by the task's configured provider (and its `fallback_chain`), the main provider/model, or an entry in `fallback_providers`. Which `fallback_providers` entries are skipped depends on the failure. A model-scoped failure (timeout, connection error, rate limit, model incompatible with the route, or a gateway `503` saying the model has no available channel) skips only the exact provider + model that failed, so another model on the same gateway is a valid fallback (each model on a gateway is its own upstream route). A credential-scoped failure (`401`, `402`/quota) skips every entry on the failed provider, because they share the dead key or account; with discovery on, the call then goes to the discovery chain. When none of those can serve the call, the call fails instead of reaching a direct provider through an ambient `GEMINI_API_KEY` / `OPENROUTER_API_KEY`. The default (`true`) keeps the discovery chain.
 
 ### Limiting auxiliary concurrency
 

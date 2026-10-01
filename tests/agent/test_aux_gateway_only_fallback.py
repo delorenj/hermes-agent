@@ -57,6 +57,7 @@ def _write_config(home, *, discovery):
 class _Recorder:
     def __init__(self):
         self.failing = set()
+        self.errors = {}    # model -> callable(base_url) returning the error to raise
         self.clients = []   # base_url of every OpenAI-wire client built
         self.calls = []     # (base_url, model) of every request sent
 
@@ -67,6 +68,8 @@ class _Recorder:
             def create(self_inner, **kw):
                 model = kw.get("model")
                 rec.calls.append((str(base_url).rstrip("/"), model))
+                if model in rec.errors:
+                    raise rec.errors[model](base_url)
                 if model in rec.failing:
                     raise openai.APIConnectionError(
                         message="Connection error.",
@@ -241,3 +244,205 @@ def test_runtime_custom_failure_skips_same_gateway_model_only(gateway_env):
     finally:
         aux.clear_runtime_main()
     assert model == FB1 and label == "automaticai"
+
+
+# ── failure scope decides what the main fallback chain skips (D3 fix) ────
+#
+# 688bacfac4 passed failed_model for EVERY failure and hard-coded
+# FailureScope.MODEL, so an account-wide 402 tried a same-provider sibling
+# and, when that sibling failed too, re-raised without ever reaching
+# discovery. The scope now comes from classify_failure_scope(reason).
+
+
+def _status_error(status, message, cls=openai.APIStatusError):
+    def _make(base_url):
+        request = httpx.Request("POST", f"{base_url}/chat/completions")
+        return cls(
+            f"Error code: {status} - {message}",
+            response=httpx.Response(status, request=request),
+            body=None,
+        )
+    return _make
+
+
+PAYMENT_402 = _status_error(402, "insufficient account quota")
+RATE_429 = _status_error(429, "rate limit exceeded, try again later", openai.RateLimitError)
+NO_CHANNEL_503 = _status_error(
+    503,
+    "{'error': {'message': 'No available channel for model gw/personal/glm-5.3 "
+    "under group default (distributor)', 'type': 'new_api_error'}}",
+    openai.InternalServerError,
+)
+GENERIC_503 = _status_error(503, "Service Unavailable", openai.InternalServerError)
+
+
+def _gateway_calls(rec):
+    return [model for url, model in rec.calls if url == GATEWAY]
+
+
+@pytest.mark.parametrize("runtime_custom", [False, True], ids=["config-main", "runtime-custom-main"])
+def test_payment_error_with_discovery_on_skips_gateway_siblings_and_reaches_discovery(
+    gateway_env, runtime_custom,
+):
+    """402 is credential scope: every route on the gateway key is dead, so no
+    sibling is tried and discovery serves (adc4cd4059 behaviour). The live
+    shape (runtime provider ``custom`` at the gateway URL) maps back to the
+    configured ``automaticai`` slug."""
+    _write_config(gateway_env.home, discovery=True)
+    aux = gateway_env.aux
+    gateway_env.rec.errors = {MAIN: PAYMENT_402, FB1: PAYMENT_402, FB2: PAYMENT_402}
+    if runtime_custom:
+        aux.set_runtime_main("custom", MAIN, base_url=GATEWAY, api_key="k",
+                             api_mode="chat_completions")
+    try:
+        resp = aux.call_llm(task="title_generation", messages=_msgs())
+    finally:
+        aux.clear_runtime_main()
+
+    assert _gateway_calls(gateway_env.rec) == [MAIN]
+    served_url, served_model = gateway_env.rec.calls[-1]
+    assert served_url != GATEWAY
+    assert resp.choices[0].message.content == f"ok:{served_model}"
+    assert gateway_env.spies.get("_try_openrouter", 0) >= 1
+
+
+def test_main_chain_payment_reason_skips_the_whole_credential(gateway_env):
+    _write_config(gateway_env.home, discovery=True)
+    aux = gateway_env.aux
+    assert aux._try_main_fallback_chain(
+        "title_generation", "auto", reason="payment error",
+        failed_model=MAIN, failed_base_url=GATEWAY,
+    ) == (None, None, "")
+    assert aux._try_main_fallback_chain(
+        "title_generation", "auto", reason="auth error",
+        failed_model=MAIN, failed_base_url=GATEWAY,
+    ) == (None, None, "")
+    _client, model, _label = aux._try_main_fallback_chain(
+        "title_generation", "auto", reason="rate limit",
+        failed_model=MAIN, failed_base_url=GATEWAY,
+    )
+    assert model == FB1
+
+
+@pytest.mark.parametrize("discovery", [False, True])
+@pytest.mark.parametrize(
+    "error", [RATE_429, NO_CHANNEL_503], ids=["429-rate-limit", "503-no-available-channel"],
+)
+def test_model_scoped_failure_tries_the_gateway_sibling(gateway_env, discovery, error):
+    _write_config(gateway_env.home, discovery=discovery)
+    gateway_env.rec.errors = {MAIN: error}
+
+    resp = gateway_env.aux.call_llm(task="title_generation", messages=_msgs())
+
+    assert resp.choices[0].message.content == f"ok:{FB1}"
+    assert gateway_env.rec.calls == [(GATEWAY, MAIN), (GATEWAY, FB1)]
+    assert set(gateway_env.rec.clients) == {GATEWAY}
+    assert gateway_env.spies == {}
+
+
+def test_generic_503_keeps_transient_only_behaviour(gateway_env):
+    """Only a 503 that names the model's route as unavailable falls back."""
+    _write_config(gateway_env.home, discovery=True)
+    gateway_env.rec.errors = {MAIN: GENERIC_503}
+
+    with pytest.raises(openai.InternalServerError):
+        gateway_env.aux.call_llm(task="title_generation", messages=_msgs())
+
+    assert gateway_env.rec.calls == [(GATEWAY, MAIN)]
+    assert gateway_env.spies == {}
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (PAYMENT_402, openai.APIStatusError),
+        (RATE_429, openai.RateLimitError),
+        (NO_CHANNEL_503, openai.InternalServerError),
+    ],
+    ids=["402", "429", "503-no-channel"],
+)
+def test_discovery_off_never_builds_a_direct_client_for_any_scope(gateway_env, error, expected):
+    _write_config(gateway_env.home, discovery=False)
+    gateway_env.rec.errors = {MAIN: error, FB1: error, FB2: error}
+
+    with pytest.raises(expected):
+        gateway_env.aux.call_llm(task="title_generation", messages=_msgs())
+
+    assert {url for url, _ in gateway_env.rec.calls} == {GATEWAY}
+    assert set(gateway_env.rec.clients) == {GATEWAY}
+    assert gateway_env.spies == {}
+    if error is PAYMENT_402:
+        assert _gateway_calls(gateway_env.rec) == [MAIN]  # credential scope: no sibling
+
+
+def test_model_unavailable_classifier_is_503_and_marker_gated():
+    from agent.auxiliary_client import _is_model_unavailable_error
+    from agent.backend_identity import FailureScope, classify_failure_scope
+
+    assert _is_model_unavailable_error(NO_CHANNEL_503(GATEWAY))
+    assert _is_model_unavailable_error(
+        _status_error(503, "分组 default 下模型 x 无可用渠道（distributor）",
+                      openai.InternalServerError)(GATEWAY))
+    assert not _is_model_unavailable_error(GENERIC_503(GATEWAY))
+    assert not _is_model_unavailable_error(
+        _status_error(500, "No available channel for model x")(GATEWAY))
+    assert classify_failure_scope("model unavailable") is FailureScope.MODEL
+
+
+class _AsyncWrap:
+    """Async face over a recorder client (the async path converts fallback
+    clients with ``_to_async_client``)."""
+
+    def __init__(self, sync):
+        self._sync = sync
+        self.base_url = sync.base_url
+        self.api_key = sync.api_key
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kw):
+        return self._sync.chat.completions.create(**kw)
+
+    async def close(self):
+        return None
+
+
+@pytest.fixture
+def async_gateway_env(gateway_env, monkeypatch):
+    monkeypatch.setattr(
+        gateway_env.aux, "_to_async_client",
+        lambda client, model, is_vision=False: (_AsyncWrap(client), model),
+    )
+    return gateway_env
+
+
+def test_async_payment_error_reaches_discovery_without_trying_siblings(async_gateway_env):
+    import asyncio
+
+    env = async_gateway_env
+    _write_config(env.home, discovery=True)
+    env.rec.errors = {MAIN: PAYMENT_402, FB1: PAYMENT_402, FB2: PAYMENT_402}
+
+    resp = asyncio.run(env.aux.async_call_llm(task="title_generation", messages=_msgs()))
+
+    assert set(_gateway_calls(env.rec)) == {MAIN}
+    served_url, served_model = env.rec.calls[-1]
+    assert served_url != GATEWAY
+    assert resp.choices[0].message.content == f"ok:{served_model}"
+
+
+@pytest.mark.parametrize(
+    "error", [RATE_429, NO_CHANNEL_503], ids=["429-rate-limit", "503-no-available-channel"],
+)
+def test_async_model_scoped_failure_tries_the_gateway_sibling(async_gateway_env, error):
+    import asyncio
+
+    env = async_gateway_env
+    _write_config(env.home, discovery=False)
+    env.rec.errors = {MAIN: error}
+
+    resp = asyncio.run(env.aux.async_call_llm(task="title_generation", messages=_msgs()))
+
+    assert resp.choices[0].message.content == f"ok:{FB1}"
+    assert _gateway_calls(env.rec)[-1] == FB1
+    assert set(env.rec.clients) == {GATEWAY}
+    assert env.spies == {}
