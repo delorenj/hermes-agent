@@ -446,3 +446,121 @@ def test_async_model_scoped_failure_tries_the_gateway_sibling(async_gateway_env,
     assert _gateway_calls(env.rec)[-1] == FB1
     assert set(env.rec.clients) == {GATEWAY}
     assert env.spies == {}
+
+
+# ── explicit aux task: main-model safety net behind a runtime ``custom`` ──
+#
+# Live shape (2026-09-30): vision pinned to a gateway model, main provider
+# ``automaticai`` reporting itself as ``custom`` once a turn ran. The safety
+# net (_try_main_agent_model_fallback) asked resolve_provider_client for the
+# bare ``custom`` provider, which resolves no endpoint, so a failed pinned
+# model got no fallback at all. The runtime ``custom`` route now maps back to
+# the configured slug and the net lands on the main model on the gateway.
+
+FLASH = "gw/personal/glm-5.3-flash"
+
+
+def _write_pinned_task_config(home, *, task, discovery=False):
+    _write_config(home, discovery=discovery)
+    cfg = yaml.safe_load((home / "config.yaml").read_text())
+    cfg["auxiliary"][task] = {"provider": "automaticai", "model": FLASH}
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+
+
+def _runtime_custom_main(aux, base_url=GATEWAY):
+    aux.set_runtime_main("custom", MAIN, base_url=base_url, api_key="k",
+                         api_mode="chat_completions")
+
+
+@pytest.mark.parametrize("task", ["title_generation", "vision"])
+@pytest.mark.parametrize(
+    "error", [None, RATE_429, NO_CHANNEL_503], ids=["connection", "429", "503-no-channel"],
+)
+def test_pinned_task_safety_net_reaches_main_model_behind_runtime_custom(
+    gateway_env, task, error,
+):
+    _write_pinned_task_config(gateway_env.home, task=task)
+    aux = gateway_env.aux
+    if error is None:
+        gateway_env.rec.failing = {FLASH}
+    else:
+        gateway_env.rec.errors = {FLASH: error}
+    _runtime_custom_main(aux)
+    try:
+        resp = aux.call_llm(task=task, messages=_msgs())
+    finally:
+        aux.clear_runtime_main()
+
+    assert resp.choices[0].message.content == f"ok:{MAIN}"
+    # 429 may be retried on the pinned model first; the net then serves MAIN.
+    assert gateway_env.rec.calls[-1] == (GATEWAY, MAIN)
+    assert {call for call in gateway_env.rec.calls[:-1]} == {(GATEWAY, FLASH)}
+    assert set(gateway_env.rec.clients) == {GATEWAY}
+    assert gateway_env.spies == {}
+
+
+def test_safety_net_maps_runtime_custom_to_the_configured_slug(gateway_env):
+    _write_pinned_task_config(gateway_env.home, task="title_generation")
+    aux = gateway_env.aux
+    _runtime_custom_main(aux)
+    try:
+        client, model, label = aux._try_main_agent_model_fallback(
+            "automaticai", "title_generation", reason="connection error",
+            failed_model=FLASH,
+        )
+    finally:
+        aux.clear_runtime_main()
+    assert model == MAIN and label == "main-agent(automaticai)"
+    assert str(client.base_url).rstrip("/") == GATEWAY
+
+
+@pytest.mark.parametrize("failed_provider", ["automaticai", "custom"])
+def test_safety_net_credential_failure_on_the_gateway_skips_main(gateway_env, failed_provider):
+    """402/401 on the gateway key: the main model shares that key, so the net
+    is skipped whether the failed route reported the slug or runtime custom."""
+    _write_pinned_task_config(gateway_env.home, task="title_generation")
+    aux = gateway_env.aux
+    _runtime_custom_main(aux)
+    try:
+        result = aux._try_main_agent_model_fallback(
+            failed_provider, "title_generation", reason="payment error",
+            failed_model=None, failed_base_url=GATEWAY,
+        )
+    finally:
+        aux.clear_runtime_main()
+    assert result == (None, None, "")
+    assert gateway_env.rec.clients == []
+
+
+def test_safety_net_skips_main_when_main_is_the_failed_deployment(gateway_env):
+    """A runtime-custom failure of the main model itself has nothing to fall to."""
+    _write_pinned_task_config(gateway_env.home, task="title_generation")
+    aux = gateway_env.aux
+    _runtime_custom_main(aux)
+    try:
+        result = aux._try_main_agent_model_fallback(
+            "custom", "title_generation", reason="connection error",
+            failed_model=MAIN, failed_base_url=GATEWAY,
+        )
+    finally:
+        aux.clear_runtime_main()
+    assert result == (None, None, "")
+
+
+def test_safety_net_never_maps_a_foreign_custom_endpoint(gateway_env):
+    """Runtime ``custom`` on some other URL is not the configured gateway
+    entry: no mapping, and with discovery off no client off the gateway."""
+    _write_pinned_task_config(gateway_env.home, task="title_generation")
+    aux = gateway_env.aux
+    _runtime_custom_main(aux, base_url="https://elsewhere.example.test/v1")
+    try:
+        client, _model, label = aux._try_main_agent_model_fallback(
+            "automaticai", "title_generation", reason="connection error",
+            failed_model=FLASH,
+        )
+    finally:
+        aux.clear_runtime_main()
+    assert label != "main-agent(automaticai)"
+    assert all(url == GATEWAY for url in gateway_env.rec.clients)
+    if client is not None:
+        assert str(client.base_url).rstrip("/") != "https://openrouter.ai/api/v1"

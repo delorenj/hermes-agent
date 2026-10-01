@@ -4021,6 +4021,24 @@ def _named_route_labels(provider: str, base_url: Optional[str] = None) -> set:
     return names | {f"custom:{name}" for name in names}
 
 
+def _configured_slug_behind_route(provider: str, base_url: Optional[str] = None) -> str:
+    """The configured main provider a runtime ``custom`` route projects (fork).
+
+    A named custom provider (``providers.<slug>``) reports itself as
+    ``custom`` once a turn ran. When ``base_url`` is that entry's endpoint
+    the route IS ``model.provider``; returns that configured slug. Returns
+    "" for every other label or endpoint, so callers keep their own label:
+    the bare ``custom`` provider resolves ``OPENAI_BASE_URL``/discovery, not
+    the named entry, and must never be mistaken for it.
+    """
+    if (provider or "").strip().lower() != "custom":
+        return ""
+    main = _configured_main_provider()
+    if main and main in _named_route_labels("custom", base_url):
+        return main
+    return ""
+
+
 def _aux_discovery_enabled() -> bool:
     """``auxiliary.discovery`` (fork): may aux walk the discovery chain?
 
@@ -5472,6 +5490,7 @@ def _try_main_agent_model_fallback(
     task: str = None,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    failed_base_url: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
@@ -5498,6 +5517,12 @@ def _try_main_agent_model_fallback(
       the shared credentials/account are broken, so the main model on the
       same provider cannot help either.
 
+    A named custom provider reports runtime ``custom`` (fork): the main side
+    maps back to the configured slug when the live endpoint is that entry's
+    (``_configured_slug_behind_route``), and so does the failed side when
+    ``failed_base_url`` is that endpoint. Bare ``custom`` resolves no named
+    endpoint, so without the mapping the net never reached the main model.
+
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
@@ -5510,8 +5535,16 @@ def _try_main_agent_model_fallback(
         if not _agg_provider or not _agg_model:
             return None, None, ""
         main_provider, main_model = _agg_provider, _agg_model
+    main_provider = (
+        _configured_slug_behind_route(main_provider, _read_main_base_url())
+        or main_provider
+    )
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
         return None, None, ""
+    failed_label = (
+        _configured_slug_behind_route(failed_provider, failed_base_url)
+        or failed_provider
+    )
 
     # Identity + scope semantics owned by agent.backend_identity (#72468):
     # model-scoped failures skip only the exact deployment that failed;
@@ -5525,7 +5558,7 @@ def _try_main_agent_model_fallback(
     skip_model = (failed_model or "").strip().lower() or None
     if should_skip_candidate(
         BackendIdentity.build(provider=main_provider, model=main_model),
-        BackendIdentity.build(provider=failed_provider, model=skip_model),
+        BackendIdentity.build(provider=failed_label, model=skip_model),
         FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL,
     ):
         # The thing that failed IS the main model (or the failure was
@@ -10202,7 +10235,8 @@ def _call_llm_impl(
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                        failed_model=_chain_failed_model,
+                        failed_base_url=str(getattr(client, "base_url", "") or ""))
 
             if fb_client is not None:
                 _record_route_info(
@@ -10884,7 +10918,8 @@ async def _async_call_llm_impl(
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                        failed_model=_chain_failed_model,
+                        failed_base_url=str(getattr(client, "base_url", "") or ""))
 
             if fb_client is not None:
                 # Convert sync fallback client to async
