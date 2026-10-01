@@ -67,6 +67,11 @@ _REASON_SCOPES = {
     # Fork: a gateway 503 "no available channel for model X" — that model's
     # route has no live upstream; sibling models on the gateway are fine.
     "model unavailable": FailureScope.MODEL,
+    # Fork: a 403 usage cap / quota window / scope miss on ONE route (Kimi
+    # "You've reached your weekly (7-day) usage limit", NewAPI "This token has
+    # no access to model X"). On a gateway every model is its own upstream
+    # account, so the gateway key that reached it is fine (a dead key is 401).
+    "route limit": FailureScope.MODEL,
 }
 
 

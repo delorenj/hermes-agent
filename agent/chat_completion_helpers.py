@@ -2477,10 +2477,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         model=getattr(agent, "model", ""),
         base_url=str(getattr(agent, "base_url", "") or ""),
     )
+    # Fork: a named custom provider entry (``providers.<slug>``) carries no
+    # base_url of its own. Take its configured endpoint, so a current route
+    # that reports runtime ``custom`` at that URL is recognised as the same
+    # deployment; otherwise a capped gateway model is re-sent once under the
+    # slug before the chain moves on.
+    fb_base_url = (fb.get("base_url") or "").strip()
+    if not fb_base_url:
+        try:
+            from agent.auxiliary_client import _named_provider_base_url
+
+            fb_base_url = _named_provider_base_url(fb_provider)
+        except Exception:
+            fb_base_url = ""
     fb_ident = BackendIdentity.build(
         provider=fb_provider,
         model=fb_model,
-        base_url=(fb.get("base_url") or ""),
+        base_url=fb_base_url,
     )
     if should_skip_candidate(fb_ident, current_ident):
         logger.warning(

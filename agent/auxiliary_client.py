@@ -59,7 +59,7 @@ import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -4609,6 +4609,100 @@ def _is_model_unavailable_error(exc: Exception) -> bool:
     return any(marker in err_lower for marker in _MODEL_UNAVAILABLE_MARKERS)
 
 
+# Fork: 403 bodies that say ONE route's usage window, quota or budget ran out,
+# as opposed to a revoked or invalid credential. Kimi Coding (relayed by the
+# gateway): "You've reached your weekly (7-day) usage limit. Your quota will
+# reset when the current 7-day window ends."; budget proxies: "Workspace daily
+# budget of $10.00 exceeded".
+_ROUTE_LIMIT_MARKERS = (
+    "usage limit",
+    "usage cap",
+    "quota",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "limit exceeded",
+    "limit reached",
+    "budget",
+    "spend limit",
+    "spending limit",
+    "usage window",
+    "-day window",
+    "-hour window",
+)
+
+
+def _is_named_gateway_route(provider: Optional[str], base_url: Optional[str] = None) -> bool:
+    """Does this route go through a named custom provider (fork)?
+
+    A ``providers.<slug>`` / ``custom_providers`` entry is how Hermes reaches an
+    inference gateway or relay, where every model is its own upstream account.
+    True for the slug, its ``custom:<name>`` projection, the runtime ``custom``
+    route at the main entry's endpoint (``_named_route_labels``), and any route
+    (``auto`` included) whose ``base_url`` is some named entry's endpoint.
+    """
+    if _named_route_labels(provider or "", base_url):
+        return True
+    url = (base_url or "").strip()
+    if not url:
+        return False
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        route_url = normalize_route_base_url(url).rstrip("/").lower()
+        if not route_url:
+            return False
+        for entry in get_compatible_custom_providers(load_config_readonly()):
+            if not isinstance(entry, dict):
+                continue
+            entry_url = normalize_route_base_url(
+                str(entry.get("base_url") or "").strip()
+            ).rstrip("/").lower()
+            if entry_url and entry_url == route_url:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _is_route_limit_error(
+    exc: Exception,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> bool:
+    """Detect a 403 that closes ONE route, not the credential (fork).
+
+    * Named gateway route (``_is_named_gateway_route(provider, base_url)``):
+      every 403 except a bad-credentials auth failure. Each model behind the
+      gateway is its own upstream account, so a usage cap ("weekly (7-day)
+      usage limit") or a token-scope miss ("This token has no access to model
+      X") on one model says nothing about the gateway key or its sibling
+      models. A dead gateway key is a 401.
+    * Any provider: a 403 whose body says a usage window / quota / budget ran
+      out, when ``_is_payment_error`` does not already own it (those keep
+      their credential-scope handling on direct providers).
+
+    Both map to reason ``route limit`` = MODEL scope
+    (``backend_identity._REASON_SCOPES``): the fallback chain skips only the
+    failed deployment and still tries same-provider siblings.
+    """
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    err_lower = str(exc).lower()
+    if status is None and "error code: 403" in err_lower:
+        status = 403
+    if status != 403 or _is_auth_error(exc):
+        return False
+    if _is_named_gateway_route(provider, base_url):
+        return True
+    if _is_payment_error(exc):
+        return False
+    return any(marker in err_lower for marker in _ROUTE_LIMIT_MARKERS)
+
+
 def _evict_cached_clients(provider: str) -> None:
     """Drop cached auxiliary clients for a provider so fresh creds are used."""
     normalized = _normalize_aux_provider(provider)
@@ -5431,6 +5525,172 @@ async def _call_fallback_candidate_async(
         return None
 
 
+# ── Fallback walk over declared routes (fork) ────────────────────────────
+#
+# A fallback candidate that fails with a MODEL-scoped capacity error (its own
+# route is usage-capped, rate limited, has no live channel, or cannot run the
+# request) used to abort the aux task: _call_fallback_candidate_* re-raised
+# anything but an auth error. On a gateway every route has its own limits, so
+# a capped fallback must hand off to the next declared route like the main
+# agent's chain does. Auth stays inside _call_fallback_candidate_* (quarantine
+# + None); payment stays terminal (credential scope); connection errors and
+# timeouts keep raising so a dead endpoint never multiplies the wall time.
+
+_FALLBACK_WALK_LIMIT = 8
+
+
+def _is_excluded_deployment(candidate: Any, exclude: Sequence[Any]) -> bool:
+    """Is ``candidate`` (a BackendIdentity) a deployment the walk already tried?"""
+    if not exclude:
+        return False
+    from agent.backend_identity import FailureScope, should_skip_candidate
+
+    return any(
+        should_skip_candidate(candidate, tried, FailureScope.MODEL)
+        for tried in exclude
+    )
+
+
+def _fallback_walk_reason(
+    err: Exception,
+    *,
+    provider: Optional[str],
+    base_url: Optional[str],
+) -> Optional[str]:
+    """The reason a failed fallback candidate may hand off to the next declared
+    route, or None when the error must propagate (see the block comment)."""
+    if _is_auth_error(err):
+        return None
+    if _is_route_limit_error(err, provider=provider, base_url=base_url):
+        return "route limit"
+    if _is_payment_error(err):
+        return None
+    if _is_rate_limit_error(err):
+        return "rate limit"
+    if _is_model_unavailable_error(err):
+        return "model unavailable"
+    if _is_model_incompatible_error(err):
+        return "model incompatible with route"
+    if _is_invalid_aux_response_error(err):
+        return "invalid provider response"
+    return None
+
+
+def _next_walk_candidate(
+    fb_err: Exception,
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
+    *,
+    task: Optional[str],
+    tried: List[Any],
+    select_next: Callable[[tuple], Tuple[Optional[Any], Optional[str], str]],
+) -> Optional[Tuple[Any, Optional[str], str]]:
+    """Record the failed candidate in ``tried`` and pick the next declared
+    route, or return None when ``fb_err`` must propagate."""
+    from agent.backend_identity import BackendIdentity
+
+    destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    reason = _fallback_walk_reason(
+        fb_err, provider=destination.provider, base_url=destination.base_url,
+    )
+    if reason is None:
+        return None
+    tried.append(BackendIdentity.build(
+        provider=destination.provider,
+        model=destination.model or fb_model,
+        base_url=destination.base_url,
+    ))
+    if len(tried) > _FALLBACK_WALK_LIMIT:
+        return None
+    next_client, next_model, next_label = select_next(tuple(tried))
+    if next_client is None:
+        logger.warning(
+            "Auxiliary %s: %s on fallback %s (%s) and no declared route left",
+            task or "call", reason, fb_label, fb_model,
+        )
+        return None
+    logger.info(
+        "Auxiliary %s: %s on fallback %s (%s) — trying %s (%s)",
+        task or "call", reason, fb_label, fb_model, next_label, next_model,
+    )
+    return next_client, next_model, next_label
+
+
+def _call_fallback_walk_sync(
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
+    *,
+    task: Optional[str],
+    tried: Sequence[Any],
+    select_next: Callable[[tuple], Tuple[Optional[Any], Optional[str], str]],
+    route_info: Optional[Dict[str, str]] = None,
+    **call_kwargs: Any,
+) -> Optional[Any]:
+    """Call a fallback candidate; on a MODEL-scoped capacity failure walk on.
+
+    ``select_next(exclude)`` re-runs the caller's declared selection (task
+    ``fallback_chain``, then the main ``fallback_providers`` chain or the
+    main-model safety net) with every tried deployment excluded. ``tried``
+    seeds the exclusions with the deployment that failed first. Returns what
+    the last candidate returned (None = stale credential, quarantined).
+    """
+    tried = list(tried)
+    while True:
+        _record_route_info(route_info, _fallback_provider_from_label(fb_label), fb_model)
+        try:
+            return _call_fallback_candidate_sync(
+                fb_client, fb_model, fb_label, task=task, **call_kwargs,
+            )
+        except Exception as fb_err:
+            picked = _next_walk_candidate(
+                fb_err, fb_client, fb_model, fb_label,
+                task=task, tried=tried, select_next=select_next,
+            )
+            if picked is None:
+                raise
+            fb_client, fb_model, fb_label = picked
+
+
+async def _call_fallback_walk_async(
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
+    *,
+    task: Optional[str],
+    tried: Sequence[Any],
+    select_next: Callable[[tuple], Tuple[Optional[Any], Optional[str], str]],
+    route_info: Optional[Dict[str, str]] = None,
+    **call_kwargs: Any,
+) -> Optional[Any]:
+    """Async mirror of :func:`_call_fallback_walk_sync`. ``fb_client`` and
+    every ``select_next`` pick are sync clients, converted per candidate."""
+    tried = list(tried)
+    while True:
+        async_fb, async_fb_model = _to_async_client(
+            fb_client, fb_model or "", is_vision=(task == "vision")
+        )
+        _record_route_info(
+            route_info,
+            _fallback_provider_from_label(fb_label),
+            async_fb_model or fb_model,
+        )
+        try:
+            return await _call_fallback_candidate_async(
+                async_fb, async_fb_model or fb_model, fb_label,
+                task=task, **call_kwargs,
+            )
+        except Exception as fb_err:
+            picked = _next_walk_candidate(
+                fb_err, fb_client, fb_model, fb_label,
+                task=task, tried=tried, select_next=select_next,
+            )
+            if picked is None:
+                raise
+            fb_client, fb_model, fb_label = picked
+
+
 def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
@@ -5491,6 +5751,7 @@ def _try_main_agent_model_fallback(
     reason: str = "error",
     failed_model: Optional[str] = None,
     failed_base_url: Optional[str] = None,
+    exclude: Sequence[Any] = (),
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
@@ -5522,6 +5783,9 @@ def _try_main_agent_model_fallback(
     (``_configured_slug_behind_route``), and so does the failed side when
     ``failed_base_url`` is that endpoint. Bare ``custom`` resolves no named
     endpoint, so without the mapping the net never reached the main model.
+
+    ``exclude`` (fork) lists deployments a fallback walk already tried
+    (``_call_fallback_walk_*``); the main model is skipped when it is one.
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -5563,6 +5827,15 @@ def _try_main_agent_model_fallback(
     ):
         # The thing that failed IS the main model (or the failure was
         # provider-wide) — nothing to fall back to.
+        return None, None, ""
+    if _is_excluded_deployment(
+        BackendIdentity.build(
+            provider=main_provider,
+            model=main_model,
+            base_url=_named_provider_base_url(main_provider),
+        ),
+        exclude,
+    ):
         return None, None, ""
     if _is_provider_unhealthy(main_provider):
         _log_skip_unhealthy(main_provider, task)
@@ -5673,6 +5946,7 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    exclude: Sequence[Any] = (),
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -5698,6 +5972,9 @@ def _try_configured_fallback_chain(
       provider skipped — the shared credentials/account behind every model
       on that provider are broken, so a sibling can't help and the
       main-agent-model safety net should be reached instead.
+
+    ``exclude`` (fork) lists deployments a fallback walk already tried
+    (``_call_fallback_walk_*``); matching entries are skipped.
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -5746,6 +6023,16 @@ def _try_configured_fallback_chain(
             ),
             failed_ident,
             failure_scope,
+        ):
+            continue
+        if _is_excluded_deployment(
+            BackendIdentity.build(
+                provider=fb_provider,
+                model=fb_model_raw,
+                base_url=str(entry.get("base_url") or "")
+                or _named_provider_base_url(fb_provider),
+            ),
+            exclude,
         ):
             continue
         fb_model = fb_model_raw or None
@@ -5854,6 +6141,7 @@ def _try_main_fallback_chain(
     failed_model: Optional[str] = None,
     failed_base_url: Optional[str] = None,
     scope: Optional[Any] = None,
+    exclude: Sequence[Any] = (),
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -5877,7 +6165,8 @@ def _try_main_fallback_chain(
       The caller then walks discovery (when ``auxiliary.discovery`` allows).
 
     ``failed_provider`` ``auto``/empty means the main provider served the
-    failed call.
+    failed call. ``exclude`` lists deployments a fallback walk already tried
+    (``_call_fallback_walk_*``); matching entries are skipped.
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -5947,6 +6236,17 @@ def _try_main_fallback_chain(
                 continue
         elif fb_norm in skip:
             tried.append(f"{label} (skipped: same provider as the failed call)")
+            continue
+        if _is_excluded_deployment(
+            BackendIdentity.build(
+                provider=main_norm if fb_norm == "main" else fb_norm,
+                model=fb_model,
+                base_url=str(entry.get("base_url") or "")
+                or _named_provider_base_url(fb_norm),
+            ),
+            exclude,
+        ):
+            tried.append(f"{label} (skipped: already tried in this fallback walk)")
             continue
         if _is_provider_unhealthy(fb_norm):
             _log_skip_unhealthy(fb_norm, task)
@@ -9262,6 +9562,7 @@ def _create_with_progress(
             or _is_auth_error(exc)
             or _is_payment_error(exc)
             or _is_rate_limit_error(exc)
+            or _is_route_limit_error(exc)
         ):
             raise
         # Anything else may be a streaming-specific rejection (explicit
@@ -9876,6 +10177,9 @@ def _call_llm_impl(
                     _is_payment_error(retry_err)
                     or _is_connection_error(retry_err)
                     or _is_auth_error(retry_err)
+                    or _is_route_limit_error(
+                        retry_err, provider=resolved_provider,
+                        base_url=str(getattr(client, "base_url", "") or ""))
                     or "max_tokens" in retry_err_str
                     or "unsupported_parameter" in retry_err_str
                 ):
@@ -9912,7 +10216,14 @@ def _call_llm_impl(
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_rate_limit_error(retry_err)
+                    or _is_route_limit_error(
+                        retry_err, provider=resolved_provider,
+                        base_url=str(getattr(client, "base_url", "") or ""))
+                ):
                     raise
                 first_err = retry_err
 
@@ -10057,7 +10368,12 @@ def _call_llm_impl(
         # between this call and recovery (which leaves current()=None and makes
         # _select_unlocked() return the NEXT key by mistake).
         _client_api_key = str(getattr(client, "api_key", "") or "")
-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+        # Fork: a route-limit 403 is one route's cap, never the key's (a
+        # gateway key serves every route), so it must not rotate or bench it.
+        if pool_provider and not _is_route_limit_error(
+            first_err, provider=resolved_provider,
+            base_url=str(getattr(client, "base_url", "") or ""),
+        ) and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             # Skip the extra retry for clear payment/quota errors — the endpoint
             # won't accept another request with the same exhausted key.
@@ -10136,8 +10452,14 @@ def _call_llm_impl(
         # auxiliary task on the floor (silent compression failure /
         # message loss). Auth is NOT a capacity error: it only bypasses
         # the explicit-provider gate when the user is in auto mode.
+        # Fork: a 403 that closes one route (usage cap, quota window, token
+        # scope miss on a gateway model) is a model-scoped capacity error.
+        _failed_base_url = str(getattr(client, "base_url", "") or "")
+        _route_limited = _is_route_limit_error(
+            first_err, provider=resolved_provider, base_url=_failed_base_url)
         should_fallback = (
             _is_auth_error(first_err)
+            or _route_limited
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
@@ -10162,7 +10484,8 @@ def _call_llm_impl(
         # the explicit-provider gate and continue to the next candidate
         # instead of aborting the auxiliary task and churning the session.
         is_capacity_error = (
-            _is_payment_error(first_err)
+            _route_limited
+            or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
@@ -10172,6 +10495,11 @@ def _call_llm_impl(
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
                 reason = "auth error"
+            elif _route_limited:
+                # Before payment: on a gateway a billing-worded 403 is still
+                # one route's limit, so neither skip the gateway's sibling
+                # routes nor mark the whole provider unhealthy.
+                reason = "route limit"
             elif _is_payment_error(first_err):
                 reason = "payment error"
                 # Resolve the actual provider label (resolved_provider may be
@@ -10215,36 +10543,47 @@ def _call_llm_impl(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
+            #   (fork) A candidate that fails with a model-scoped capacity
+            #   error hands off to the next declared route
+            #   (_call_fallback_walk_sync re-runs this selection with every
+            #   tried deployment excluded; discovery only on the first pick).
+            def _select_fallback(exclude=()):
+                if is_auto:
+                    picked = _try_configured_fallback_chain(
                         task, resolved_provider or "auto", reason=reason,
-                        failed_model=final_model,
-                        failed_base_url=str(getattr(client, "base_url", "") or ""))
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                        failed_model=_chain_failed_model, exclude=exclude)
+                    if picked[0] is None:
+                        picked = _try_main_fallback_chain(
+                            task, resolved_provider or "auto", reason=reason,
+                            failed_model=final_model,
+                            failed_base_url=_failed_base_url, exclude=exclude)
+                    if picked[0] is None and not exclude:
+                        picked = _try_payment_fallback(
+                            resolved_provider, task, reason=reason)
+                    return picked
+                picked = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    failed_model=_chain_failed_model, exclude=exclude)
+                if picked[0] is None:
+                    picked = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
                         failed_model=_chain_failed_model,
-                        failed_base_url=str(getattr(client, "base_url", "") or ""))
+                        failed_base_url=_failed_base_url, exclude=exclude)
+                return picked
+
+            fb_client, fb_model, fb_label = _select_fallback()
 
             if fb_client is not None:
-                _record_route_info(
-                    route_info, _fallback_provider_from_label(fb_label), fb_model
-                )
-                fb_resp = _call_fallback_candidate_sync(
+                from agent.backend_identity import BackendIdentity
+
+                fb_resp = _call_fallback_walk_sync(
                     fb_client, fb_model, fb_label,
-                    task=task, messages=messages,
+                    task=task,
+                    tried=[BackendIdentity.build(
+                        provider=resolved_provider, model=final_model,
+                        base_url=_failed_base_url)],
+                    select_next=_select_fallback, route_info=route_info,
+                    messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=task_extra_body,
@@ -10607,6 +10946,9 @@ async def _async_call_llm_impl(
                     _is_payment_error(retry_err)
                     or _is_connection_error(retry_err)
                     or _is_auth_error(retry_err)
+                    or _is_route_limit_error(
+                        retry_err, provider=resolved_provider,
+                        base_url=str(getattr(client, "base_url", "") or ""))
                     or "max_tokens" in retry_err_str
                     or "unsupported_parameter" in retry_err_str
                 ):
@@ -10643,7 +10985,14 @@ async def _async_call_llm_impl(
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_rate_limit_error(retry_err)
+                    or _is_route_limit_error(
+                        retry_err, provider=resolved_provider,
+                        base_url=str(getattr(client, "base_url", "") or ""))
+                ):
                     raise
                 first_err = retry_err
 
@@ -10779,7 +11128,12 @@ async def _async_call_llm_impl(
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
         _client_api_key = str(getattr(client, "api_key", "") or "")
-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+        # Fork: a route-limit 403 is one route's cap, never the key's (a
+        # gateway key serves every route), so it must not rotate or bench it.
+        if pool_provider and not _is_route_limit_error(
+            first_err, provider=resolved_provider,
+            base_url=str(getattr(client, "base_url", "") or ""),
+        ) and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             # Skip the extra retry for clear payment/quota errors — the endpoint
             # won't accept another request with the same exhausted key.
@@ -10831,8 +11185,14 @@ async def _async_call_llm_impl(
         # falls back in auto mode just like the sync call_llm() path. Auth is
         # NOT a capacity error, so on an explicit provider it still respects
         # the user's choice (handled by the is_auto/is_capacity_error gate).
+        # Fork: a 403 that closes one route (usage cap, quota window, token
+        # scope miss on a gateway model) is a model-scoped capacity error.
+        _failed_base_url = str(getattr(client, "base_url", "") or "")
+        _route_limited = _is_route_limit_error(
+            first_err, provider=resolved_provider, base_url=_failed_base_url)
         should_fallback = (
             _is_auth_error(first_err)
+            or _route_limited
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
@@ -10849,7 +11209,8 @@ async def _async_call_llm_impl(
         # bypass the gate too — see the sync call_llm() path for rationale.
         is_auto = resolved_provider in {"auto", "", None}
         is_capacity_error = (
-            _is_payment_error(first_err)
+            _route_limited
+            or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
@@ -10859,6 +11220,8 @@ async def _async_call_llm_impl(
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
                 reason = "auth error"
+            elif _route_limited:
+                reason = "route limit"
             elif _is_payment_error(first_err):
                 reason = "payment error"
                 _mark_provider_unhealthy(
@@ -10898,42 +11261,46 @@ async def _async_call_llm_impl(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
+            #   (fork) A candidate that fails with a model-scoped capacity
+            #   error hands off to the next declared route — mirrors sync.
+            def _select_fallback(exclude=()):
+                if is_auto:
+                    picked = _try_configured_fallback_chain(
                         task, resolved_provider or "auto", reason=reason,
-                        failed_model=final_model,
-                        failed_base_url=str(getattr(client, "base_url", "") or ""))
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                        failed_model=_chain_failed_model, exclude=exclude)
+                    if picked[0] is None:
+                        picked = _try_main_fallback_chain(
+                            task, resolved_provider or "auto", reason=reason,
+                            failed_model=final_model,
+                            failed_base_url=_failed_base_url, exclude=exclude)
+                    if picked[0] is None and not exclude:
+                        picked = _try_payment_fallback(
+                            resolved_provider, task, reason=reason)
+                    return picked
+                picked = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    failed_model=_chain_failed_model, exclude=exclude)
+                if picked[0] is None:
+                    picked = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
                         failed_model=_chain_failed_model,
-                        failed_base_url=str(getattr(client, "base_url", "") or ""))
+                        failed_base_url=_failed_base_url, exclude=exclude)
+                return picked
+
+            fb_client, fb_model, fb_label = _select_fallback()
 
             if fb_client is not None:
-                # Convert sync fallback client to async
-                async_fb, async_fb_model = _to_async_client(
-                    fb_client, fb_model or "", is_vision=(task == "vision")
-                )
-                _record_route_info(
-                    route_info,
-                    _fallback_provider_from_label(fb_label),
-                    async_fb_model or fb_model,
-                )
-                fb_resp = await _call_fallback_candidate_async(
-                    async_fb, async_fb_model or fb_model, fb_label,
-                    task=task, messages=messages,
+                from agent.backend_identity import BackendIdentity
+
+                # Sync fallback clients are converted to async per candidate.
+                fb_resp = await _call_fallback_walk_async(
+                    fb_client, fb_model, fb_label,
+                    task=task,
+                    tried=[BackendIdentity.build(
+                        provider=resolved_provider, model=final_model,
+                        base_url=_failed_base_url)],
+                    select_next=_select_fallback, route_info=route_info,
+                    messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=task_extra_body,

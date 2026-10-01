@@ -564,3 +564,213 @@ def test_safety_net_never_maps_a_foreign_custom_endpoint(gateway_env):
     assert all(url == GATEWAY for url in gateway_env.rec.clients)
     if client is not None:
         assert str(client.base_url).rstrip("/") != "https://openrouter.ai/api/v1"
+
+
+# ── route-limit 403s fall back (fork) ────────────────────────────────────
+#
+# Live (2026-09-30): every kimi-* route on the gateway answered 403 "You've
+# reached your weekly (7-day) usage limit" (upstream Kimi Coding cap relayed by
+# NewAPI), and a token missing a route's scope answers 403 "This token has no
+# access to model X". The main agent fell back on those 403s; aux did not:
+# _is_payment_error does not match the wording and a 403 is not an auth error,
+# so title/vision/compression raised with no fallback at all. On a gateway each
+# route is its own upstream account, so a 403 is MODEL scope: try the siblings.
+
+KIMI_WEEKLY_403 = _status_error(
+    403,
+    "{'error': {'message': \"You've reached your weekly (7-day) usage limit. "
+    "Your quota will reset when the current 7-day window ends. To continue now, "
+    "purchase extra usage or upgrade your plan\", 'type': 'access_terminated_error', "
+    "'param': '', 'code': None}}",
+    openai.PermissionDeniedError,
+)
+SCOPE_MISS_403 = _status_error(
+    403,
+    "{'error': {'message': 'This token has no access to model gw/personal/glm-5.3', "
+    "'type': 'new_api_error'}}",
+    openai.PermissionDeniedError,
+)
+# Billing-worded ("weekly usage limit", "upgrade for higher limits" are
+# _is_payment_error keywords): on a gateway it is still ONE route's limit.
+BILLING_WORDED_403 = _status_error(
+    403,
+    "You've reached your weekly usage limit. Upgrade for higher limits.",
+    openai.PermissionDeniedError,
+)
+BAD_CREDENTIALS_403 = _status_error(
+    403, "unauthenticated:bad-credentials", openai.PermissionDeniedError,
+)
+PLAIN_403 = _status_error(403, "Forbidden", openai.PermissionDeniedError)
+
+ROUTE_LIMIT_403S = [KIMI_WEEKLY_403, SCOPE_MISS_403, BILLING_WORDED_403]
+ROUTE_LIMIT_IDS = ["kimi-weekly-cap", "token-scope-miss", "billing-worded"]
+
+
+def test_route_limit_classifier(gateway_env):
+    _write_config(gateway_env.home, discovery=False)
+    from agent.auxiliary_client import _is_route_limit_error
+    from agent.backend_identity import FailureScope, classify_failure_scope
+
+    for make in ROUTE_LIMIT_403S + [PLAIN_403]:
+        err = make(GATEWAY)
+        # The gateway slug, the runtime ``custom`` label and an ``auto`` route
+        # at the gateway URL are all the named gateway route.
+        assert _is_route_limit_error(err, provider="automaticai", base_url=GATEWAY)
+        assert _is_route_limit_error(err, provider="auto", base_url=GATEWAY)
+        assert _is_route_limit_error(err, provider="custom:automaticai")
+
+    direct = "https://api.direct-vendor.test/v1"
+    # Off the gateway only limit wording counts, and payment keeps its own.
+    assert _is_route_limit_error(KIMI_WEEKLY_403(direct), provider="kimi-coding", base_url=direct)
+    assert not _is_route_limit_error(PLAIN_403(direct), provider="kimi-coding", base_url=direct)
+    assert not _is_route_limit_error(BILLING_WORDED_403(direct), provider="opencode-go", base_url=direct)
+    # Never a credential failure, never another status.
+    assert not _is_route_limit_error(
+        BAD_CREDENTIALS_403(GATEWAY), provider="automaticai", base_url=GATEWAY)
+    assert not _is_route_limit_error(PAYMENT_402(GATEWAY), provider="automaticai", base_url=GATEWAY)
+    assert not _is_route_limit_error(RATE_429(GATEWAY), provider="automaticai", base_url=GATEWAY)
+    assert classify_failure_scope("route limit") is FailureScope.MODEL
+
+
+@pytest.mark.parametrize("discovery", [False, True])
+@pytest.mark.parametrize("error", ROUTE_LIMIT_403S, ids=ROUTE_LIMIT_IDS)
+@pytest.mark.parametrize("runtime_custom", [False, True], ids=["config-main", "runtime-custom-main"])
+def test_route_limit_403_on_main_route_falls_back_to_gateway_sibling(
+    gateway_env, discovery, error, runtime_custom,
+):
+    _write_config(gateway_env.home, discovery=discovery)
+    aux = gateway_env.aux
+    gateway_env.rec.errors = {MAIN: error}
+    if runtime_custom:
+        _runtime_custom_main(aux)
+    try:
+        resp = aux.call_llm(task="title_generation", messages=_msgs())
+    finally:
+        aux.clear_runtime_main()
+
+    assert resp.choices[0].message.content == f"ok:{FB1}"
+    assert gateway_env.rec.calls == [(GATEWAY, MAIN), (GATEWAY, FB1)]
+    assert set(gateway_env.rec.clients) == {GATEWAY}
+    assert gateway_env.spies == {}
+    # One route's cap never benches the whole gateway provider.
+    assert aux._aux_unhealthy_until == {}
+
+
+def test_route_limited_fallback_walks_to_the_next_declared_route(gateway_env):
+    """A fallback route that is capped too hands off to the next one."""
+    _write_config(gateway_env.home, discovery=False)
+    gateway_env.rec.errors = {MAIN: KIMI_WEEKLY_403, FB1: KIMI_WEEKLY_403}
+
+    resp = gateway_env.aux.call_llm(task="title_generation", messages=_msgs())
+
+    assert resp.choices[0].message.content == f"ok:{FB2}"
+    assert gateway_env.rec.calls == [(GATEWAY, MAIN), (GATEWAY, FB1), (GATEWAY, FB2)]
+    assert gateway_env.spies == {}
+
+
+def test_every_route_limited_raises_after_one_pass_on_the_gateway(gateway_env):
+    _write_config(gateway_env.home, discovery=False)
+    gateway_env.rec.errors = {MAIN: KIMI_WEEKLY_403, FB1: SCOPE_MISS_403, FB2: KIMI_WEEKLY_403}
+
+    with pytest.raises(openai.PermissionDeniedError):
+        gateway_env.aux.call_llm(task="title_generation", messages=_msgs())
+
+    assert gateway_env.rec.calls == [(GATEWAY, MAIN), (GATEWAY, FB1), (GATEWAY, FB2)]
+    assert set(gateway_env.rec.clients) == {GATEWAY}
+    assert gateway_env.spies == {}
+
+
+def test_fallback_walk_never_continues_past_a_connection_error(gateway_env):
+    """The walk is for capacity failures only: a dead endpoint still raises."""
+    _write_config(gateway_env.home, discovery=False)
+    gateway_env.rec.errors = {MAIN: KIMI_WEEKLY_403}
+    gateway_env.rec.failing = {FB1}
+
+    with pytest.raises(openai.APIConnectionError):
+        gateway_env.aux.call_llm(task="title_generation", messages=_msgs())
+
+    assert gateway_env.rec.calls == [(GATEWAY, MAIN), (GATEWAY, FB1)]
+
+
+def test_bad_credentials_403_keeps_credential_handling(gateway_env):
+    """A 403 that says the KEY is bad is auth: the explicit pinned task does
+    not fall back (auth is not a capacity error), exactly as before."""
+    _write_pinned_task_config(gateway_env.home, task="title_generation")
+    gateway_env.rec.errors = {FLASH: BAD_CREDENTIALS_403}
+
+    with pytest.raises(openai.PermissionDeniedError):
+        gateway_env.aux.call_llm(task="title_generation", messages=_msgs())
+
+    assert gateway_env.rec.calls == [(GATEWAY, FLASH)]
+
+
+@pytest.mark.parametrize("task", ["title_generation", "vision", "compression"])
+@pytest.mark.parametrize("error", ROUTE_LIMIT_403S, ids=ROUTE_LIMIT_IDS)
+@pytest.mark.parametrize("runtime_custom", [False, True], ids=["config-main", "runtime-custom-main"])
+def test_pinned_task_route_limit_reaches_main_model(gateway_env, task, error, runtime_custom):
+    """An aux task pinned to a capped gateway model (explicit provider) falls
+    back to the main model on the gateway via the safety net."""
+    _write_pinned_task_config(gateway_env.home, task=task)
+    aux = gateway_env.aux
+    gateway_env.rec.errors = {FLASH: error}
+    if runtime_custom:
+        _runtime_custom_main(aux)
+    try:
+        resp = aux.call_llm(task=task, messages=_msgs())
+    finally:
+        aux.clear_runtime_main()
+
+    assert resp.choices[0].message.content == f"ok:{MAIN}"
+    assert gateway_env.rec.calls == [(GATEWAY, FLASH), (GATEWAY, MAIN)]
+    assert set(gateway_env.rec.clients) == {GATEWAY}
+    assert gateway_env.spies == {}
+
+
+def test_pinned_task_route_limit_walks_its_fallback_chain(gateway_env):
+    """A pinned task's own fallback_chain is walked past a capped entry."""
+    _write_pinned_task_config(gateway_env.home, task="vision")
+    cfg = yaml.safe_load((gateway_env.home / "config.yaml").read_text())
+    cfg["auxiliary"]["vision"]["fallback_chain"] = [
+        {"provider": "automaticai", "model": FB2},
+        {"provider": "automaticai", "model": FB1},
+    ]
+    (gateway_env.home / "config.yaml").write_text(yaml.safe_dump(cfg))
+    gateway_env.rec.errors = {FLASH: KIMI_WEEKLY_403, FB2: KIMI_WEEKLY_403}
+
+    resp = gateway_env.aux.call_llm(task="vision", messages=_msgs())
+
+    assert resp.choices[0].message.content == f"ok:{FB1}"
+    assert gateway_env.rec.calls == [(GATEWAY, FLASH), (GATEWAY, FB2), (GATEWAY, FB1)]
+
+
+@pytest.mark.parametrize("error", ROUTE_LIMIT_403S, ids=ROUTE_LIMIT_IDS)
+def test_async_route_limit_403_falls_back_and_walks(async_gateway_env, error):
+    import asyncio
+
+    env = async_gateway_env
+    _write_config(env.home, discovery=False)
+    env.rec.errors = {MAIN: error, FB1: error}
+
+    resp = asyncio.run(env.aux.async_call_llm(task="title_generation", messages=_msgs()))
+
+    assert resp.choices[0].message.content == f"ok:{FB2}"
+    assert _gateway_calls(env.rec) == [MAIN, FB1, FB2]
+    assert set(env.rec.clients) == {GATEWAY}
+    assert env.spies == {}
+    assert env.aux._aux_unhealthy_until == {}
+
+
+def test_async_pinned_vision_route_limit_reaches_main_model(async_gateway_env):
+    import asyncio
+
+    env = async_gateway_env
+    _write_pinned_task_config(env.home, task="vision")
+    env.rec.errors = {FLASH: KIMI_WEEKLY_403}
+    _runtime_custom_main(env.aux)
+    try:
+        resp = asyncio.run(env.aux.async_call_llm(task="vision", messages=_msgs()))
+    finally:
+        env.aux.clear_runtime_main()
+
+    assert resp.choices[0].message.content == f"ok:{MAIN}"
+    assert _gateway_calls(env.rec) == [FLASH, MAIN]
