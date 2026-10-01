@@ -3932,6 +3932,47 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     return normalized
 
 
+_DISCOVERY_OFF_LOGGED: set = set()
+
+
+def _aux_discovery_enabled() -> bool:
+    """``auxiliary.discovery`` (fork): may aux walk the discovery chain?
+
+    Default true keeps upstream behaviour. When false, auxiliary routing never
+    walks Hermes' built-in provider discovery (OpenRouter -> Nous ->
+    local/custom -> API-key providers): no payment/connection-error
+    discovery fallback, no auto-route Step 3, no stale-credential re-walk, no
+    vision aggregator fallback, and no API-key provider walk for a bare
+    ``custom`` request. Only the task's configured provider (and its
+    ``fallback_chain``), the main provider/model and the main
+    ``fallback_providers`` chain can serve an aux call — so every aux request
+    stays on the routes the operator declared (e.g. one inference gateway)
+    even when the process env exports direct provider keys.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        value = cfg_get(load_config_readonly(), "auxiliary", "discovery", default=True)
+    except Exception:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "off"}
+    return value is None or bool(value)
+
+
+def _log_discovery_off(site: str, task: Optional[str] = None) -> None:
+    """Say once per (site, task) that discovery was suppressed."""
+    key = (site, task or "")
+    if key in _DISCOVERY_OFF_LOGGED:
+        return
+    _DISCOVERY_OFF_LOGGED.add(key)
+    logger.info(
+        "Auxiliary %s: auxiliary.discovery is false — not walking the "
+        "provider discovery chain (%s)",
+        task or "call", site,
+    )
+
+
 def _get_provider_chain() -> List[tuple]:
     """Return the ordered provider detection chain.
 
@@ -5260,6 +5301,9 @@ def _try_payment_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    if not _aux_discovery_enabled():
+        _log_discovery_off(f"{reason} on {failed_provider or 'auto'}", task)
+        return None, None, ""
     # Normalise the failed provider label for matching.
     skip = failed_provider.lower().strip()
     # Also skip Step-1 main-provider path if it maps to the same backend.
@@ -5649,6 +5693,8 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    failed_model: Optional[str] = None,
+    failed_base_url: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -5657,6 +5703,16 @@ def _try_main_fallback_chain(
     chain. The top-level chain is read through ``get_fallback_chain`` so
     both modern ``fallback_providers`` and legacy ``fallback_model`` entries
     participate in the same order as the main agent.
+
+    ``failed_model`` (fork): skip an entry only when its (provider, model)
+    is the deployment that just failed. ``failed_provider`` ``auto``/empty
+    means the main provider served the failed call. A fallback entry on the
+    SAME provider with a DIFFERENT model is a valid candidate — on an
+    inference gateway every model is its own upstream route, so skipping the
+    whole provider sent aux traffic straight into the discovery chain
+    (direct-provider keys) while healthy gateway routes sat unused. Without
+    ``failed_model`` every entry on the failed/main provider is skipped (the
+    original behaviour).
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -5673,6 +5729,19 @@ def _try_main_fallback_chain(
     failed_norm = (failed_provider or "").strip().lower()
     main_norm = (_read_main_provider() or "").strip().lower()
     skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    failed_ident = None
+    if (failed_model or "").strip():
+        from agent.backend_identity import (
+            BackendIdentity,
+            FailureScope,
+            should_skip_candidate,
+        )
+
+        failed_ident = BackendIdentity.build(
+            provider=main_norm if failed_norm in {"", "auto"} else failed_norm,
+            model=failed_model,
+            base_url=failed_base_url or "",
+        )
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -5685,7 +5754,19 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
-        if fb_norm in skip:
+        if fb_norm == "auto":
+            tried.append(f"{label} (skipped)")
+            continue
+        if failed_ident is not None:
+            fb_ident = BackendIdentity.build(
+                provider=main_norm if fb_norm == "main" else fb_norm,
+                model=fb_model,
+                base_url=str(entry.get("base_url") or ""),
+            )
+            if should_skip_candidate(fb_ident, failed_ident, FailureScope.MODEL):
+                tried.append(f"{label} (skipped: same deployment as the failed call)")
+                continue
+        elif fb_norm in skip:
             tried.append(f"{label} (skipped)")
             continue
         if _is_provider_unhealthy(fb_norm):
@@ -5915,11 +5996,20 @@ def _resolve_auto_route(
         if fb_client is not None:
             return fb_client, fb_model, _fallback_provider_from_label(fb_label)
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-        task, main_provider or "auto", reason="main provider unavailable")
+        task, main_provider or "auto", reason="main provider unavailable",
+        failed_model=main_model or None)
     if fb_client is not None:
         return fb_client, fb_model, fb_label
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
+    if not _aux_discovery_enabled():
+        _log_discovery_off("auto-route step 3", task)
+        logger.warning(
+            "Auxiliary auto-detect: main provider %s and fallback_providers "
+            "unavailable; discovery disabled (auxiliary.discovery: false)",
+            main_provider or "auto",
+        )
+        return None, None, ""
     tried = []
     for label, try_fn in _get_provider_chain():
         if _is_provider_unhealthy(label):
@@ -6448,7 +6538,14 @@ def resolve_provider_client(
                     else (client, final_model))
         # Try custom first, then API-key providers (Codex excluded here:
         # falling through to Codex with no model is a stale-constant trap).
-        for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
+        # With auxiliary.discovery false the API-key provider walk is
+        # discovery, not configuration — only the configured endpoint counts.
+        _custom_try_fns = (
+            (_try_custom_endpoint, _resolve_api_key_provider)
+            if _aux_discovery_enabled()
+            else (_try_custom_endpoint,)
+        )
+        for try_fn in _custom_try_fns:
             client, default = try_fn()
             if client is not None:
                 final_model = _normalize_resolved_model(model or default, provider)
@@ -7065,6 +7162,8 @@ def get_available_vision_backends() -> List[str]:
             if client is not None:
                 available.append(main_provider)
     # 2. OpenRouter, 3. Nous — skip if already covered by main provider.
+    if not _aux_discovery_enabled():
+        return available
     for p in _VISION_AUTO_PROVIDER_ORDER:
         if p not in available and _strict_vision_backend_available(p):
             available.append(p)
@@ -7259,6 +7358,9 @@ def resolve_vision_provider_client(
 
         # Fall back through aggregators (uses their dedicated vision model,
         # not the user's main model) when main provider has no client.
+        if not _aux_discovery_enabled():
+            _log_discovery_off("vision aggregator fallback", "vision")
+            return None, None, None
         for candidate in _VISION_AUTO_PROVIDER_ORDER:
             if candidate == main_provider:
                 continue  # already tried above
@@ -9825,7 +9927,9 @@ def _call_llm_impl(
                     failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=final_model,
+                        failed_base_url=str(getattr(client, "base_url", "") or ""))
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
@@ -10489,7 +10593,9 @@ async def _async_call_llm_impl(
                     failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=final_model,
+                        failed_base_url=str(getattr(client, "base_url", "") or ""))
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)

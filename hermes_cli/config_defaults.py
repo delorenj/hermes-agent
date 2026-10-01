@@ -925,6 +925,17 @@ DEFAULT_CONFIG = {
         # OPENROUTER_API_KEY is present. Default false keeps the historical
         # paid fallback for users who want it.
         "free_only": False,
+        # Fork (delorenj): may auxiliary routing walk Hermes' built-in
+        # provider DISCOVERY chain (OpenRouter -> Nous -> local/custom ->
+        # API-key providers found in the environment)? true (default) is the
+        # upstream behaviour. false pins every aux call to declared routes
+        # only: the task's configured provider (+ its fallback_chain), the
+        # main provider/model, and the top-level fallback_providers chain.
+        # No payment/connection-error discovery fallback, no auto-route
+        # discovery step, no stale-credential re-walk, no vision aggregator
+        # fallback — a process that happens to export GEMINI_API_KEY /
+        # OPENROUTER_API_KEY never sends aux traffic around your gateway.
+        "discovery": True,
         # Override the auxiliary auto-chain's OpenRouter fallback model
         # (default: google/gemini-3.6-flash, a PAID model). Set e.g.
         # "nvidia/nemotron-3-ultra-550b-a55b:free" together with

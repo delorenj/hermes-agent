@@ -1357,6 +1357,19 @@ Each entry supports the same three knobs as any auxiliary task config:
 
 `fallback_chain` is available on any auxiliary task — `compression`, `vision`, `web_extract`, `approval`, `skills_hub`, `mcp`, etc.
 
+### Pinning auxiliary traffic to declared routes (`auxiliary.discovery`)
+
+When an auxiliary call fails (connection error, 402, rate limit) or its provider cannot be resolved, Hermes tries, in order: the task's `fallback_chain`, then (for `provider: auto` tasks) the top-level `fallback_providers` chain, and finally its built-in **discovery chain** — OpenRouter → Nous → local/custom → any API-key provider whose key happens to be in the environment (Gemini, z.ai, Kimi, …). The vision `auto` backend similarly falls through to OpenRouter / Nous / DeepInfra.
+
+If every model call must go through one gateway (or one set of declared providers), turn discovery off:
+
+```yaml
+auxiliary:
+  discovery: false
+```
+
+With `discovery: false` an auxiliary call is only ever served by the task's configured provider (and its `fallback_chain`), the main provider/model, or an entry in `fallback_providers`. A `fallback_providers` entry on the same provider as the failed call but with a different model is a valid fallback (each model on a gateway is its own upstream route); only the exact provider + model that failed is skipped. When none of those can serve the call, the call fails instead of reaching a direct provider through an ambient `GEMINI_API_KEY` / `OPENROUTER_API_KEY`. The default (`true`) keeps the discovery chain.
+
 ### Limiting auxiliary concurrency
 
 `max_concurrency` caps in-flight LLM calls for auxiliary tasks such as `compression` and `title_generation` across the whole process. `auxiliary.vision.max_concurrency` is excluded: it already controls only vision's CPU-bound image encode/resize workers, not LLM requests. This is most useful when:
