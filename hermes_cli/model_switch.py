@@ -1222,6 +1222,23 @@ def _configured_provider_matches(
         return None
 
     matches: dict[str, str] = {}
+    # One provider, one candidate (fork): ``load_picker_context()`` passes a
+    # ``providers.<slug>`` dict as ``user_providers`` AND its compatibility
+    # projection (``get_compatible_custom_providers``) as ``custom_providers``,
+    # so the same entry would otherwise be counted twice — ``automaticai`` and
+    # ``custom:AutomaticAI`` — and every typed ``/model`` it declares is
+    # "declared by multiple configured providers".  Collapse a derived entry
+    # (``provider_key``) onto its source slug, and any two entries sharing an
+    # endpoint identity (base_url + key reference) onto the first one seen.
+    seen_identities: dict[tuple, str] = {}
+
+    def _claim(slug: str, cfg: dict, hit: str) -> None:
+        identity = _configured_provider_identity(cfg)
+        if identity is not None and identity in seen_identities:
+            return
+        matches[slug] = hit
+        if identity is not None:
+            seen_identities[identity] = slug
 
     if isinstance(user_providers, dict):
         for slug, cfg in user_providers.items():
@@ -1230,7 +1247,7 @@ def _configured_provider_matches(
             for key in ("models", "model", "default_model"):
                 hit = _match(cfg.get(key))
                 if hit:
-                    matches[slug] = hit
+                    _claim(slug, cfg, hit)
                     break
 
     if isinstance(custom_providers, list):
@@ -1243,13 +1260,96 @@ def _configured_provider_matches(
             slug = f"custom:{name}"
             if slug in matches:
                 continue
+            derived_from = str(entry.get("provider_key") or "").strip()
+            if derived_from and derived_from in matches:
+                continue
             for key in ("models", "model", "default_model"):
                 hit = _match(entry.get(key))
                 if hit:
-                    matches[slug] = hit
+                    _claim(slug, entry, hit)
                     break
 
     return matches
+
+
+def _configured_provider_url(cfg: Any) -> str:
+    """Normalized endpoint URL of a ``providers.<slug>`` / ``custom_providers``
+    entry (``base_url`` / ``url`` / ``api`` — the same keys the config
+    normalizer reads), or ``""``."""
+    if not isinstance(cfg, dict):
+        return ""
+    for key in ("base_url", "url", "api"):
+        value = cfg.get(key)
+        if isinstance(value, str) and value.strip():
+            from hermes_cli.route_identity import normalize_route_base_url
+
+            return normalize_route_base_url(value.strip()).rstrip("/")
+    return ""
+
+
+def _configured_provider_identity(cfg: Any) -> Optional[tuple]:
+    """``(url, key reference)`` identity of a configured provider entry.
+
+    Two entries with the same endpoint and the same key reference (``key_env``
+    name, or the same literal ``api_key``) are the same provider.  Returns
+    None when the entry has no endpoint, so URL-less entries never collapse.
+    """
+    url = _configured_provider_url(cfg)
+    if not url:
+        return None
+    key_env = ""
+    for key in ("key_env", "api_key_env", "keyEnv", "apiKeyEnv"):
+        value = cfg.get(key)
+        if isinstance(value, str) and value.strip():
+            key_env = value.strip()
+            break
+    api_key = cfg.get("api_key")
+    api_key = api_key.strip() if isinstance(api_key, str) else ""
+    return (url, key_env, api_key)
+
+
+def _configured_slug_for_runtime_route(
+    current_provider: str,
+    current_base_url: str,
+    candidates: list[str],
+    user_providers: Optional[dict],
+    custom_providers: Optional[list],
+) -> str:
+    """Map a runtime ``custom`` / ``custom:*`` provider back to the configured
+    slug serving the same endpoint.
+
+    A named custom provider (``providers.<slug>`` with its own ``api``)
+    resolves to provider ``custom`` at runtime, so after the first turn the
+    CLI's current provider is ``custom`` rather than the slug it started on.
+    Returns the unique candidate whose endpoint equals ``current_base_url``,
+    else ``""``.
+    """
+    provider = str(current_provider or "").strip().lower()
+    if provider != "custom" and not provider.startswith("custom:"):
+        return ""
+    if not current_base_url:
+        return ""
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    current_url = normalize_route_base_url(str(current_base_url).strip()).rstrip("/")
+    if not current_url:
+        return ""
+
+    def _entry_for(slug: str) -> Optional[dict]:
+        if isinstance(user_providers, dict) and isinstance(user_providers.get(slug), dict):
+            return user_providers[slug]
+        if slug.startswith("custom:") and isinstance(custom_providers, list):
+            name = slug[len("custom:"):]
+            for entry in custom_providers:
+                if isinstance(entry, dict) and entry.get("name") == name:
+                    return entry
+        return None
+
+    hits = [
+        slug for slug in candidates
+        if _configured_provider_url(_entry_for(slug)) == current_url
+    ]
+    return hits[0] if len(hits) == 1 else ""
 
 
 def _resolve_named_custom_model_id(
@@ -1616,12 +1716,28 @@ def switch_model(
                 new_model, user_providers, custom_providers
             )
             if cfg_matches:
+                # After the first turn a named custom provider's runtime slug
+                # is ``custom``; map it back to the configured slug serving the
+                # same endpoint so it counts as "the current provider" (fork).
+                _runtime_slug = (
+                    ""
+                    if current_provider in cfg_matches
+                    else _configured_slug_for_runtime_route(
+                        current_provider,
+                        current_base_url,
+                        sorted(cfg_matches),
+                        user_providers,
+                        custom_providers,
+                    )
+                )
                 if current_provider in cfg_matches:
                     # The current provider itself declares it — keep current.
                     new_model = cfg_matches[current_provider]
                     config_routed = True
                 else:
-                    match_slugs = sorted(cfg_matches)
+                    match_slugs = (
+                        [_runtime_slug] if _runtime_slug else sorted(cfg_matches)
+                    )
                     if len(match_slugs) > 1:
                         return ModelSwitchResult(
                             success=False,
