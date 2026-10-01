@@ -5108,6 +5108,9 @@ def _call_fallback_candidate_sync(
         tools,
         destination=destination,
     )
+    effective_extra_body = _with_main_provider_extra_body(
+        effective_extra_body, task=task, provider=destination.provider,
+        base_url=destination.base_url, reasoning_config=reasoning_config)
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=max_tokens,
@@ -5214,6 +5217,9 @@ async def _call_fallback_candidate_async(
         tools,
         destination=destination,
     )
+    effective_extra_body = _with_main_provider_extra_body(
+        effective_extra_body, task=task, provider=destination.provider,
+        base_url=destination.base_url, reasoning_config=reasoning_config)
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=max_tokens,
@@ -8220,6 +8226,105 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     return effective
 
 
+_PROVIDER_REASONING_KEYS = ("reasoning_effort", "reasoning")
+_MOA_TASKS = ("moa_reference", "moa_aggregator")
+
+
+def _main_named_provider_extra_body(provider: str, base_url: Optional[str]) -> Dict[str, Any]:
+    """``extra_body`` of the main provider when it is a named custom provider
+    and this aux route is served by it (fork).
+
+    A named custom provider (``providers.<slug>`` / ``custom_providers``)
+    can declare ``extra_body`` (e.g. ``reasoning_effort: high``). The main
+    agent sends it on every turn, but aux calls resolved through ``auto`` (or
+    pinned to the same provider) did not, so helpers ran at the endpoint's
+    default effort. The route counts as the main provider when ``provider``
+    names it (slug, ``custom:<name>``) or when a ``custom``/``auto`` route
+    reaches the main entry's endpoint.
+    """
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        main = (_read_main_provider() or "").strip().lower()
+        if not main or main in {"auto", "custom"}:
+            return {}
+        main_name = main[len("custom:"):] if main.startswith("custom:") else main
+        main_entry = None
+        for entry in get_compatible_custom_providers(load_config_readonly()):
+            if not isinstance(entry, dict):
+                continue
+            keys = {
+                str(entry.get("provider_key") or "").strip().lower(),
+                str(entry.get("name") or "").strip().lower(),
+            }
+            if main_name in keys:
+                main_entry = entry
+                break
+        if main_entry is None:
+            return {}
+        extra = main_entry.get("extra_body")
+        if not isinstance(extra, dict) or not extra:
+            return {}
+
+        prov = (provider or "").strip().lower()
+        entry_names = {
+            str(main_entry.get("provider_key") or "").strip().lower(),
+            str(main_entry.get("name") or "").strip().lower(),
+        } - {""}
+        named_route = prov == main or prov in entry_names or (
+            prov.startswith("custom:") and prov[len("custom:"):] in entry_names
+        )
+        if not named_route:
+            if prov not in {"", "auto", "custom"} and not prov.startswith("custom:"):
+                return {}
+            route_url = normalize_route_base_url(str(base_url or "").strip()).rstrip("/")
+            entry_url = normalize_route_base_url(
+                str(main_entry.get("base_url") or "").strip()
+            ).rstrip("/")
+            if not route_url or route_url != entry_url:
+                return {}
+        return dict(extra)
+    except Exception as exc:
+        logger.debug("Auxiliary: main provider extra_body lookup failed: %s", exc)
+        return {}
+
+
+def _with_main_provider_extra_body(
+    extra_body: Optional[Dict[str, Any]],
+    *,
+    task: Optional[str],
+    provider: str,
+    base_url: Optional[str],
+    reasoning_config: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Layer the main named provider's ``extra_body`` under an aux request.
+
+    Order: provider ``extra_body`` < task-derived extras < caller extras.
+    Skipped entirely when ``auxiliary.<task>.extra_body`` is set (the task
+    owns its request body) and for MoA slots (per-slot reasoning). The
+    provider's reasoning keys are dropped when the task or caller already
+    chose a reasoning level (``reasoning`` extra or ``reasoning_config``).
+    """
+    base = dict(extra_body or {})
+    if task in _MOA_TASKS:
+        return base
+    if task:
+        own = _get_auxiliary_task_config(task).get("extra_body")
+        if isinstance(own, dict) and own:
+            return base
+    provider_extra = _main_named_provider_extra_body(provider, base_url)
+    if not provider_extra:
+        return base
+    if reasoning_config is not None or any(k in base for k in _PROVIDER_REASONING_KEYS):
+        provider_extra = {
+            k: v for k, v in provider_extra.items() if k not in _PROVIDER_REASONING_KEYS
+        }
+    merged = dict(provider_extra)
+    merged.update(base)
+    return merged
+
+
 def _get_task_extra_body(task: str) -> Dict[str, Any]:
     """Read auxiliary.<task>.extra_body and return a shallow copy when valid.
 
@@ -9430,6 +9535,15 @@ def _call_llm_impl(
                      task, request_provider or "auto", final_model or "default",
                      f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
 
+    # The main named provider's extra_body rides on requests to its own
+    # route (fork). Fallback candidates re-derive it for their destination
+    # from the task-level body, so it never leaks to another provider.
+    task_extra_body = effective_extra_body
+    effective_extra_body = _with_main_provider_extra_body(
+        task_extra_body, task=task, provider=request_provider,
+        base_url=_base_info or resolved_base_url,
+        reasoning_config=reasoning_config)
+
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
@@ -9951,7 +10065,7 @@ def _call_llm_impl(
                     task=task, messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
+                    effective_extra_body=task_extra_body,
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
                     return fb_resp
@@ -9969,7 +10083,7 @@ def _call_llm_impl(
                         task=task, messages=messages,
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
-                        effective_extra_body=effective_extra_body,
+                        effective_extra_body=task_extra_body,
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
@@ -10215,6 +10329,11 @@ async def _async_call_llm_impl(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
+    task_extra_body = effective_extra_body
+    effective_extra_body = _with_main_provider_extra_body(
+        task_extra_body, task=task, provider=request_provider,
+        base_url=_client_base or resolved_base_url,
+        reasoning_config=reasoning_config)
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
@@ -10623,7 +10742,7 @@ async def _async_call_llm_impl(
                     task=task, messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
+                    effective_extra_body=task_extra_body,
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
                     return fb_resp
@@ -10645,7 +10764,7 @@ async def _async_call_llm_impl(
                         task=task, messages=messages,
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
-                        effective_extra_body=effective_extra_body,
+                        effective_extra_body=task_extra_body,
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
