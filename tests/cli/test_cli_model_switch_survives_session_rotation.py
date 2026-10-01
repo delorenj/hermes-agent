@@ -283,3 +283,136 @@ def test_inline_model_command_with_args_is_not_recorded_twice():
     cli._run_inline_model_command(buf, buf.text)
     buf.reset(append_to_history=True)
     assert buf.history.strings == [f"/model {SWITCHED}"]
+
+
+# ── e. /new resets a named custom provider default (fork) ────────────────
+#
+# Live shape (33GOD, 2026-09-30): model.provider is ``automaticai``, a named
+# custom provider (``providers.automaticai``). new_session() called
+# switch_model() without the configured provider maps, so the reset failed
+# "Unknown provider 'automaticai'" and the failure was dropped: after a
+# session-only ``/model automaticai/personal/glm-5.3``, ``/new`` stayed on
+# glm-5.3 and printed nothing. The reset now passes the same maps ``/model``
+# does, and a reset that still fails is logged and printed.
+
+import contextlib
+
+import yaml
+
+GATEWAY = "https://api.example-gateway.test/v1"
+NAMED_DEFAULT = "gw/personal/sol-6.1"
+_ACCEPTED = {"accepted": True, "persist": True, "recognized": True, "message": None}
+
+
+def _named_provider_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    (home / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"provider": "automaticai", "default": NAMED_DEFAULT,
+                  "api_mode": "chat_completions"},
+        "providers": {
+            "automaticai": {
+                "name": "AutomaticAI",
+                "api": GATEWAY,
+                "key_env": "GW_TEST_KEY",
+                "default_model": NAMED_DEFAULT,
+                "api_mode": "chat_completions",
+                "models": [NAMED_DEFAULT, SWITCHED],
+            },
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("GW_TEST_KEY", "gw-test-key-not-a-secret")
+
+
+def _pin_named_default():
+    import cli as cli_mod
+
+    cli_mod.CLI_CONFIG["model"] = {"default": NAMED_DEFAULT, "provider": "automaticai"}
+
+
+@contextlib.contextmanager
+def _offline_switch_model():
+    """Real switch_model(), no catalog/network lookups."""
+    with patch("hermes_cli.model_switch.resolve_alias", return_value=None), \
+         patch("hermes_cli.model_switch.list_provider_models", return_value=[]), \
+         patch("hermes_cli.model_switch.normalize_model_for_provider",
+               side_effect=lambda model, provider: model), \
+         patch("hermes_cli.models.validate_requested_model", return_value=_ACCEPTED), \
+         patch("hermes_cli.models.detect_provider_for_model", return_value=None), \
+         patch("hermes_cli.model_switch.get_model_info", return_value=None), \
+         patch("hermes_cli.model_switch.get_model_capabilities", return_value=None), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+               return_value={"api_key": "***", "base_url": GATEWAY, "api_mode": ""}):
+        yield
+
+
+@pytest.mark.parametrize("current_provider", ["automaticai", "custom"])
+def test_new_resets_a_session_switch_on_a_named_custom_provider(
+    printed, tmp_path, monkeypatch, current_provider,
+):
+    _named_provider_home(tmp_path, monkeypatch)
+    cli = _switched_cli(printed)
+    _pin_named_default()
+    cli.provider = current_provider  # "custom" once a turn ran
+    cli.base_url = GATEWAY
+    cli.api_key = "***"
+
+    with _offline_switch_model():
+        notice = cli.new_session()
+
+    assert cli.model == NAMED_DEFAULT
+    assert cli.provider == "automaticai"
+    assert cli.agent.switch_model.call_args.kwargs["new_model"] == NAMED_DEFAULT
+    assert notice == f"  (model reset to config default: {NAMED_DEFAULT})"
+    assert notice in printed
+
+
+def test_reset_hands_switch_model_the_configured_provider_maps(printed):
+    cli = _switched_cli(printed)
+    ctx = SimpleNamespace(
+        user_providers={"automaticai": {"api": GATEWAY}},
+        custom_providers=[{"name": "AutomaticAI", "provider_key": "automaticai"}],
+    )
+    with patch("hermes_cli.inventory.load_picker_context", return_value=ctx), \
+         patch("hermes_cli.model_switch.switch_model", return_value=_reset_result()) as sm:
+        cli.new_session(silent=True)
+    kwargs = sm.call_args.kwargs
+    assert kwargs["user_providers"] is ctx.user_providers
+    assert kwargs["custom_providers"] is ctx.custom_providers
+
+
+def test_failed_reset_is_logged_and_printed(printed, caplog):
+    cli = _switched_cli(printed)
+    failed = SimpleNamespace(
+        success=False,
+        error_message="Unknown provider 'automaticai'.\n  Check 'hermes model'.",
+    )
+    with patch("hermes_cli.model_switch.switch_model", return_value=failed), \
+         caplog.at_level(logging.WARNING):
+        notice = cli.new_session(silent=True)
+
+    assert cli.model == SWITCHED
+    cli.agent.switch_model.assert_not_called()
+    assert notice and "\n" not in notice
+    assert f"model reset to config default {CONFIG_DEFAULT} failed" in notice
+    assert f"still on {SWITCHED}" in notice
+    assert "Unknown provider 'automaticai'. Check 'hermes model'." in notice
+    assert notice in printed
+    assert any(
+        r.levelno == logging.WARNING and CONFIG_DEFAULT in r.getMessage()
+        and "Unknown provider" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_reset_that_raises_is_logged_and_printed(printed, caplog):
+    cli = _switched_cli(printed)
+    with patch("hermes_cli.model_switch.switch_model", side_effect=RuntimeError("boom")), \
+         caplog.at_level(logging.WARNING):
+        notice = cli.new_session(silent=True)
+
+    assert cli.model == SWITCHED
+    assert notice and "RuntimeError: boom" in notice
+    assert notice in printed
+    assert any(r.levelno == logging.WARNING and "boom" in r.getMessage() for r in caplog.records)

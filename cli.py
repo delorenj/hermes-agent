@@ -4598,6 +4598,24 @@ def _split_model_config_default(raw_default: Any) -> tuple[str, str]:
     return split_model_config_default(raw_default)
 
 
+def _configured_provider_maps() -> tuple[Optional[dict], Optional[list]]:
+    """``(user_providers, custom_providers)`` from config.yaml (fork).
+
+    The same ``load_picker_context()`` maps ``/model`` hands ``switch_model``.
+    Every internal ``switch_model`` call needs them too: a named custom
+    provider (``providers.<slug>``) is otherwise "Unknown provider".
+    ``(None, None)`` when the config cannot be read.
+    """
+    try:
+        from hermes_cli.inventory import load_picker_context
+
+        ctx = load_picker_context()
+        return ctx.user_providers, ctx.custom_providers
+    except Exception:
+        logger.debug("Could not load the configured provider maps", exc_info=True)
+        return None, None
+
+
 class _VoiceInputMessage:
     """Sentinel wrapper for voice-transcribed messages in ``_pending_input``.
 
@@ -9203,6 +9221,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
         return history_snapshot
 
+    def _announce_model_reset_failure(self, config_model: str, error) -> None:
+        """A /new reset that failed keeps the previous model: log and print it.
+
+        Printed even when ``silent`` and kept as the returned notice (so
+        ``/clear`` reprints it): which model answers next must never change,
+        or fail to change, without a word (fork).
+        """
+        detail = " ".join(str(error or "unknown error").split())
+        if len(detail) > 200:
+            detail = detail[:197] + "..."
+        logger.warning(
+            "/new could not reset the model to config default %s; still on %s: %s",
+            config_model, self.model, detail,
+        )
+        self._last_model_reset_notice = (
+            f"  (model reset to config default {config_model} failed; "
+            f"still on {self.model}: {detail})"
+        )
+        _cprint(self._last_model_reset_notice)
+
     def new_session(self, silent=False, title=None, *, reset_model=True):
         """Start a fresh session with a new session ID and cleared agent state.
 
@@ -9303,6 +9341,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             try:
                 from hermes_cli.model_switch import switch_model as _switch_model
 
+                # The configured provider maps, exactly as /model passes them
+                # (fork): without them a named custom provider default
+                # (providers.<slug>) is "Unknown provider" and the reset is a
+                # silent no-op that leaves the session-only /model in place.
+                _user_provs, _custom_provs = _configured_provider_maps()
                 _reset_result = _switch_model(
                     raw_input=_config_model,
                     current_provider=self.provider or "",
@@ -9311,8 +9354,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     current_api_key=self.api_key or "",
                     is_global=False,
                     explicit_provider=_config_provider or "",
+                    user_providers=_user_provs,
+                    custom_providers=_custom_provs,
                 )
-                if _reset_result.success:
+                if not _reset_result.success:
+                    self._announce_model_reset_failure(
+                        _config_model, _reset_result.error_message
+                    )
+                else:
                     if self.agent:
                         self.agent.switch_model(
                             new_model=_reset_result.new_model,
@@ -9339,10 +9388,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         f"{_reset_result.new_model})"
                     )
                     _cprint(self._last_model_reset_notice)
-            except Exception:
+            except Exception as exc:
                 # Best-effort: an unreachable config default must never block
-                # /new. The session keeps the current working model.
+                # /new. The session keeps the current working model, and says so.
                 logger.debug("/new model reset to config default failed", exc_info=True)
+                self._announce_model_reset_failure(_config_model, f"{type(exc).__name__}: {exc}")
         _sync_process_session_id(self.session_id)
 
         if self.agent:
