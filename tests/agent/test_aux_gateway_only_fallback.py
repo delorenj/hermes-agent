@@ -220,3 +220,24 @@ def test_discovery_default_true_keeps_upstream_discovery(gateway_env):
         _client, _m, label = gateway_env.aux._try_payment_fallback(
             "automaticai", "title_generation", reason="connection error")
         assert label  # a discovery-chain provider served
+
+
+def test_runtime_custom_failure_skips_same_gateway_model_only(gateway_env):
+    """Live shape: the failed call ran on runtime provider ``custom`` at the
+    gateway URL. A fallback entry naming the same model on ``automaticai`` (the
+    configured slug for that URL) is the same deployment; other models are not."""
+    _write_config(gateway_env.home, discovery=False)
+    aux = gateway_env.aux
+    cfg = yaml.safe_load((gateway_env.home / "config.yaml").read_text())
+    cfg["fallback_providers"].insert(0, {"provider": "automaticai", "model": MAIN})
+    (gateway_env.home / "config.yaml").write_text(yaml.safe_dump(cfg))
+    aux.set_runtime_main("custom", MAIN, base_url=GATEWAY, api_key="k",
+                         api_mode="chat_completions")
+    try:
+        client, model, label = aux._try_main_fallback_chain(
+            "title_generation", "auto", reason="connection error",
+            failed_model=MAIN, failed_base_url=GATEWAY,
+        )
+    finally:
+        aux.clear_runtime_main()
+    assert model == FB1 and label == "automaticai"

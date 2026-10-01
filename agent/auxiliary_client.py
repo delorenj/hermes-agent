@@ -3935,6 +3935,57 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
 _DISCOVERY_OFF_LOGGED: set = set()
 
 
+def _configured_main_provider() -> str:
+    """``model.provider`` from config.yaml, ignoring the runtime override.
+
+    A named custom provider (``providers.<slug>`` with its own endpoint)
+    resolves to provider ``custom`` at runtime, so ``_read_main_provider()``
+    reports ``custom`` once a turn has run. Code that must find the
+    configured entry behind the live route reads the configured slug here.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        model_cfg = load_config_readonly().get("model", {})
+        if isinstance(model_cfg, dict):
+            provider = model_cfg.get("provider", "")
+            if isinstance(provider, str):
+                return provider.strip().lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _named_provider_entry(slug: str) -> Optional[Dict[str, Any]]:
+    """Compat-view entry for a named custom provider (``providers.<slug>`` or
+    ``custom_providers`` ``name``/``custom:<name>``), or None."""
+    name = (slug or "").strip().lower()
+    if name.startswith("custom:"):
+        name = name[len("custom:"):]
+    if not name or name in {"auto", "custom", "main"}:
+        return None
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+
+        for entry in get_compatible_custom_providers(load_config_readonly()):
+            if not isinstance(entry, dict):
+                continue
+            keys = {
+                str(entry.get("provider_key") or "").strip().lower(),
+                str(entry.get("name") or "").strip().lower(),
+            }
+            if name in keys:
+                return entry
+    except Exception:
+        pass
+    return None
+
+
+def _named_provider_base_url(slug: str) -> str:
+    entry = _named_provider_entry(slug)
+    return str((entry or {}).get("base_url") or "")
+
+
 def _aux_discovery_enabled() -> bool:
     """``auxiliary.discovery`` (fork): may aux walk the discovery chain?
 
@@ -5767,7 +5818,12 @@ def _try_main_fallback_chain(
             fb_ident = BackendIdentity.build(
                 provider=main_norm if fb_norm == "main" else fb_norm,
                 model=fb_model,
-                base_url=str(entry.get("base_url") or ""),
+                # A named custom provider entry carries no base_url of its
+                # own; fill in its configured endpoint so a runtime ``custom``
+                # failure on that endpoint is recognised as the same
+                # deployment.
+                base_url=str(entry.get("base_url") or "")
+                or _named_provider_base_url(fb_norm),
             )
             if should_skip_candidate(fb_ident, failed_ident, FailureScope.MODEL):
                 tried.append(f"{label} (skipped: same deployment as the failed call)")
@@ -6003,7 +6059,8 @@ def _resolve_auto_route(
             return fb_client, fb_model, _fallback_provider_from_label(fb_label)
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable",
-        failed_model=main_model or None)
+        failed_model=main_model or None,
+        failed_base_url=runtime_base_url or None)
     if fb_client is not None:
         return fb_client, fb_model, fb_label
 
@@ -8240,27 +8297,14 @@ def _main_named_provider_extra_body(provider: str, base_url: Optional[str]) -> D
     pinned to the same provider) did not, so helpers ran at the endpoint's
     default effort. The route counts as the main provider when ``provider``
     names it (slug, ``custom:<name>``) or when a ``custom``/``auto`` route
-    reaches the main entry's endpoint.
+    reaches the main entry's endpoint. The main provider is the CONFIGURED
+    one: at runtime a named custom provider reports itself as ``custom``.
     """
     try:
-        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
         from hermes_cli.route_identity import normalize_route_base_url
 
-        main = (_read_main_provider() or "").strip().lower()
-        if not main or main in {"auto", "custom"}:
-            return {}
-        main_name = main[len("custom:"):] if main.startswith("custom:") else main
-        main_entry = None
-        for entry in get_compatible_custom_providers(load_config_readonly()):
-            if not isinstance(entry, dict):
-                continue
-            keys = {
-                str(entry.get("provider_key") or "").strip().lower(),
-                str(entry.get("name") or "").strip().lower(),
-            }
-            if main_name in keys:
-                main_entry = entry
-                break
+        main = _configured_main_provider()
+        main_entry = _named_provider_entry(main)
         if main_entry is None:
             return {}
         extra = main_entry.get("extra_body")

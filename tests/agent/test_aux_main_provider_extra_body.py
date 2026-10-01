@@ -166,3 +166,23 @@ def test_no_provider_extra_body_leaves_request_unchanged(env):
     _write_config(env.home)
     _call(env)
     assert "extra_body" not in env.requests[-1] or not env.requests[-1]["extra_body"].get("reasoning_effort")
+
+
+def test_live_runtime_override_custom_still_finds_main_provider(env):
+    """Live CLI/gateway shape: set_runtime_main() records provider ``custom``
+    (the runtime identity of a named custom provider), so the runtime-aware
+    _read_main_provider() says ``custom``. The configured slug must still be
+    found (first live run showed title_generation at effort_defaulted=true)."""
+    _write_config(env.home, extra_body={"reasoning_effort": "high"})
+    env.aux.set_runtime_main(
+        "custom", MAIN, requested_provider="automaticai", base_url=GATEWAY,
+        api_key="gw-test-key-not-a-secret", api_mode="chat_completions",
+    )
+    try:
+        assert env.aux._read_main_provider() == "custom"
+        _call(env)
+    finally:
+        env.aux.clear_runtime_main()
+    req = env.requests[-1]
+    assert req["base_url"] == GATEWAY
+    assert req["extra_body"]["reasoning_effort"] == "high"
