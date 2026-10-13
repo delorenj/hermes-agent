@@ -1986,10 +1986,21 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         if not agent.quiet_mode:
             _ra().logger.info("Using context engine: %s", _selected_engine.name)
     else:
+        # Read the aux compression model from config (auxiliary.compression.model).
+        # When set, the compressor uses this model instead of the main model for
+        # summarisation — keeps the main context free and lets the operator pin
+        # a cheap/fast model for compression.
+        _aux_compression_model = None
+        try:
+            _aux_comp = cfg_get(_agent_cfg, "auxiliary", "compression", default={})
+            if isinstance(_aux_comp, dict):
+                _aux_compression_model = _aux_comp.get("model") or None
+        except Exception:
+            pass
         agent.context_compressor = ContextCompressor(
             model=agent.model, threshold_percent=cs.threshold, protect_first_n=cs.protect_first,
             protect_last_n=cs.protect_last, summary_target_ratio=cs.target_ratio,
-            summary_model_override=None, quiet_mode=agent.quiet_mode, base_url=agent.base_url,
+            summary_model_override=_aux_compression_model, quiet_mode=agent.quiet_mode, base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""), config_context_length=_effective_context_length,
             provider=agent.provider, api_mode=agent.api_mode,
             abort_on_summary_failure=cs.abort_on_summary_failure,
