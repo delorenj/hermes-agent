@@ -813,6 +813,9 @@ def _collect_pre_llm_call_context(
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            # Session cwd for hook payload attribution (agent-known value wins; the shell-hook
+            # bridge resolves per-session state when this is None).
+            cwd=getattr(agent, "session_cwd", None),
         )
         try:
             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent

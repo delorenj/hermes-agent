@@ -46,7 +46,7 @@ _TOOL_EVENTS = frozenset({"pre_tool_call", "post_tool_call"})
 _STDERR_MESSAGE_LIMIT = 400
 _TRUTHY = {"1", "true", "yes", "on"}
 # kwargs promoted to top-level payload keys; everything else lands under ``extra``.
-_TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
+_TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id", "cwd"}
 
 # (home, event, matcher, command) wired in this process: matcher in the key (one script may register
 # per-tool under one event), home so multiplexed-gateway profiles can register identical triples.
@@ -76,17 +76,79 @@ def _utc_now_iso() -> str:
     return datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
 
 
-def _payload_fields(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Common stdin/POST payload fields (shared with outbound webhooks); key order is wire order."""
+def _resolve_session_cwd(*session_keys: str, platform: str = "") -> str:
+    """TRUE per-session terminal cwd, never the bare process cwd.
+
+    Mirrors ``agent/relay_cwd.py``'s contract: scoped session override → session/task cwd
+    records → profile-scoped ``TERMINAL_CWD``. The host cwd (``resolve_agent_cwd()``) is
+    consulted ONLY for a CLI-platform session on the local backend — there one process is
+    one session and the launch dir is genuinely the agent's working directory; everywhere
+    else (gateway multiplexing, remote/container backends) a host-process cwd would
+    mis-attribute the hook's project, so unknown stays ``""``. Remote/container values are
+    returned as declared, never host-resolved.
+    """
     try:
-        cwd = str(Path.cwd())
-    except OSError:
+        from agent.runtime_cwd import scoped_session_cwd
+        scoped = str(scoped_session_cwd() or "").strip()
+    except Exception:
+        logger.debug("Unable to read the scoped hook session cwd", exc_info=True)
+        scoped = ""
+    if scoped:
+        return scoped
+    # Session/task cwd records (the terminal tool keys them by task/session key; qualified
+    # per routed profile inside get_session_cwd).
+    try:
+        from tools.terminal_tool import get_session_cwd
+        for key in dict.fromkeys(key for key in session_keys if key):
+            recorded = get_session_cwd(key)
+            if isinstance(recorded, str) and recorded.strip():
+                return recorded.strip()
+    except Exception:
+        logger.debug("Unable to read the recorded hook session cwd", exc_info=True)
+    backend = ""
+    try:
+        from tools.terminal_scope import terminal_env
+        backend = terminal_env("TERMINAL_ENV", "local").strip().lower()
+        configured = str(terminal_env("TERMINAL_CWD", "") or "").strip()
+    except Exception:
+        logger.debug("Unable to read the configured hook session cwd", exc_info=True)
+        configured = ""
+    if configured:
+        return configured
+    if platform in {"", "cli"} and backend in {"", "local"}:
+        try:
+            from agent.runtime_cwd import resolve_agent_cwd
+            resolved = resolve_agent_cwd()
+            return str(resolved if resolved.is_absolute() else resolved.resolve())
+        except Exception:
+            logger.debug("Unable to resolve the local hook session cwd", exc_info=True)
+    return ""
+
+
+def _payload_fields(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Common stdin/POST payload fields (shared with outbound webhooks); key order is wire order.
+
+    ``cwd`` is the session's logical working directory: an explicit ``cwd`` kwarg wins (the
+    caller knows its session), then the per-session resolution — never ``Path.cwd()`` (the
+    PROCESS cwd), which under a multiplexed gateway names whatever directory the launcher
+    happened to start in, mis-attributing the hook's project to every profile it serves.
+    """
+    session_id = kwargs.get("session_id") or kwargs.get("parent_session_id") or ""
+    explicit = kwargs.get("cwd")
+    if isinstance(explicit, str) and explicit.strip():
+        cwd = explicit.strip()
+    elif explicit is None:
+        cwd = _resolve_session_cwd(
+            str(session_id or ""), str(kwargs.get("task_id") or ""),
+            platform=str(kwargs.get("platform") or ""),
+        )
+    else:
         cwd = ""
     from hermes_cli.profiles import get_active_profile_name
     return {
         "tool_name": kwargs.get("tool_name"),
         "tool_input": kwargs.get("args") if isinstance(kwargs.get("args"), dict) else None,
-        "session_id": kwargs.get("session_id") or kwargs.get("parent_session_id") or "",
+        "session_id": session_id,
         "cwd": cwd,
         # Resolved at fire time: a multiplexed gateway's hook script must know which profile fired it.
         "profile": get_active_profile_name(),

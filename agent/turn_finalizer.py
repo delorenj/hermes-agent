@@ -804,6 +804,12 @@ def finalize_turn(
             turn_exit_reason=_turn_exit_reason,
             model=agent.model,
             platform=_platform,
+            # The finalized reply (same text post_llm_call delivered as assistant_response),
+            # NOT the transcript: hooks get the one message a completion signal needs.
+            final_response=final_response,
+            # Session cwd for hook payload attribution (agent-known value wins; the shell-hook
+            # bridge resolves per-session state when this is None).
+            cwd=getattr(agent, "session_cwd", None),
         )
 
     agent._turn_preflight_display_snapshot = None

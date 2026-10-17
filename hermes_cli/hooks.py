@@ -128,6 +128,7 @@ _DEFAULT_PAYLOADS = {
         "session_id": "test-session", "task_id": "test-task", "turn_id": "test-turn",
         "completed": True, "failed": False, "interrupted": False,
         "turn_exit_reason": "text_response(stop)", "model": "gpt-4", "platform": "cli",
+        "final_response": "All done — the change is applied.",
     },
     "on_session_finalize": {"session_id": "test-session"},
     "on_session_reset": {"session_id": "test-session"},
