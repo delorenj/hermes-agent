@@ -674,6 +674,135 @@ class TestFailSemanticsEndToEnd:
         assert "failed closed" in result["parsed"]["message"]
 
 
+# ── session-scoped payload cwd ─────────────────────────────────────────────
+
+
+class TestSessionCwdPayload:
+    """``cwd`` in the stdin/POST payload must be the SESSION's working directory.
+
+    ``_payload_fields`` used ``Path.cwd()`` — the Hermes process's directory — so under a
+    multiplexed gateway every profile's hooks were attributed to wherever the launcher
+    started, and a session that had ``cd``-ed elsewhere reported the stale launch dir.
+    """
+
+    def test_two_sessions_get_their_own_cwd_not_the_process_cwd(self, tmp_path, monkeypatch):
+        from tools.terminal_tool import clear_session_cwd, record_session_cwd
+
+        proc, proj_a, proj_b = tmp_path / "proc", tmp_path / "projA", tmp_path / "projB"
+        for d in (proc, proj_a, proj_b):
+            d.mkdir()
+        monkeypatch.chdir(proc)
+        record_session_cwd("sess-A", str(proj_a))
+        record_session_cwd("sess-B", str(proj_b))
+        try:
+            payload_a = shell_hooks._payload_fields({"session_id": "sess-A"})
+            payload_b = shell_hooks._payload_fields({"session_id": "sess-B"})
+        finally:
+            clear_session_cwd("sess-A")
+            clear_session_cwd("sess-B")
+        assert payload_a["cwd"] == str(proj_a)
+        assert payload_b["cwd"] == str(proj_b)
+        assert str(proc) not in (payload_a["cwd"], payload_b["cwd"])
+
+    def test_scoped_session_cwd_wins_and_remote_paths_stay_declared(self, monkeypatch):
+        from agent import runtime_cwd
+
+        monkeypatch.setattr("tools.terminal_tool.get_session_cwd", lambda _key: "/recorded/host/path")
+        token = runtime_cwd.set_session_cwd("/remote/container/project")
+        try:
+            payload = shell_hooks._payload_fields({"session_id": "s", "platform": "gateway"})
+            assert payload["cwd"] == "/remote/container/project"
+        finally:
+            runtime_cwd.reset_session_cwd(token)
+
+    def test_explicit_cwd_kwarg_wins_and_is_not_duplicated_in_extra(self):
+        payload = shell_hooks._payload_fields({"session_id": "s", "cwd": "/declared/workspace"})
+        assert payload["cwd"] == "/declared/workspace"
+        assert "cwd" not in payload["extra"]
+
+    def test_unknown_gateway_session_is_unattributed_not_process_cwd(self, tmp_path, monkeypatch):
+        """No session state + a non-CLI platform → ``cwd`` must be empty, never the
+        host process directory (false project attribution for remote/container sessions)."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("tools.terminal_tool.get_session_cwd", lambda _key: None)
+        monkeypatch.setattr(
+            "tools.terminal_scope.terminal_env",
+            lambda name, default: ("local" if name == "TERMINAL_ENV" else default),
+        )
+        payload = shell_hooks._payload_fields({"session_id": "s", "platform": "telegram"})
+        assert payload["cwd"] == ""
+
+    def test_local_cli_session_falls_back_to_agent_launch_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("tools.terminal_tool.get_session_cwd", lambda _key: None)
+        monkeypatch.setattr(
+            "tools.terminal_scope.terminal_env",
+            lambda name, default: ("local" if name == "TERMINAL_ENV" else default),
+        )
+        payload = shell_hooks._payload_fields({"session_id": "s", "platform": "cli"})
+        assert str(Path(payload["cwd"]).resolve()) == str(Path(tmp_path).resolve())
+
+    def test_payload_key_set_is_unchanged(self):
+        payload = shell_hooks._payload_fields({"session_id": "s"})
+        assert set(payload.keys()) == {
+            "tool_name", "tool_input", "session_id", "cwd", "profile", "extra",
+        }
+
+    @pytest.mark.platforms("linux")
+    def test_on_session_end_stdin_carries_final_response_and_session_cwd(self, tmp_path):
+        """End to end through the real subprocess: the native stdin JSON an
+        ``on_session_end`` script receives has the finalized reply (in ``extra``)
+        and the session's own cwd, not the process cwd."""
+        capture = tmp_path / "payload.json"
+        script = _write_script(
+            tmp_path, "capture.sh",
+            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+        )
+        spec = shell_hooks.ShellHookSpec(event="on_session_end", command=str(script))
+        cb = shell_hooks._make_callback(spec)
+        cb(
+            session_id="sess-w", task_id="task-w", turn_id="turn-w",
+            completed=True, failed=False, interrupted=False,
+            turn_exit_reason="text_response(stop)", model="m", platform="cli",
+            final_response="Shipped the report to artifacts/",
+            cwd="/home/user/project",
+        )
+        payload = json.loads(capture.read_text())
+        assert payload["hook_event_name"] == "on_session_end"
+        assert payload["session_id"] == "sess-w"
+        assert payload["cwd"] == "/home/user/project"
+        assert payload["extra"]["final_response"] == "Shipped the report to artifacts/"
+        assert payload["extra"]["turn_exit_reason"] == "text_response(stop)"
+
+    @pytest.mark.platforms("linux")
+    def test_two_sessions_stdin_cwds_through_one_process(self, tmp_path, monkeypatch):
+        """Two independent sessions firing hooks from the same process each see
+        their own recorded cwd on stdin."""
+        from tools.terminal_tool import clear_session_cwd, record_session_cwd
+
+        proj_a, proj_b = tmp_path / "projA", tmp_path / "projB"
+        proj_a.mkdir(); proj_b.mkdir()
+        monkeypatch.chdir(tmp_path)
+        record_session_cwd("sess-A", str(proj_a))
+        record_session_cwd("sess-B", str(proj_b))
+        capture = tmp_path / "payloads.log"
+        script = _write_script(
+            tmp_path, "log.sh",
+            f"#!/usr/bin/env bash\ncat - >> {capture}\nprintf '\\n' >> {capture}\nprintf '{{}}\\n'\n",
+        )
+        spec = shell_hooks.ShellHookSpec(event="on_session_end", command=str(script))
+        cb = shell_hooks._make_callback(spec)
+        try:
+            cb(session_id="sess-A", platform="gateway")
+            cb(session_id="sess-B", platform="gateway")
+        finally:
+            clear_session_cwd("sess-A")
+            clear_session_cwd("sess-B")
+        first, second = (json.loads(line) for line in capture.read_text().splitlines())
+        assert first["cwd"] == str(proj_a)
+        assert second["cwd"] == str(proj_b)
+
+
 # ── multiplexed profiles ──────────────────────────────────────────────────
 
 
