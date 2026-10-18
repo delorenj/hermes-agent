@@ -32,6 +32,31 @@ class FailureScope(Enum):
     ENDPOINT = "endpoint"
 
 
+#: Reason strings used by auxiliary_client's recovery ladder, mapped to scopes. Unknown reasons default to
+#: MODEL -- the least-invalidating scope -- so an unrecognized failure never over-skips viable candidates.
+_REASON_SCOPES = {
+    "auth error": FailureScope.CREDENTIAL,
+    "payment error": FailureScope.CREDENTIAL,
+    "rate limit": FailureScope.MODEL,
+    "model incompatible with route": FailureScope.MODEL,
+    "invalid provider response": FailureScope.MODEL,
+    "connection error": FailureScope.MODEL,
+    "request timed out": FailureScope.MODEL,
+    # Fork: a gateway 503 "no available channel for model X" -- that model's route has no live
+    # upstream; sibling models on the gateway are fine.
+    "model unavailable": FailureScope.MODEL,
+    # Fork: a 403 usage cap / quota window / scope miss (or a 429 quota) on ONE route. On a gateway
+    # every model is its own upstream account, so the gateway key that reached it is fine (a dead key
+    # is a 401).
+    "route limit": FailureScope.MODEL,
+}
+
+
+def classify_failure_scope(reason: Optional[str]) -> FailureScope:
+    """Map a human-readable failure reason to the identity axis it invalidates."""
+    return _REASON_SCOPES.get((reason or "").strip().lower(), FailureScope.MODEL)
+
+
 def _norm(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 

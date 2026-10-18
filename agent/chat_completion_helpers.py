@@ -1985,7 +1985,18 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
-    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
+    # Fork: a named custom provider entry (``providers.<slug>``) carries no base_url of its own. Take its
+    # configured endpoint so a current route that reports runtime ``custom`` at that URL is recognised as
+    # the same deployment; otherwise a capped gateway model is re-sent once under the slug before the
+    # chain moves on.
+    fb_base_url = (fb.get("base_url") or "").strip()
+    if not fb_base_url:
+        try:
+            from agent.auxiliary_client import _named_provider_base_url
+            fb_base_url = _named_provider_base_url(fb_provider)
+        except Exception:
+            fb_base_url = ""
+    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=fb_base_url)
     if should_skip_candidate(fb_ident, current_ident):
         logger.warning(
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
