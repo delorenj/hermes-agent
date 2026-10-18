@@ -70,6 +70,10 @@ def _manifest_file() -> Path:
 # Written by `hermes profile create --no-skills` / installer `--no-skills`: sync seeds only
 # essential skills. Mirrors hermes_cli.profiles.NO_BUNDLED_SKILLS_MARKER (no CLI import here).
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+# Written by Skillex on a strict (Skillex-only) profile: Skillex owns every entry under skills/
+# and refuses anything it did not project, so sync must not seed even the essential skills or
+# their category DESCRIPTION.md files there.
+SKILLEX_ONLY_MARKER = ".skillex-only"
 
 
 def _get_bundled_dir() -> Path:  # HERMES_BUNDLED_SKILLS env first, then repo-relative
@@ -397,6 +401,10 @@ def sync_skills(quiet: bool = False) -> dict:
     """Sync bundled skills into ~/.hermes/skills/ using the manifest; returns the per-category
     result dict. Opted-out profiles seed ONLY ESSENTIAL_SKILLS (the system prompt always
     points at ``hermes-agent``)."""
+    if (_hermes_home() / SKILLEX_ONLY_MARKER).is_file():
+        return {"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
+                "suppressed": [], "total_bundled": 0, "optional_provenance_backfilled": [],
+                "skipped_skillex_only": True}
     essential_only = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
     if essential_only and not quiet:
         print("  (profile opted out of bundled skills via .no-bundled-skills — seeding essential skills only)")
