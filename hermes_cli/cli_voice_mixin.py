@@ -704,7 +704,9 @@ class CLIVoiceMixin:
 
         if getattr(self, "_wake_start_new_session", True):
             try:
-                self.new_session(silent=True)
+                # reset_model=False: a wake trigger (often a false positive) rotates the conversation but
+                # must never discard the model the user picked with /model.
+                self.new_session(silent=True, reset_model=False)
             except Exception as e:
                 logger.debug("wake word new_session failed: %s", e)
 
