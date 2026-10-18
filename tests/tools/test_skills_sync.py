@@ -433,6 +433,26 @@ class TestSyncSkills:
         assert "new-skill" in result["copied"]
         assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
 
+    def test_skillex_only_profile_seeds_nothing(self, tmp_path):
+        """A Skillex-only profile owns its whole skills root: no bundled skill (not even an
+        essential one), category description or manifest may be written into it."""
+        bundled = self._setup_bundled(tmp_path)
+        home = tmp_path / "profile"
+        skills_dir = home / "skills"
+        skills_dir.mkdir(parents=True)
+        (home / ".skillex-only").write_text("")
+        (home / ".no-bundled-skills").write_text("")
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file), \
+                patch("tools.skills_sync._hermes_home", return_value=home), \
+                patch("tools.skills_sync.ESSENTIAL_SKILLS", frozenset({"new-skill"})):
+            result = sync_skills(quiet=True)
+
+        assert result["skipped_skillex_only"] is True
+        assert result["copied"] == []
+        assert list(skills_dir.iterdir()) == []
+
     def test_fresh_install_copies_all_and_records_origin_hashes(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)
         skills_dir = tmp_path / "user_skills"
