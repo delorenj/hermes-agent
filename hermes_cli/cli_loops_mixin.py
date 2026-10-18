@@ -100,12 +100,14 @@ class CLILoopsMixin:
             cmd_original=cmd_original,
         ) is None:
             return True  # confirmation cancelled — command handled, keep REPL alive
-        self.new_session(silent=True)
+        _model_reset_notice = self.new_session(silent=True)
         _clear_output_history()
         if not self._app:
             self.console.clear()
             self.show_banner()
             print(_fresh_start())
+            if _model_reset_notice:
+                print(_model_reset_notice)  # printed during new_session() but wiped by the clear above
             self._print_random_tip()
             return
         # Inside the TUI, Rich's console.clear() and self.console both go through
@@ -132,6 +134,8 @@ class CLILoopsMixin:
                 context_length=ctx_len, provider=self.provider,
                 context_pinned=is_context_pinned(ctx_len, getattr(agent, "_config_context_length", None)))
         _cprint(_fresh_start())
+        if _model_reset_notice:
+            _cprint(_model_reset_notice)  # printed during new_session() but wiped by the clear above
         self._print_random_tip()
 
     def _cmd_title(self, cmd_original: str):

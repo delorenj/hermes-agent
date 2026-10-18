@@ -1487,7 +1487,7 @@ class CLITuiMixin:
         submitted text (looking unsent, inviting a re-submit) until some unrelated redraw.
         """
         if self._should_handle_model_command_inline(text, has_images=has_images):
-            if not self.process_command(text):
+            if not self._run_inline_model_command(event.app.current_buffer, text):
                 self._should_exit = True
                 if event.app.is_running:
                     event.app.exit()

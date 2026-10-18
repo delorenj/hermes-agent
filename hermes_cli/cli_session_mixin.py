@@ -59,6 +59,36 @@ def _dim_notice(cli, msg: str, quiet: bool) -> None:
         cli._console_print(f"[dim]{_escape(msg)}[/dim]")
 
 
+def _configured_provider_maps():
+    """``(user_providers, custom_providers)`` from config.yaml (fork): the same ``load_picker_context()`` maps
+    ``/model`` hands ``switch_model``. Every internal ``switch_model`` call needs them too -- a named custom
+    provider (``providers.<slug>``) is otherwise "Unknown provider". ``(None, None)`` when unreadable."""
+    try:
+        from hermes_cli.inventory import load_picker_context
+
+        ctx = load_picker_context()
+        return ctx.user_providers, ctx.custom_providers
+    except Exception:
+        import logging
+        logging.getLogger(__name__).debug("Could not load the configured provider maps", exc_info=True)
+        return None, None
+
+
+def _announce_model_reset_failure(cli, config_model: str, error) -> None:
+    """A /new reset that failed keeps the previous model: log and print it (even when ``silent`` -- which
+    model answers next must never change, or fail to change, without a word). Kept as the returned notice so
+    ``/clear`` can reprint it after the screen wipe."""
+    from cli import _cprint, logger
+    detail = " ".join(str(error or "unknown error").split())
+    if len(detail) > 200:
+        detail = detail[:197] + "..."
+    logger.warning("/new could not reset the model to config default %s; still on %s: %s",
+                   config_model, getattr(cli, "model", ""), detail)
+    cli._last_model_reset_notice = (
+        f"  (model reset to config default {config_model} failed; still on {getattr(cli, 'model', '')}: {detail})")
+    _cprint(cli._last_model_reset_notice)
+
+
 def _reset_model_to_config_default(cli, silent: bool) -> None:
     """/new is a full boundary: re-derive model/provider from config.yaml so a
     session-only ``/model --session`` switch never leaks into the next session.
@@ -77,6 +107,9 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
     try:
         from hermes_cli.model_switch import switch_model as _switch_model
 
+        # The configured provider maps, exactly as /model passes them: without them a named custom
+        # provider default (providers.<slug>) is "Unknown provider" and the reset silently no-ops.
+        _user_provs, _custom_provs = _configured_provider_maps()
         r = _switch_model(
             raw_input=_config_model,
             current_provider=cli.provider or "",
@@ -84,8 +117,11 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
             current_base_url=cli.base_url or "",
             current_api_key=cli.api_key or "",
             is_global=False,
-            explicit_provider=_config_provider or "")
+            explicit_provider=_config_provider or "",
+            user_providers=_user_provs,
+            custom_providers=_custom_provs)
         if not r.success:
+            _announce_model_reset_failure(cli, _config_model, r.error_message)
             return
         if cli.agent:
             cli.agent.switch_model(
@@ -103,10 +139,13 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
             cli.base_url = r.base_url
         if r.api_mode:
             cli.api_mode = r.api_mode
-        if not silent:
-            _cprint(f"  {t('cli.session.model_reset_default', model=r.new_model)}")
-    except Exception:
+        # Always announce: ``silent`` suppresses the session banner, never a change to which model
+        # answers next (a silent change is how a /model switch vanished under a false wake trigger).
+        cli._last_model_reset_notice = f"  {t('cli.session.model_reset_default', model=r.new_model)}"
+        _cprint(cli._last_model_reset_notice)
+    except Exception as exc:
         logger.debug("/new model reset to config default failed", exc_info=True)
+        _announce_model_reset_failure(cli, _config_model, f"{type(exc).__name__}: {exc}")
 
 
 def _apply_new_session_title(cli, title: str) -> Optional[str]:
@@ -484,13 +523,21 @@ class CLISessionMixin:
             return None
         return history_snapshot
 
-    def new_session(self, silent=False, title=None):
-        """Start a fresh session with a new session ID and cleared agent state."""
+    def new_session(self, silent=False, title=None, *, reset_model=True):
+        """Start a fresh session with a new session ID and cleared agent state.
+
+        ``reset_model`` (keyword-only, default True) re-derives model/provider from config.yaml, which is
+        what ``/new`` and ``/clear`` mean. Callers that rotate the session without the user asking for a
+        model reset (the wake word) pass ``reset_model=False`` so the running model survives. A reset that
+        changes the model is always announced, even when ``silent``.
+
+        Returns the model-reset notice that was printed, or None."""
         from cli import (
             CLI_CONFIG, _parse_service_tier_config,
             _sync_process_session_id, datetime)
         from hermes_cli.cli_model_switch_mixin import _resolve_cli_reasoning
         old_session_id = self.session_id
+        self._last_model_reset_notice = None
         _boundary_snapshot = None
         if self.agent:
             if self.conversation_history:
@@ -524,14 +571,25 @@ class CLISessionMixin:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
-        # An explicit -m/--model was for the previous session only.
-        self._explicit_model_override = False
+        # An explicit -m/--model was for the previous session only (a rotation that keeps the model keeps
+        # the flag too).
+        if reset_model:
+            self._explicit_model_override = False
         # Session-scoped overrides (/model --session, /fast, one-turn restores) don't carry over.
         # Re-derive model/provider and service tier from config.yaml so a session-only switch never leaks
         # into the next session (#48055, #23131).
-        self._pending_one_turn_model_restore = None
+        #
+        # Queued one-shot notes belong to the conversation being closed: a "[Note: model was just switched
+        # ... to X]" that survives into the next session is prepended to a turn that may no longer run on X.
+        self._pending_model_switch_note = None
+        self._pending_model_switch_target = None
+        self._pending_skills_reload_note = None
+        if reset_model:
+            # A one-turn override is only discarded together with the model it would restore.
+            self._pending_one_turn_model_restore = None
         self.service_tier = _parse_service_tier_config(CLI_CONFIG["agent"].get("service_tier", ""))
-        _reset_model_to_config_default(self, silent)
+        if reset_model:
+            _reset_model_to_config_default(self, silent)
         # After the model reset: the effort belongs to the model the fresh session lands on (a /reasoning
         # session override is dropped, the default model's per-model override is kept).
         _resolve_cli_reasoning(self)
@@ -585,6 +643,36 @@ class CLISessionMixin:
                 print(t("cli.session.new_session_titled", title=title))
             else:
                 print(t("cli.session.new_session"))
+        return self._last_model_reset_notice
+
+    def _take_pending_model_switch_note(self) -> Optional[str]:
+        """Pop the queued /model note, returning it only if it is still true.
+
+        The note names the switch target. If the agent about to run this turn is on a different model (the
+        switch was undone between the /model and this turn -- a /new, /clear or a failed rebuild), prepending
+        it would tell the model it is something it is not. Drop it and log a WARNING so the lost switch is
+        visible. Notes queued without a target (older callers, tests) are passed on."""
+        from cli import logger
+        note = getattr(self, "_pending_model_switch_note", None)
+        target = getattr(self, "_pending_model_switch_target", None)
+        self._pending_model_switch_note = None
+        self._pending_model_switch_target = None
+        if not note:
+            return None
+        agent = getattr(self, "agent", None)
+        live = getattr(agent, "model", None) if agent is not None else None
+        if not target or not isinstance(live, str) or not live or live == target:
+            return note
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+
+            if normalize_model_for_provider(target, getattr(agent, "provider", "") or "") == live:
+                return note
+        except Exception:
+            pass
+        logger.warning("/model switch to %s did not survive to this turn (agent is on %s); "
+                       "dropping the stale switch note", target, live)
+        return None
 
     def _consume_pending_resume_selection(self, text: str) -> bool:
         """Resolve a bare numeric reply following a bare ``/resume`` prompt.

@@ -131,6 +131,8 @@ def _print_switch_summary(cli, result, old_model, *, one_turn: bool, strict_cont
         f"via {result.provider_label or result.target_provider}. "
         f"{'This override applies to the next turn only. ' if one_turn else ''}"
         f"Adjust your self-identification accordingly.]")
+    # The note is only true while the agent still runs this model; the chat turn checks before prepending it.
+    cli._pending_model_switch_target = result.new_model
     _cprint(f"  {t('cli.model.switched', model=_display_new)}")
     _cprint(f"    {t('gateway.model.provider_label', provider=result.provider_label or result.target_provider)}")
     if result.target_provider == "moa":
@@ -916,6 +918,20 @@ class CLIModelSwitchMixin:
             _cprint(f"  {prefix} {line}" if line.startswith("openai_runtime") else f"    {line}")
         if result.success and result.requires_new_session:
             _cprint(f"    {t('cli.model.tip_reset_new_session')}")
+
+    def _run_inline_model_command(self, buffer, text: str) -> bool:
+        """Dispatch an inline ``/model`` submission, recording it in prompt history first.
+
+        A bare ``/model`` opens the picker, which snapshots and clears the input buffer
+        (``_capture_modal_input_snapshot``), so the post-dispatch ``reset(append_to_history=True)`` found an
+        empty buffer and the command never reached ``.hermes_history``. Append before dispatch;
+        prompt_toolkit skips a repeat of the last entry, so the later reset cannot double it."""
+        from cli import logger
+        try:
+            buffer.append_to_history()
+        except Exception:
+            logger.debug("could not record /model in prompt history", exc_info=True)
+        return self.process_command(text)
 
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""

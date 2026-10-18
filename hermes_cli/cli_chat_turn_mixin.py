@@ -347,7 +347,10 @@ class CLIChatTurnMixin:
         # One-shot /model and /reload-skills notes; _prepend_note_to_message also handles
         # multimodal content-part lists (string concat raised TypeError with an image).
         for _note_attr in ("_pending_model_switch_note", "_pending_skills_reload_note"):
-            _note = getattr(self, _note_attr, None)
+            if _note_attr == "_pending_model_switch_note":
+                _note = self._take_pending_model_switch_note()  # dropped when the switch did not survive
+            else:
+                _note = getattr(self, _note_attr, None)
             if _note:
                 agent_message = _prepend_note_to_message(agent_message, _note)
                 setattr(self, _note_attr, None)
