@@ -50,6 +50,10 @@ _CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = {
     "invalid provider response": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "provider overloaded": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "server error": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+    # Fork: one gateway route closed (model-scoped hold). A no-channel 503 clears like any transient blip;
+    # a usage window / quota / budget outlasts a minute, so the route is not re-tried on every aux call.
+    "model unavailable": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+    "route limit": 600.0,
 }
 
 

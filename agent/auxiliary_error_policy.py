@@ -16,6 +16,14 @@ from agent.error_classifier import (
 _R = FailoverReason
 AUTH_ERROR, PAYMENT_ERROR, MODEL_INCOMPATIBLE = "auth error", "payment error", "model incompatible with route"
 MODEL_NOT_FOUND = "model not found"
+# Fork: ONE deployment on a healthy gateway is closed (a 403 usage cap / scope miss, a 429 quota, a 503 "no
+# available channel for model X"); the gateway key and its sibling models are fine, so these are model-scoped
+# capacity failures, never payment errors (which bench the whole gateway). Set by auxiliary_client's
+# ``_gateway_route_verdict`` in ``error_context[ROUTE_SCOPE_KEY]``.
+ROUTE_LIMIT, MODEL_UNAVAILABLE = "route limit", "model unavailable"
+ROUTE_SCOPE_KEY = "route_scope_label"
+#: Labels whose quarantine marks only the failed model, not its provider.
+MODEL_SCOPED_LABELS = frozenset({MODEL_NOT_FOUND, MODEL_INCOMPATIBLE, ROUTE_LIMIT, MODEL_UNAVAILABLE})
 # The request's own shape failed: another provider only helps once a parameter rung changed the request.
 _REQUEST_SHAPE = frozenset({
     _R.format_error, _R.role_alternation, _R.multimodal_tool_content_unsupported, _R.reasoning_mandatory,
@@ -75,6 +83,8 @@ def resend_cannot_help(verdict: ClassifiedError) -> bool:
 
 
 def benches_provider(verdict: ClassifiedError) -> bool:
+    if verdict.error_context.get(ROUTE_SCOPE_KEY):  # fork: one route is closed, not the gateway
+        return False
     return verdict.reason is _R.billing or bool(verdict.error_context.get("quota_exhausted"))
 
 
@@ -86,6 +96,8 @@ def fallback_label(failure: Failure, *, rung_spent: bool = False) -> Optional[st
     structured = "structured provider error" if context.get("statusless_structured") else None
     if context.get("hook_declines_fallback"):
         return None
+    if context.get(ROUTE_SCOPE_KEY):
+        return context[ROUTE_SCOPE_KEY]
     if benches_provider(verdict):
         return PAYMENT_ERROR
     if reason is _R.timeout:

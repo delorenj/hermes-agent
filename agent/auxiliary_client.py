@@ -10,6 +10,7 @@ in neither chain (undocumented, shifting allow-list): main provider or explicit
 
 import contextlib
 import contextvars
+import dataclasses
 import functools
 import hashlib
 import inspect
@@ -28,6 +29,7 @@ from agent.local_prompt_progress import (
     PromptReadingClock, current_prompt_reading_hook, prompt_progress, prompt_reading_hook, with_prompt_progress)
 from agent import auxiliary_call_outcome, auxiliary_error_policy as aux_errors
 from agent.error_classifier import (
+    POLICY_REFUSAL_REASONS,
     FailoverReason,
     UNSUPPORTED_PARAM_MARKERS,
     is_reasoning_field_rejection,
@@ -3197,6 +3199,199 @@ def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(kw in text for kw in needles)
 
 
+# ── Route limits (fork) ──────────────────────────────────────────────────
+# A gateway (NewAPI & co.) puts many models behind ONE key, and each model is its own upstream
+# account: a 403 "weekly (7-day) usage limit" (Kimi Coding relayed), a 403 "This token has no
+# access to model X", a 429 insufficient_quota / "Workspace daily budget exceeded" or a 503 "No
+# available channel for model X" closes ONE route. The gateway key and its sibling models are fine,
+# so these are MODEL-scoped capacity failures -- never credential-scoped payment errors (which skip
+# every sibling and bench the whole gateway).
+
+def _configured_main_provider() -> str:
+    """``model.provider`` from config.yaml, ignoring the runtime override.
+
+    A named custom provider (``providers.<slug>`` with its own endpoint) reports itself as ``custom``
+    once a turn ran, so ``_read_main_provider()`` answers ``custom``. Code that must find the
+    configured entry behind the live route reads the configured slug here."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        model_cfg = load_config_readonly().get("model", {})
+        if isinstance(model_cfg, dict):
+            provider = model_cfg.get("provider", "")
+            if isinstance(provider, str):
+                return provider.strip().lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _named_provider_entry(slug: str) -> Optional[Dict[str, Any]]:
+    """Compat-view entry for a named custom provider (``providers.<slug>`` or ``custom_providers``
+    ``name`` / ``custom:<name>``), or None."""
+    name = (slug or "").strip().lower()
+    if name.startswith("custom:"):
+        name = name[len("custom:"):]
+    if not name or name in {"auto", "custom", "main"}:
+        return None
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+
+        for entry in get_compatible_custom_providers(load_config_readonly()):
+            if not isinstance(entry, dict):
+                continue
+            keys = {
+                str(entry.get("provider_key") or "").strip().lower(),
+                str(entry.get("name") or "").strip().lower(),
+            }
+            if name in keys:
+                return entry
+    except Exception:
+        pass
+    return None
+
+
+def _named_provider_base_url(slug: str) -> str:
+    return str((_named_provider_entry(slug) or {}).get("base_url") or "")
+
+
+def _named_route_labels(provider: str, base_url: Optional[str] = None) -> set:
+    """Every label that names the configured provider entry behind a route.
+
+    ``provider`` is a slug, ``custom:<name>``, or the runtime ``custom`` a named custom provider
+    reports once a turn ran; the latter maps back to the configured main provider when ``base_url`` is
+    that entry's endpoint. Returns the entry's slug/name and their ``custom:`` forms, or an empty set
+    when no configured entry is behind the route."""
+    label = (provider or "").strip().lower()
+    entry = _named_provider_entry(label)
+    if entry is None and label == "custom" and (base_url or "").strip():
+        main_entry = _named_provider_entry(_configured_main_provider())
+        if main_entry is not None:
+            try:
+                from hermes_cli.route_identity import normalize_route_base_url
+
+                route_url = normalize_route_base_url(str(base_url).strip()).rstrip("/")
+                entry_url = normalize_route_base_url(str(main_entry.get("base_url") or "").strip()).rstrip("/")
+            except Exception:
+                route_url = entry_url = ""
+            if route_url and route_url == entry_url:
+                entry = main_entry
+    if entry is None:
+        return set()
+    names = {
+        str(entry.get("provider_key") or "").strip().lower(),
+        str(entry.get("name") or "").strip().lower(),
+    } - {""}
+    return names | {f"custom:{name}" for name in names}
+
+
+def _configured_slug_behind_route(provider: str, base_url: Optional[str] = None) -> str:
+    """The configured main provider a runtime ``custom`` route projects: ``model.provider`` when
+    ``provider`` is ``custom`` and ``base_url`` is that named entry's endpoint, else "" (the bare
+    ``custom`` provider resolves ``OPENAI_BASE_URL``/discovery, never the named entry)."""
+    if (provider or "").strip().lower() != "custom":
+        return ""
+    main = _configured_main_provider()
+    if main and main in _named_route_labels("custom", base_url):
+        return main
+    return ""
+
+
+# NewAPI: "No available channel for model X under group Y (distributor)", "No available channel keys".
+_MODEL_UNAVAILABLE_MARKERS = (
+    "no available channel", "无可用渠道", "model unavailable", "model is unavailable",
+    "model is currently unavailable", "model_unavailable",
+)
+# 403 bodies that say ONE route's usage window, quota or budget ran out (Kimi Coding relayed by the
+# gateway: "You've reached your weekly (7-day) usage limit"; budget proxies: "Workspace daily budget of
+# $10.00 exceeded"), as opposed to a revoked credential.
+_ROUTE_LIMIT_MARKERS = (
+    "usage limit", "usage cap", "quota", "rate limit", "rate_limit", "too many requests",
+    "limit exceeded", "limit reached", "budget", "spend limit", "spending limit",
+    "usage window", "-day window", "-hour window",
+)
+# 429 bodies that say a route's upstream account ran out of quota/budget, not a request-rate throttle.
+_QUOTA_429_MARKERS = (
+    "insufficient_quota", "quota", "budget", "spend limit", "spending limit", "usage limit", "usage cap",
+)
+def _is_named_gateway_route(provider: Optional[str], base_url: Optional[str] = None) -> bool:
+    """Does this route go through a named custom provider (``providers.<slug>`` / ``custom_providers``)?
+    True for the slug, its ``custom:<name>`` projection, the runtime ``custom`` route at the main
+    entry's endpoint, and any route (``auto`` included) whose ``base_url`` is a named entry's endpoint."""
+    if _named_route_labels(provider or "", base_url):
+        return True
+    url = (base_url or "").strip()
+    if not url:
+        return False
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        route_url = normalize_route_base_url(url).rstrip("/").lower()
+        if not route_url:
+            return False
+        for entry in get_compatible_custom_providers(load_config_readonly()):
+            if not isinstance(entry, dict):
+                continue
+            entry_url = normalize_route_base_url(str(entry.get("base_url") or "").strip()).rstrip("/").lower()
+            if entry_url and entry_url == route_url:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _gateway_route_label(exc: Exception, verdict: Any, provider: Optional[str], base_url: Optional[str]) -> Optional[str]:
+    """Fork: the label for a failure that closes ONE route on a healthy gateway, else None.
+
+    A gateway (NewAPI & co.) puts many models behind one key and each model is its own upstream account.
+    Upstream's classifier reads a 403 usage cap / scope miss or a 429 quota as billing/auth and so benches
+    the whole gateway (or, for auth, skips the credential surface). This re-reads those verdicts as
+    MODEL-scoped: ``route limit`` (named gateway route: any 403 but bad-credentials, a 429 whose body says
+    quota/budget; any route: a 403 whose body says a usage window/quota/budget ran out and that the
+    classifier did not call billing) and ``model unavailable`` (a 503 "No available channel for model X").
+    A plain gateway 429 rate limit and a dead key (401) keep upstream's handling."""
+    status = getattr(verdict, "status_code", None) or getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    if status is None:
+        for code in (403, 429, 503):
+            if f"error code: {code}" in text:
+                status = code
+                break
+    if status == 503:
+        return aux_errors.MODEL_UNAVAILABLE if any(m in text for m in _MODEL_UNAVAILABLE_MARKERS) else None
+    if status not in (403, 429) or verdict.reason in POLICY_REFUSAL_REASONS:  # a safety/data-policy refusal follows any route
+        return None
+    gateway = _is_named_gateway_route(provider, base_url)
+    if status == 429:
+        quota = verdict.reason is FailoverReason.billing or bool(verdict.error_context.get("quota_exhausted"))
+        return aux_errors.ROUTE_LIMIT if gateway and (quota or any(m in text for m in _QUOTA_429_MARKERS)) else None
+    if "bad-credentials" in text:  # an expired OAuth token reported as 403 is a credential problem
+        return None
+    if gateway:
+        return aux_errors.ROUTE_LIMIT
+    if verdict.reason is not FailoverReason.billing and any(m in text for m in _ROUTE_LIMIT_MARKERS):
+        return aux_errors.ROUTE_LIMIT
+    return None
+
+
+def _gateway_route_verdict(exc: Exception, verdict: Any, provider: Optional[str], client: Any,
+                           base_url: Optional[str]) -> Any:
+    """``verdict`` re-read as a route-scoped failure (see :func:`_gateway_route_label`), or unchanged."""
+    if isinstance(exc, _ClassifiedAttempt) or verdict.error_context.get("interrupted"):
+        return verdict
+    url = str(getattr(client, "base_url", None) or base_url or "")
+    label = _gateway_route_label(exc, verdict, provider, url)
+    if label is None:
+        return verdict
+    context = {k: v for k, v in verdict.error_context.items() if k != "quota_exhausted"}
+    context[aux_errors.ROUTE_SCOPE_KEY] = label
+    return dataclasses.replace(
+        verdict, reason=FailoverReason.model_not_found if label == aux_errors.MODEL_UNAVAILABLE else FailoverReason.model_entitlement,
+        retryable=True, should_rotate_credential=False, should_fallback=True, should_compress=False,
+        error_context=context)
+
+
 def _nous_portal_account_has_fresh_paid_access() -> bool:
     """Return True only when the fresh Nous account API says paid access is allowed."""
     try:
@@ -3875,6 +4070,10 @@ def _plan_fallback_candidate(
     return destination, _fallback_request_kwargs(destination, **common), _rebuild
 
 
+#: Capacity reasons that implicate ONE model deployment, not the provider/credential.
+_MODEL_SCOPED_REASONS = frozenset({"route limit", "model unavailable"})
+
+
 def _quarantine_fallback_candidate(
     task: Optional[str], fb_label: str, fb_provider: str, fb_err: Exception, *,
     base_url: str = "", tag: str = "", reason: Optional[str] = None, model: Optional[str] = None,
@@ -3886,7 +4085,7 @@ def _quarantine_fallback_candidate(
     _mark_provider_unhealthy(
         fb_provider or fb_label, ttl=fallback_candidate_quarantine_ttl(reason),
         base_url=base_url, reason=reason or "stale fallback credential",
-        model=model if reason in (aux_errors.MODEL_NOT_FOUND, aux_errors.MODEL_INCOMPATIBLE) else None)
+        model=model if reason in aux_errors.MODEL_SCOPED_LABELS else None)
     why = f"is out of capacity ({reason})" if reason else "has a stale/unrefreshable credential"
     logger.warning("Auxiliary %s%s: fallback candidate %s %s (%s) — skipping to next fallback",
                    task or "call", tag, fb_label, why, fb_err)
@@ -4066,6 +4265,20 @@ def _fallback_lane(client: Any, model: Optional[str], label: str) -> tuple[str, 
     return label, model, str(getattr(client, "base_url", "") or "")  # one candidate's identity within a walk
 
 
+def _canonical_named_provider(provider: str, base_url: Optional[str]) -> str:
+    """Configured slug behind a runtime ``custom`` / ``custom:<name>`` route; the label itself otherwise."""
+    label = (provider or "").strip()
+    slug = _configured_slug_behind_route(label, base_url)
+    if slug:
+        return slug
+    if label.lower().startswith("custom:"):
+        entry = _named_provider_entry(label)
+        key = str((entry or {}).get("provider_key") or "").strip()
+        if key:
+            return key
+    return label
+
+
 def _failed_backend_skip(
     failed_provider: str, failed_model: Optional[str], *, failed_base_url: str = "",
     failure_scope: Any = None,
@@ -4075,20 +4288,24 @@ def _failed_backend_skip(
     None → credential-wide (whole provider; auth/payment)."""
     from agent.backend_identity import BackendIdentity, FailureScope, should_skip_candidate
     skip_model = (failed_model or "").strip().lower() or None
+    # Fork: a runtime ``custom`` / ``custom:<name>`` label at a named entry's endpoint IS that entry's slug,
+    # so a credential failure on it reaches the same-slug candidates (one gateway key, many models).
+    failed_provider = _canonical_named_provider(failed_provider, failed_base_url)
+    if failed_provider.strip().lower() == "auto":
+        failed_provider = ""  # ``auto`` is a routing mode, not a credential: let the endpoint decide
     failed_ident = BackendIdentity.build(
         provider=failed_provider, model=skip_model, base_url=failed_base_url)
     failure_scope = failure_scope or (FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL)
 
     def _skip(provider: str, model: Optional[str], base_url: str = "") -> bool:
         return should_skip_candidate(
-            BackendIdentity.build(provider=provider, model=model, base_url=base_url), failed_ident, failure_scope,
-        )
+            BackendIdentity.build(provider=provider, model=model, base_url=base_url), failed_ident, failure_scope)
     return _skip
 
 
 def _try_main_agent_model_fallback(
     failed_provider: str, task: str | None = None, reason: str = "error",
-    failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
+    failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None, skip_lanes=(),
 ) -> tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the main agent provider + model after the configured chain is exhausted.
     ``failed_model`` scoping per ``_failed_backend_skip``; same-URL custom endpoints serve many models,
@@ -4111,6 +4328,13 @@ def _try_main_agent_model_fallback(
                     reason, failed_provider, main_provider)
         return None, None, ""
     main_base_url = _custom_health_base_url(main_provider)
+    # Fork: a named custom provider reports itself as ``custom`` once a turn ran; the bare ``custom``
+    # provider resolves OPENAI_BASE_URL/discovery, not the named entry. Map it back to the configured
+    # slug so an explicit aux task still gets its main-model safety net.
+    configured_slug = _configured_slug_behind_route(
+        main_provider, _read_main_base_url() if main_provider.lower() == "custom" else main_base_url)
+    if configured_slug:
+        main_provider, main_base_url = configured_slug, _custom_health_base_url(configured_slug)
     if _failed_backend_skip(
             failed_provider, failed_model, failed_base_url=failed_base_url,
             failure_scope=failure_scope)(main_provider, main_model, main_base_url):
@@ -4125,6 +4349,8 @@ def _try_main_agent_model_fallback(
     if client is None:
         return None, None, ""
     label = f"main-agent({main_provider})"
+    if _fallback_lane(client, resolved_model or main_model, label) in skip_lanes:
+        return None, None, ""
     logger.info("Auxiliary %s: %s on %s — falling back to main agent model %s (%s)",
                 task or "call", reason, failed_provider, label, resolved_model or main_model)
     return client, resolved_model or main_model, label
@@ -6168,8 +6394,12 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     return max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS) if task == "compression" else effective
 
 
+_PROVIDER_REASONING_KEYS = ("reasoning_effort", "reasoning")
+
+
 def _with_custom_endpoint_extra_body(
     extra_body: Optional[dict], provider: str, model: Optional[str], base_url: Optional[str],
+    reasoning_config: Optional[dict] = None,
 ) -> Optional[dict]:
     """Layer the destination custom provider's ``extra_body`` UNDER the task/caller body.
 
@@ -6178,7 +6408,21 @@ def _with_custom_endpoint_extra_body(
     to the same entry must carry it too, or a proxy that 400s without e.g. a ``user`` field breaks
     smart approval, titles and compression (#103738). Resolved per destination with the agent's own
     matcher, so a fallback to another provider never inherits it; ``auxiliary.<task>.extra_body`` and
-    caller keys win on conflict, as request_overrides win over the entry on the main path."""
+    caller keys win on conflict, as request_overrides win over the entry on the main path.
+
+    Fork: a route addressed by the named provider's own slug (``providers.<slug>``, which is how
+    ``auto`` -> main provider and pinned tasks reach it) is that entry too -- not only the
+    ``custom`` / ``custom:<name>`` labels -- and the entry's reasoning keys (``reasoning_effort: high``)
+    are dropped when the task or caller already chose a reasoning level, so two effort settings never
+    ride one request."""
+    label = (provider or "").strip().lower()
+    if label and label != "custom" and not label.startswith("custom:"):
+        entry = _named_provider_entry(label)
+        if entry is None:
+            return extra_body
+        slug = str(entry.get("provider_key") or entry.get("name") or label).strip().lower()
+        provider = f"custom:{slug}"
+        base_url = base_url or str(entry.get("base_url") or "")
     if not base_url:
         return extra_body
     try:
@@ -6193,6 +6437,8 @@ def _with_custom_endpoint_extra_body(
         return extra_body
     if not inherited:
         return extra_body
+    if reasoning_config is not None or any(k in (extra_body or {}) for k in _PROVIDER_REASONING_KEYS):
+        inherited = {k: v for k, v in inherited.items() if k not in _PROVIDER_REASONING_KEYS}
     return {**inherited, **(extra_body or {})}
 
 
@@ -6531,7 +6777,8 @@ def _build_call_kwargs(
     if no_progress_timeout is not None:
         kwargs["no_progress_timeout"] = no_progress_timeout
     effective_base = base_url or (_current_custom_base_url() if provider == "custom" else "")
-    extra_body = _with_custom_endpoint_extra_body(extra_body, provider, model, effective_base)
+    extra_body = _with_custom_endpoint_extra_body(
+        extra_body, provider, model, effective_base, reasoning_config=reasoning_config)
     # Per-model fixed/omitted temperature, then Opus 4.7+ sampling bans: it rejects any
     # non-default temperature/top_p/top_k, so drop silently rather than 400 when the aux model flips.
     fixed_temperature = _fixed_temperature_for_model(model, effective_base, provider)
@@ -7388,7 +7635,8 @@ def _classify_failure(exc: Exception, provider: Optional[str], client: Any, mode
     if isinstance(exc, _ClassifiedAttempt):
         return exc.failure
     provider = _classification_provider(client, provider or "", main_runtime)
-    verdict = aux_errors.classify_attempt(exc, provider, client, model, base_url)
+    verdict = _gateway_route_verdict(exc, aux_errors.classify_attempt(exc, provider, client, model, base_url),
+                                     provider, client, base_url)
     failure = aux_errors.Failure(exc, verdict, any(rung[0](exc) for rung in _parameter_rungs(client, 0)), client)
     _note_relay_auxiliary_error(exc, failure)
     return failure
@@ -7668,7 +7916,10 @@ def _next_fallback_after_quarantine(
     fb = _try_configured_fallback_chain(task, resolved_provider or "auto", failed_model=failed_model, **walk)
     if task_chain_only:
         return fb
-    if fb[0] is None and is_auto:
+    if fb[0] is None and not is_auto:
+        # Fork: an explicit-provider task's main-model safety net precedes the main fallback chain.
+        fb = _try_main_agent_model_fallback(resolved_provider, task, failed_model=failed_model, **walk)
+    if fb[0] is None:  # fork: explicit-provider tasks walk the main fallback_providers chain too (19a)
         fb = _try_main_fallback_chain(task, resolved_provider or "auto", failed_model=failed_model, **walk)
     if fb[0] is None:
         fb = _try_payment_fallback(resolved_provider, task, main_runtime=route.main_runtime, **walk)
@@ -7737,6 +7988,12 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+        if fb_client is None:
+            # Fork: an explicit-provider task (title pinned to a capped route) walks the main
+            # ``fallback_providers`` chain too, not just the task chain and the main model.
+            fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
+                failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
     # Ordered walk: a candidate that returns None was quarantined (dead credential or a capacity error such as
     # a quota 429), so re-walking the CONFIGURED chains first lands on the next entry, then discovery where the
     # selection policy allows it (#106367). The selectors pass over tried lanes, so an entry whose refresh moved
