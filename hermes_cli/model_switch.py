@@ -200,6 +200,21 @@ def _clean(value: Any) -> str:
 DIRECT_ALIASES: dict[str, DirectAlias] = {}
 
 
+def _provider_lists_model(user_providers: Optional[dict], provider_name: Optional[str], model_id: str) -> bool:
+    """True when the configured provider's ``models:`` catalogue contains *model_id* verbatim.
+
+    A provider whose endpoint speaks full slugs (``automaticai/auto`` on an OpenAI-compatible
+    gateway) lists them under ``providers.<name>.models``; that catalogue is the authority that
+    says the wire id is the WHOLE string, so ``provider/model`` input must not be split at the
+    first slash for it.
+    """
+    entry = (user_providers or {}).get(str(provider_name or "").strip()) if provider_name else None
+    models = entry.get("models") if isinstance(entry, dict) else None
+    if not isinstance(models, (list, tuple)):
+        return False
+    return model_id.strip() in {str(m).strip() for m in models if str(m).strip()}
+
+
 def _load_direct_aliases() -> dict[str, DirectAlias]:
     """Load direct aliases from config.yaml.
 
@@ -243,6 +258,17 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                             key_env=_clean(value.get("key_env", "")))
                 elif isinstance(value, str) and value.strip():
                     val = value.strip()
+                    # ``provider/model`` split only when the prefix's provider does not serve the
+                    # full string verbatim in its ``models:`` catalogue. A provider whose endpoint
+                    # speaks prefixed slugs (``automaticai/auto`` on an OpenAI-compatible gateway)
+                    # lists them verbatim; the wire id is the WHOLE slug — splitting would ship
+                    # ``auto`` and 403. The catalogue lookup only matches a configured provider,
+                    # so the prefix is the routing target when it hits.
+                    if "/" in val and _provider_lists_model(
+                            cfg.get("providers"), val.split("/", 1)[0], val):
+                        merged[key] = DirectAlias(
+                            model=val, provider=val.split("/", 1)[0].strip(), base_url="")
+                        continue
                     provider, model = val.split("/", 1) if "/" in val else (current_provider, val)
                     merged[key] = DirectAlias(
                         model=model.strip(), provider=provider.strip() or current_provider, base_url="")
@@ -406,6 +432,13 @@ def resolve_startup_model_route(
     prefix, model = (part.strip() for part in raw.split("/", 1))
     if not prefix or not model:
         return None
+
+    # The provider's own ``models:`` catalogue is authoritative when it lists the full string
+    # verbatim (``automaticai/auto`` on an OpenAI-compatible gateway whose slugs start with the
+    # provider name): the wire id is the WHOLE slug, so route to the provider with the model
+    # unsplit instead of shredding it at the first slash.
+    if _provider_lists_model(user_providers, prefix, raw):
+        return StartupModelRoute(model=raw, provider=prefix)
 
     if current_provider:
         try:
