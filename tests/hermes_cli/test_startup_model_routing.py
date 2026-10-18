@@ -168,6 +168,55 @@ def _write_named_provider(tmp_path, monkeypatch):
     return load_config()
 
 
+def test_startup_route_keeps_full_slug_listed_in_provider_catalogue(monkeypatch):
+    """A provider whose ``models:`` catalogue lists the full string verbatim speaks prefixed
+    slugs on the wire (an OpenAI-compatible gateway named like its slug namespace:
+    ``automaticai/auto``). Splitting at the first slash ships ``auto`` and the endpoint 403s,
+    so the route must keep the WHOLE slug."""
+    monkeypatch.setattr(model_switch, "DIRECT_ALIASES", {})
+    route = model_switch.resolve_startup_model_route(
+        "automaticai/auto",
+        user_providers={"automaticai": {
+            "api": "https://api.automaticai.io/v1",
+            "models": ["automaticai/auto", "automaticai/personal/glm-5.3"],
+        }},
+    )
+    assert route == model_switch.StartupModelRoute("automaticai/auto", "automaticai", "")
+
+
+def test_alias_entry_keeps_full_slug_when_provider_catalogue_lists_it(monkeypatch):
+    """``model.aliases:`` string entries must not split a value the provider's own catalogue
+    serves verbatim — ``auto: automaticai/auto`` loaded as ``model="auto"`` reaches the wire
+    bare and 403s, and the gateway session-hygiene compressor (no fallback chain) aborts on
+    every turn."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "automaticai",
+                "aliases": {
+                    "auto": "automaticai/auto",
+                    "auto-fast": "automaticai/auto/fast",
+                },
+            },
+            "providers": {"automaticai": {
+                "api": "https://api.automaticai.io/v1",
+                "models": ["automaticai/auto", "automaticai/auto/fast"],
+            }},
+        },
+    )
+    aliases = model_switch._load_direct_aliases()
+    assert aliases["auto"] == model_switch.DirectAlias(
+        "automaticai/auto", "automaticai", ""
+    )
+    assert aliases["auto-fast"] == model_switch.DirectAlias(
+        "automaticai/auto/fast", "automaticai", ""
+    )
+    monkeypatch.setattr(model_switch, "DIRECT_ALIASES", aliases)
+    route = model_switch.resolve_startup_model_route("auto")
+    assert route == model_switch.StartupModelRoute("automaticai/auto", "automaticai", "")
+
+
 def test_startup_route_decodes_custom_colon_qualified_model(tmp_path, monkeypatch):
     """``custom:<name>:<model>`` selects the named provider instead of leaving the unsplit string
     to the configured default (#73943: the prompt went to api.anthropic.com before a 404)."""
