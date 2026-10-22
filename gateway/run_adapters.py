@@ -17,7 +17,7 @@ import os
 import time
 import weakref as _weakref
 from agent.async_utils import consume_detached_task_result
-from contextvars import Context
+from contextvars import Context, ContextVar
 from datetime import datetime, timedelta, timezone, UTC
 from gateway.config import (
     ON_ALL_ADAPTERS_DOWN_POLICIES,
@@ -44,6 +44,12 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 _UNSET = object()  # "no per-profile human_delay snapshot": fall back to the primary's value
+
+
+# Per-profile startup ordering gate, set by ``_start_profiles_bounded`` in each profile's own task:
+# ``(previous profile's "claims settled" event | None, this profile's event)``. ``None`` outside a
+# concurrent boot, so a direct ``_start_one_profile_adapters`` call (hot-serve re-scan, tests) claims at once.
+_PROFILE_CLAIM_GATE: ContextVar[Optional[tuple]] = ContextVar("hermes_profile_claim_gate", default=None)
 
 
 class _UnresolvedProfileHome:
@@ -131,6 +137,29 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
                 logger.warning(
                     "✗ %s disconnect timed out after %.1fs - forcing continue%s",
                     platform.value, timeout, suffix,
+                )
+
+    async def _bounded_adapter_teardown_all(self, teardowns, *, concurrency: Optional[int] = None) -> None:
+        """Tear down every ``(adapter, platform, profile | None)`` at once, at most ``concurrency`` in flight
+        (default ``_SHUTDOWN_NOTICE_CONCURRENCY``). Each call keeps ``_bounded_adapter_teardown``'s own
+        per-await bound and never raises, so the total is about the slowest adapter, not the sum, and a hung
+        one cannot delay the rest beyond its own bound."""
+        from gateway.run_shutdown import _SHUTDOWN_NOTICE_CONCURRENCY
+        teardowns = list(teardowns)
+        if not teardowns:
+            return
+        gate = asyncio.Semaphore(max(1, concurrency or _SHUTDOWN_NOTICE_CONCURRENCY))
+
+        async def _one(adapter, platform, profile):
+            async with gate:
+                await self._bounded_adapter_teardown(adapter, platform, profile=profile)
+
+        results = await asyncio.gather(*(_one(*item) for item in teardowns), return_exceptions=True)
+        for (_adapter, platform, profile), result in zip(teardowns, results):
+            if isinstance(result, BaseException):
+                logger.error(
+                    "✗ %s teardown raised%s: %s", getattr(platform, "value", platform),
+                    f" (profile: {profile})" if profile else "", result,
                 )
 
     @staticmethod
@@ -957,12 +986,89 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
                 )
         pending.clear()
 
+    def _profile_startup_concurrency(self) -> int:
+        """``gateway.profile_startup_concurrency`` (default 8; ``1`` = serial boot)."""
+        from gateway.config import DEFAULT_PROFILE_STARTUP_CONCURRENCY
+        value = getattr(getattr(self, "config", None), "profile_startup_concurrency", None)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return DEFAULT_PROFILE_STARTUP_CONCURRENCY
+        return value
+
+    async def _start_profiles_bounded(self, targets, claimed: dict[tuple, str]) -> list:
+        """Start each ``(name, home)`` via ``_start_one_profile_adapters`` with at most
+        ``profile_startup_concurrency`` in flight. Returns ``[(name, (connected, scan_signature) | exception)]``
+        in input order; one profile failing never cancels the others.
+
+        * Each profile runs in its own task, so its ``_profile_runtime_scope`` contextvars (home, secrets,
+          terminal policy) are private to it.
+        * Permits are taken in profile order, and each profile's credential/listener claims are settled
+          (before any connect) only after the previous profile's: the first profile in order wins a duplicate
+          token exactly as in a serial boot, whatever the timing of config loads.
+        * A ``MultiplexConfigError`` stops further profiles from being launched; in-flight ones finish.
+        """
+        from gateway.run import MultiplexConfigError
+        from gateway.run_profile_reconcile import profile_serve_signature
+        if not targets:
+            return []
+        concurrency = min(self._profile_startup_concurrency(), len(targets))
+        started_at = time.monotonic()
+        logger.info("[MULTIPLEX] Starting %d secondary profile(s) (concurrency=%d)", len(targets), concurrency)
+        permits = asyncio.Semaphore(concurrency)
+        abort = asyncio.Event()
+
+        async def _run(profile_name: str, profile_home: Path, prev_settled, settled):
+            began = time.monotonic()
+            _PROFILE_CLAIM_GATE.set((prev_settled, settled))  # task-local: this task's context is a copy
+            try:
+                # Preserve changes made while the initial connection is awaiting I/O.
+                scan_signature = profile_serve_signature(profile_home)
+                profile_connected = await self._start_one_profile_adapters(profile_name, profile_home, claimed)
+            except MultiplexConfigError as e:
+                abort.set()
+                return e
+            except Exception as e:
+                logger.error("Failed to start adapters for profile '%s': %s", profile_name, e, exc_info=True)
+                return e
+            finally:
+                settled.set()  # idempotent: a profile that failed before its claim step must not stall the next
+                permits.release()
+            logger.info(
+                "[MULTIPLEX] Profile '%s' started: %d adapter(s) connected in %.1fs",
+                profile_name, profile_connected, time.monotonic() - began,
+            )
+            return profile_connected, scan_signature
+
+        tasks: list[tuple[str, asyncio.Task]] = []
+        prev_settled = None
+        try:
+            for profile_name, profile_home in targets:
+                await permits.acquire()
+                if abort.is_set():
+                    permits.release()
+                    break
+                settled = asyncio.Event()
+                tasks.append((profile_name, asyncio.create_task(
+                    _run(profile_name, profile_home, prev_settled, settled),
+                    name=f"profile-startup:{profile_name}",
+                )))
+                prev_settled = settled
+            results = await asyncio.gather(*(task for _n, task in tasks), return_exceptions=True)
+        except BaseException:
+            for _name, task in tasks:
+                task.cancel()
+            await asyncio.gather(*(task for _n, task in tasks), return_exceptions=True)
+            raise
+        logger.info(
+            "[MULTIPLEX] Secondary profile startup finished: %d/%d launched in %.1fs",
+            len(tasks), len(targets), time.monotonic() - started_at,
+        )
+        return [(name, result) for (name, _task), result in zip(tasks, results)]
+
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile (multiplex only); returns connected count.
         Each profile connects under its own HERMES_HOME + secret scope; credential/listener collisions
         are refused here — the only point seeing every profile's credentials together."""
         from gateway.run import MultiplexConfigError, _multiplex_profile_homes
-        from gateway.run_profile_reconcile import profile_serve_signature
         if not self._multiplex_on():
             # Runtime-status publication re-stamps the previous writer's record in place, so a multiplexer's
             # ``served_profiles`` would outlive it into this single-profile run and `hermes -p X ...`
@@ -984,26 +1090,22 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         for name, home in profiles_to_serve(True, include_parked=True):
             if name != "default" and profile_is_parked(home):
                 logger.info("profile '%s' is parked (gateway.parked); not served by this gateway", name)
-        connected = 0
         claimed = self._primary_resource_claims(active)
         profile_homes = _multiplex_profile_homes(self.config)
         self._served_profile_signatures = {}
         transient_failed = set()
-        for profile_name, profile_home in profile_homes:
-            if profile_name == active:
-                continue  # handled by the primary startup loop
-            # Preserve changes made while the initial connection is awaiting I/O.
-            scan_signature = profile_serve_signature(profile_home)
-            try:
-                connected += await self._start_one_profile_adapters(profile_name, profile_home, claimed)
-            except MultiplexConfigError:
-                raise
-            except Exception as e:
-                logger.error("Failed to start adapters for profile '%s': %s", profile_name, e, exc_info=True)
+        targets = [(name, home) for name, home in profile_homes if name != active]  # primary: its own startup loop
+        connected = 0
+        for profile_name, outcome in await self._start_profiles_bounded(targets, claimed):
+            if isinstance(outcome, MultiplexConfigError):
+                raise outcome
+            if isinstance(outcome, BaseException):
                 # Not acknowledged: the reconcile watcher retries a transiently-failed profile.
                 transient_failed.add(profile_name)
-            else:
-                self._served_profile_signatures[profile_name] = scan_signature
+                continue
+            profile_connected, scan_signature = outcome
+            connected += profile_connected
+            self._served_profile_signatures[profile_name] = scan_signature
         self._record_served_profiles(active, profile_homes)
         # ``_note_served_profiles`` fills a missing signature with the current one; that refill
         # would park a transiently-failed profile before the first watcher tick can retry it.
@@ -1246,6 +1348,11 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
     ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
         from gateway.run import _platform_has_bot_credential, _profile_runtime_scope
+        # Concurrent boot only: taken, and cleared from this task's context, before anything below can spawn a
+        # task that would inherit it (plugin rewire, an unbuilt platform's reconnect bridge) and settle it early.
+        gate = _PROFILE_CLAIM_GATE.get()
+        if gate is not None:
+            _PROFILE_CLAIM_GATE.set(None)
         profile_cfg = await self._load_secondary_profile_config(profile_name, profile_home)
         # Keep the served profile's config: host-wide passes (planned-restart notices) must reach
         # every served profile's home channels, and this is the only place it is loaded.
@@ -1256,6 +1363,7 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         multiplex = self._multiplex_on()
         profile_map = self._profile_adapters.setdefault(profile_name, {})
         connected = 0
+        staged: list[tuple[Platform, Any]] = []
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
@@ -1302,43 +1410,72 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
             if not adapter:
                 self._note_unbuilt_secondary_platform(profile_name, platform, heals)
                 continue
+            staged.append((platform, adapter))
 
-            # Same-token / same-listener conflict detection — refuse a duplicate poll or bind.
-            # Held claims too (a profile earlier in the sweep whose connect failed, or one healing, still owns
-            # its bot), and once live, owners as of now: a runtime caller's snapshot predates these awaits.
-            owners = self._current_claim_owners() if getattr(self, "_running", False) else self._held_claim_owners()
-            claims = self._claim_secondary_platform(
-                profile_name, profile_home, platform, adapter, {**claimed, **owners})
-            if claims is None:
-                continue
-            self._configure_profile_adapter(adapter, profile_name, platform)
-            # Hold the bot across the connect await; a failed connect's reconnect takes the hold over.
-            self._hold_secondary_claims(profile_name, platform, adapter, claims)
-            try:
-                try:
-                    with _profile_runtime_scope(profile_home, hydrate_secrets=False):
-                        success = await self._connect_initial_adapter_with_timeout(adapter, platform)
-                    if not success:
-                        logger.warning("✗ %s failed to connect (profile: %s)", platform.value, profile_name)
-                except Exception as e:
-                    logger.error("✗ %s error (profile: %s): %s", platform.value, profile_name, e)
-                    success = False
-                if not success:
-                    await self._safe_adapter_disconnect(adapter, platform)
-                    self._schedule_secondary_profile_startup_reconnect(profile_name, platform, adapter)
+        # Same-token / same-listener conflict detection — refuse a duplicate poll or bind. Every staged platform
+        # is claimed and HELD before any connect() await, and under a concurrent boot only once the previous
+        # profile's claims are settled (the gate): a later profile then sees this one's bots held (connect in
+        # flight) or claimed (connected), so two profiles never both take one credential/listener and the first
+        # in profile order keeps it, as in a serial boot. Held claims too (a profile earlier in the sweep whose
+        # connect failed, or one healing, still owns its bot), and once live, owners as of now: a runtime caller's
+        # snapshot predates these awaits.
+        ready: list[tuple[Platform, Any, tuple]] = []
+        try:
+            if gate is not None and gate[0] is not None:
+                await gate[0].wait()
+            for platform, adapter in staged:
+                owners = self._current_claim_owners() if getattr(self, "_running", False) else self._held_claim_owners()
+                claims = self._claim_secondary_platform(
+                    profile_name, profile_home, platform, adapter, {**claimed, **owners})
+                if claims is None:
                     continue
-                profile_map[platform] = adapter
-            finally:
+                # Hold the bot from the check on (no await in between) and across the connect; a failed
+                # connect's reconnect takes the hold over.
+                self._hold_secondary_claims(profile_name, platform, adapter, claims)
+                ready.append((platform, adapter, claims))
+        except BaseException:
+            for platform, adapter, _claims in ready:
                 self._release_secondary_claims(profile_name, platform, adapter)
-            # Restore persisted /voice state for this bot (primary startup and reconnects do too).
-            # See #84872.
-            self._sync_voice_mode_state_to_adapter(adapter)
-            for claim in claims:
-                if claim is not None:
-                    claimed[claim] = profile_name
+            raise
+        finally:
+            if gate is not None:
+                gate[1].set()  # settled: the next profile in order may claim now
+        started = 0
+        try:
+            for platform, adapter, claims in ready:
+                started += 1
+                try:
+                    self._configure_profile_adapter(adapter, profile_name, platform)
+                    try:
+                        with _profile_runtime_scope(profile_home, hydrate_secrets=False):
+                            success = await self._connect_initial_adapter_with_timeout(adapter, platform)
+                        if not success:
+                            logger.warning("✗ %s failed to connect (profile: %s)", platform.value, profile_name)
+                    except Exception as e:
+                        logger.error("✗ %s error (profile: %s): %s", platform.value, profile_name, e)
+                        success = False
+                    if not success:
+                        await self._safe_adapter_disconnect(adapter, platform)
+                        self._schedule_secondary_profile_startup_reconnect(profile_name, platform, adapter)
+                        continue
+                    profile_map[platform] = adapter
+                finally:
+                    self._release_secondary_claims(profile_name, platform, adapter)
+                # Restore persisted /voice state for this bot (primary startup and reconnects do too).
+                # See #84872.
+                self._sync_voice_mode_state_to_adapter(adapter)
+                for claim in claims:
+                    if claim is not None:
+                        claimed[claim] = profile_name
 
-            connected += 1
-            logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
+                connected += 1
+                logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
+        finally:
+            # A raise or cancellation part-way (a shutdown during boot) must not strand the holds of the platforms it
+            # never reached: a re-scan skips a held platform. Only those: a reached one released its own hold, or
+            # handed it to its reconnect, and a fatal teardown since may hold it again under the same adapter.
+            for platform, adapter, _claims in ready[started:]:
+                self._release_secondary_claims(profile_name, platform, adapter)
         return connected
 
     def _wire_adapter_handlers(
