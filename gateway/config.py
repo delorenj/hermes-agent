@@ -23,6 +23,9 @@ from utils import fast_safe_load, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
+# Secondary profiles the multiplexer starts at once (``gateway.profile_startup_concurrency``).
+DEFAULT_PROFILE_STARTUP_CONCURRENCY = 8
+
 _TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSY_STRINGS = frozenset({"0", "false", "no", "off"})
 
@@ -614,6 +617,9 @@ class GatewayConfig:
     # route); HERMES_ROOM_LINK_URL overrides.
     room_link_url: Optional[str] = None
     systemd_watchdog_seconds: int = 0  # opt-in; zero keeps Type=simple and disables sd_notify
+    # How many secondary profiles the multiplexer brings up at once at boot (each Telegram bot costs a
+    # ~10s first long-poll, so a serial 40-profile start takes minutes). ``1`` restores the serial start.
+    profile_startup_concurrency: int = DEFAULT_PROFILE_STARTUP_CONCURRENCY
     # In-process loop liveness watchdog: after consecutive missed probes it dumps all-thread stacks
     # and hard-exits with the service-restart code. The knobs tolerate transient self-recovering
     # stalls (adapter reconnect doing sync socket I/O) so a short block does not cause restart churn.
@@ -646,7 +652,7 @@ class GatewayConfig:
     _SCALAR_DICT_FIELDS = (
         "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
-        "max_concurrent_sessions", "multiplex_profiles",
+        "max_concurrent_sessions", "multiplex_profiles", "profile_startup_concurrency",
         "on_all_adapters_down",
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
@@ -762,6 +768,11 @@ class GatewayConfig:
         systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             pick("systemd_watchdog_seconds"), key_label("systemd_watchdog_seconds")
         )
+        profile_startup_concurrency = _coerce_int(
+            pick("profile_startup_concurrency"), DEFAULT_PROFILE_STARTUP_CONCURRENCY
+        )
+        if not 1 <= profile_startup_concurrency <= 256:
+            profile_startup_concurrency = DEFAULT_PROFILE_STARTUP_CONCURRENCY
         # env > config.yaml > unset: a recognized GATEWAY_MULTIPLEX_PROFILES wins (hosted deployments
         # stamp it on the container); blank/unrecognized falls through to the top-level VALUE when not
         # None, else ``gateway.multiplex_profiles``. Nothing set stays ``None`` so the boot-time guard
@@ -802,6 +813,7 @@ class GatewayConfig:
             multiplex_profiles=None if multiplex_profiles is None else _coerce_bool(multiplex_profiles, True),
             room_link_url=room_link_url if isinstance(room_link_url, str) else None,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
+            profile_startup_concurrency=profile_startup_concurrency,
             loop_watchdog=_coerce_bool(pick("loop_watchdog"), True),
             loop_watchdog_probe_interval_s=bounded_float("loop_watchdog_probe_interval_s", DEFAULT_LOOP_WATCHDOG_INTERVAL_S, 1.0, 3600.0),
             loop_watchdog_probe_timeout_s=bounded_float("loop_watchdog_probe_timeout_s", DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, 1.0, 600.0),

@@ -25,6 +25,7 @@ from gateway.config import Platform
 from gateway.restart import (
     CRON_DRAIN_CLEANUP_RESERVE_S,
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
+    SYSTEMD_STOP_HEADROOM_S,
     parse_cron_drain_timeout,
     resolve_cron_drain_budget,
     resolve_systemd_timeout_stop_sec,
@@ -183,15 +184,21 @@ class TestResolveSystemdTimeoutStopSec:
 
 
     def test_configured_drain_still_extends_the_deadline_directly(self):
-        assert resolve_systemd_timeout_stop_sec(60.0, 30.0) == 90
-        assert resolve_systemd_timeout_stop_sec(180.0, 30.0) == 210
+        # drain + headroom (notices, unwind, ~60 serial-bounded adapters' worth of teardown, ExecStop/Post)
+        assert resolve_systemd_timeout_stop_sec(60.0, 30.0) == 60 + int(SYSTEMD_STOP_HEADROOM_S)
+        assert resolve_systemd_timeout_stop_sec(180.0, 30.0) == 180 + int(SYSTEMD_STOP_HEADROOM_S)
 
     def test_larger_cron_floor_raises_timeout_stop_sec(self):
-        # 60s cron + 10s reserve + 30s headroom = 100s
-        assert resolve_systemd_timeout_stop_sec(0.0, 60.0) == 100
+        # 60s cron + 10s reserve + headroom
+        assert resolve_systemd_timeout_stop_sec(0.0, 60.0) == 70 + int(SYSTEMD_STOP_HEADROOM_S)
+
+    def test_headroom_leaves_a_fast_stop_a_150s_budget(self):
+        # restart_drain_timeout: 20 with the default 30s cron floor (+10s cleanup reserve) is the fleet's
+        # shipped setting: 40s drain window + headroom = 150s TimeoutStopSec.
+        assert resolve_systemd_timeout_stop_sec(20.0, 30.0) == 150
 
     def test_zero_cron_floor_is_an_opt_out_not_a_hidden_default(self):
-        assert resolve_systemd_timeout_stop_sec(0.0, 0.0) == 60
+        assert resolve_systemd_timeout_stop_sec(0.0, 0.0) == max(60, int(SYSTEMD_STOP_HEADROOM_S))
 
     def test_cron_floor_never_shortens_a_long_drain(self):
         assert resolve_systemd_timeout_stop_sec(180.0, 30.0) == resolve_systemd_timeout_stop_sec(
@@ -199,4 +206,4 @@ class TestResolveSystemdTimeoutStopSec:
         )
 
     def test_garbage_inputs_degrade_to_the_floor(self):
-        assert resolve_systemd_timeout_stop_sec("soon", None) == 60
+        assert resolve_systemd_timeout_stop_sec("soon", None) == max(60, int(SYSTEMD_STOP_HEADROOM_S))
