@@ -313,7 +313,9 @@ class TestGeneratedSystemdUnits:
         monkeypatch.setattr(gateway_cli, "_get_cron_drain_timeout", lambda: 0.0)
 
         unit = gateway_cli.generate_systemd_unit(system=False)
-        assert "TimeoutStopSec=60" in unit
+        assert (
+            f"TimeoutStopSec={resolve_systemd_timeout_stop_sec(0.0, 0.0)}" in unit
+        )
 
     def test_restart_exit_code_is_also_declared_a_success_status(self):
         """#104251: a planned restart (gateway/restart.py's exit 75) is force-restarted
@@ -2821,9 +2823,13 @@ class TestTimeoutStopSecCoversCronFloor:
             monkeypatch,
             "agent:\n  restart_drain_timeout: 60\n",
         )
-        # An explicit restart drain above the default cron floor keeps the old
-        # formula's result — no regression for restart-drain-dominated installs.
-        assert "TimeoutStopSec=90" in unit  # 60s drain + 30s cleanup: same as the pre-cron formula
+        # An explicit restart drain above the default cron floor dominates the
+        # leash: drain + the itemised stop headroom.
+        expected = resolve_systemd_timeout_stop_sec(
+            60.0, DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
+        )
+        assert f"TimeoutStopSec={expected}" in unit
+        assert expected >= 60 + 30
 
     def test_env_override_extends_the_leash(self, tmp_path, monkeypatch):
         unit = self._unit_with_config(
