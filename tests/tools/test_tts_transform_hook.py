@@ -161,6 +161,20 @@ class TestTextToSpeechToolWiring:
         tts_tool.text_to_speech_tool("Short and sweet.")
         assert captured[0] == ["Short and sweet."]
 
+    def test_transform_text_false_skips_hook(self, register_hook, captured):
+        calls: list = []
+        register_hook.append(lambda **kw: calls.append(kw["text"]) or "rewritten")
+        tts_tool.text_to_speech_tool("Short and sweet.", transform_text=False)
+        assert calls == []
+        assert captured[0] == ["Short and sweet."]
+
+    def test_per_sentence_callers_opt_out(self):
+        import inspect
+        from hermes_cli.web_routers import audio
+        from tools import tts_tool_speaker
+        assert "transform_text=False" in inspect.getsource(tts_tool_speaker._SyncSentencePipeline._synthesize_to_tmp)
+        assert "transform_text=False" in inspect.getsource(audio._sync_sentence_to_pcm)
+
     def test_hook_name_is_valid(self):
         from hermes_cli.plugins import VALID_HOOKS
         assert transform.HOOK_NAME in VALID_HOOKS

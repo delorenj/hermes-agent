@@ -457,8 +457,13 @@ def _synthesize_chunks(chunks: list[str], base_path: Path, generated_artifacts: 
 
 def text_to_speech_tool(
     text: str, output_path: Optional[str] = None, speed: Optional[float] = None,
-    instructions: Optional[str] = None, provider: Optional[str] = None) -> str:
+    instructions: Optional[str] = None, provider: Optional[str] = None,
+    *, transform_text: bool = True) -> str:
     """Convert text to speech with long-form chunking; returns the JSON result envelope.
+
+    ``transform_text=False`` skips the ``transform_tts_text`` plugin hook; per-sentence and
+    short-phrase callers (sentence pipelines, ack phrases) pass it so a persona rewrite only
+    ever sees a whole response.
 
     Text is normalized, split into provider-safe chunks (never silently truncated), synthesized
     sequentially, then packed against the platform's upload limit: a failed combine keeps the
@@ -477,7 +482,8 @@ def text_to_speech_tool(
     max_len = _resolve_max_text_length(provider, tts_config)
     platform, want_opus = _session_platform()
     # Plugin rewrite (voice persona): sees the WHOLE response once, before chunking; fail-open.
-    text = apply_tts_text_transform(text, provider, tts_config, platform)
+    if transform_text:
+        text = apply_tts_text_transform(text, provider, tts_config, platform)
     chunks = _split_text_for_tts(text, max_len)
     if not chunks:
         return tool_error("Text is required", success=False)

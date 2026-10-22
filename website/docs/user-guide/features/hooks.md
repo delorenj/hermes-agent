@@ -1758,7 +1758,7 @@ def my_callback(
 
 **Timeout:** this hook is deliberately not bounded by `plugins.hook_callback_timeout`, because a typical callback wraps an LLM call that takes several seconds. It has its own cap, `tts.transform_timeout_seconds` (default `45`); on expiry the original text is spoken. It costs nothing when no plugin registers it.
 
-**Scope:** whole-file synthesis only. The sentence-level streaming TTS path speaks sentences as they arrive and cannot rewrite a whole response, so this hook does not fire there.
+**Scope:** whole-file synthesis only. The sentence-level streaming TTS path speaks sentences as they arrive and cannot rewrite a whole response, so this hook does not fire there. The sync per-sentence fallbacks (CLI voice pipeline, web speak-stream socket) and short phrases such as Discord acks call `text_to_speech_tool(..., transform_text=False)` for the same reason.
 
 **Privacy:** the callback receives the full text of the spoken reply.
 

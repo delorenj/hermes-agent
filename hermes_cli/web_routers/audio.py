@@ -413,7 +413,7 @@ def _sync_sentence_to_pcm(text: str) -> tuple:
     os.close(fd)
     extra = None
     try:
-        raw = text_to_speech_tool(text=text, output_path=tmp_path)
+        raw = text_to_speech_tool(text=text, output_path=tmp_path, transform_text=False)
         try:
             payload = json.loads(raw) if isinstance(raw, str) else raw
         except (TypeError, ValueError) as exc:
