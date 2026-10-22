@@ -16,7 +16,8 @@ import threading
 from typing import Any, Optional
 
 from tools.tts_command_provider import (
-    BUILTIN_TTS_PROVIDERS, _get_named_provider_config, _get_provider_section)
+    BUILTIN_TTS_PROVIDERS, _get_named_provider_config, _get_provider_section,
+    _is_command_provider_config)
 
 logger = logging.getLogger("tools.tts_tool")
 
@@ -30,15 +31,20 @@ def _config_voice(section: Any) -> Optional[str]:
 
 
 def resolve_configured_voice(provider: str, tts_config: dict[str, Any]) -> Optional[str]:
-    """The voice Hermes would use for *provider*: ``tts.<provider>.voice`` (or the named
-    ``tts.providers.<provider>`` block for non-built-ins), then top-level ``tts.voice``; None if unset."""
+    """The voice Hermes would use for *provider*; None if unset.
+
+    Built-ins and command providers: their own section (``tts.<provider>.voice`` or the named
+    ``tts.providers.<provider>`` block), then top-level ``tts.voice``. Registered plugin providers
+    (vox, ...) are called with top-level ``tts.voice`` (``_plugin_voice_kwargs``) and only fall back
+    to their own section as the plugin's default, so the order flips for them."""
     key = (provider or "").lower().strip()
     cfg = tts_config if isinstance(tts_config, dict) else {}
     if key in BUILTIN_TTS_PROVIDERS:
-        section = _get_provider_section(cfg, key)
-    else:
-        section = _get_named_provider_config(cfg, key)
-    return _config_voice(section) or _config_voice(cfg)
+        return _config_voice(_get_provider_section(cfg, key)) or _config_voice(cfg)
+    named = _get_named_provider_config(cfg, key)
+    if _is_command_provider_config(named):
+        return _config_voice(named) or _config_voice(cfg)
+    return _config_voice(cfg) or _config_voice(named)
 
 
 def _resolve_timeout(tts_config: dict[str, Any]) -> float:

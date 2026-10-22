@@ -115,6 +115,11 @@ class TestResolveVoice:
         assert transform.resolve_configured_voice("vox", {"providers": {"vox": {"voice": "peter"}}}) == "peter"
         assert transform.resolve_configured_voice("vox", {"vox": {"voice": "carlin"}}) == "carlin"
 
+    def test_plugin_provider_prefers_top_level_voice(self):
+        # vox is called with tts.voice; tts.vox.voice is only the plugin's own default.
+        cfg = {"voice": "brule", "vox": {"voice": "carlin"}}
+        assert transform.resolve_configured_voice("vox", cfg) == "brule"
+
     def test_unknown_is_none(self):
         assert transform.resolve_configured_voice("edge", {}) is None
         assert transform.resolve_configured_voice("edge", {"edge": {"voice": "  "}}) is None
