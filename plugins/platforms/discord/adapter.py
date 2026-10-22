@@ -3507,7 +3507,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
         try:
             from tools.tts_tool import text_to_speech_tool
             result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=phrase, output_path=audio_path
+                text_to_speech_tool, text=phrase, output_path=audio_path, transform_text=False
             )
             result = json.loads(result_json)
             actual = result.get("file_path", audio_path)
