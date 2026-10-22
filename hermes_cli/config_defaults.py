@@ -1081,6 +1081,9 @@ DEFAULT_CONFIG = {
         # turns off, so a quick re-activation (wake word, voice-chat restart) skips the reload.
         # 0 unloads immediately.
         "keep_warm_seconds": 60,
+        # Wall-clock cap (seconds) on the ``transform_tts_text`` plugin hook (e.g. a voice persona
+        # rewrite wrapping an LLM call); on timeout the original text is spoken.
+        "transform_timeout_seconds": 45,
         "streaming": {
             # Shortest first sentence (chars) spoken on its own by streaming TTS; shorter openers
             # ride with the next sentence. 20 suits English; CJK voice setups use ~6.

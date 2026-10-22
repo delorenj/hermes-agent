@@ -49,6 +49,7 @@ from tools.tts_tool_local import _generate_kittentts, _generate_neutts, _generat
 from tools.tts_tool_plugins import (
     _dispatch_to_plugin_provider, _plugin_provider_is_available,
     _plugin_provider_is_voice_compatible)
+from tools.tts_tool_transform import apply_tts_text_transform
 from tools.tts_tool_openai import _generate_deepinfra_tts, _generate_openai_tts, _has_openai_audio_backend
 
 
@@ -474,13 +475,15 @@ def text_to_speech_tool(
     tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
+    platform, want_opus = _session_platform()
+    # Plugin rewrite (voice persona): sees the WHOLE response once, before chunking; fail-open.
+    text = apply_tts_text_transform(text, provider, tts_config, platform)
     chunks = _split_text_for_tts(text, max_len)
     if not chunks:
         return tool_error("Text is required", success=False)
     if len(chunks) > 1:
         logger.info("TTS text for provider %s split into %d chunks (input=%d chars, cap=%d)",
                     provider, len(chunks), len(text), max_len)
-    platform, want_opus = _session_platform()
     delivery_profile = _resolve_audio_delivery_profile(platform, tts_config)
     base_path, error = _resolve_output_base(
         output_path, provider, command_provider_config, want_opus)

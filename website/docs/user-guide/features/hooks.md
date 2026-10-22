@@ -456,6 +456,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | Full prompt, response, and history. |
 | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
+| `transform_tts_text` | Transform | In `text_to_speech_tool`, after spoken-text normalization and before chunking, once per call on the whole text; all callbacks run, first non-empty string wins and is re-normalized. Whole-file TTS only (not the sentence-streaming path). Fail-open; bounded by `tts.transform_timeout_seconds` (default 45), not `plugins.hook_callback_timeout`. | `text`, `provider`, `voice`, `platform` | Full spoken response text. |
 | `pre_verify` | Directive/control | At the bounded edited-code verify gate; first valid continue/block-stop directive keeps the turn going. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response and changed paths. |
 | `pre_api_request` | Observer | Per provider attempt, immediately before the request; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `user_message`, `conversation_history`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `retry_count`, `request_messages`, `message_count`, `tool_count`, `approx_input_tokens`, `request_char_count`, `max_tokens`, `started_at`, `middleware_trace`, `request` | High sensitivity: legacy `user_message`, `conversation_history`, and `request_messages` are intentionally raw; prefer sanitized `request`. |
 | `post_api_request` | Observer | After normalized provider success; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `api_duration`, `started_at`, `ended_at`, `finish_reason`, `message_count`, `response_model`, `response`, `usage`, `assistant_message`, `assistant_content_chars`, `assistant_tool_call_count` | Sanitized `response` is available, but raw normalized `assistant_message` may contain model/user content; `usage` is accounting data. |
@@ -1729,6 +1730,37 @@ def register(ctx):
 ```
 
 The hook is guarded on a non-empty, non-interrupted response — it will not fire on stop-button interrupts or empty turns. Exceptions are logged as warnings and do not break agent execution.
+
+### `transform_tts_text`
+
+Fires **once per text-to-speech call** inside `text_to_speech_tool`, after Hermes has normalized the response into spoken text (markdown, emoji and think blocks stripped) and **before** it is split into provider-sized chunks, so a callback always sees the whole response and never a fragment. Every whole-file TTS path converges there: gateway auto-TTS voice replies, CLI voice, the web audio router and the agent's `text_to_speech` tool. Use it to enrich the text that will be spoken without touching the text that is displayed or stored, for example a voice persona that re-voices a reply as a character.
+
+**Callback signature:**
+
+```python
+def my_callback(
+    text: str,
+    provider: str,
+    voice: str | None,
+    platform: str | None,
+    **kwargs,
+) -> str | None:
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `text` | `str` | The already-normalized spoken text for the whole response. |
+| `provider` | `str` | Resolved TTS provider id (`edge`, `elevenlabs`, a plugin provider such as `vox`, ...). |
+| `voice` | `str \| None` | The voice Hermes would use for that provider (`tts.<provider>.voice`, else `tts.voice`); `None` if unset. |
+| `platform` | `str \| None` | Session platform when known (`telegram`, `discord`, ...). |
+
+**Return value:** a replacement `str`, or `None` to leave the text unchanged. All callbacks run, then the **first non-`None` result wins**. A non-string, blank string, exception or timeout is treated as "no change" (fail-open) and the original text is spoken. An accepted replacement is normalized again, so a persona may emit markdown or emoji safely.
+
+**Timeout:** this hook is deliberately not bounded by `plugins.hook_callback_timeout`, because a typical callback wraps an LLM call that takes several seconds. It has its own cap, `tts.transform_timeout_seconds` (default `45`); on expiry the original text is spoken. It costs nothing when no plugin registers it.
+
+**Scope:** whole-file synthesis only. The sentence-level streaming TTS path speaks sentences as they arrive and cannot rewrite a whole response, so this hook does not fire there.
+
+**Privacy:** the callback receives the full text of the spoken reply.
 
 ### API-request observer hooks
 

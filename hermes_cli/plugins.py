@@ -110,6 +110,15 @@ VALID_HOOKS: set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
     "transform_llm_output", "pre_llm_call", "post_llm_call",
+    # transform_tts_text: fired by tools.tts_tool.text_to_speech_tool on the WHOLE normalized spoken
+    # text, once per call, BEFORE chunking and synthesis (every whole-file TTS path: gateway auto-TTS,
+    # voice replies, CLI voice, the tts tool). NOT fired on the sentence-streaming TTS path.
+    # Kwargs: text (normalized), provider (resolved TTS provider id), voice (configured voice or None),
+    # platform (session platform or None). Return a replacement str or None; run-all-then-first-non-None-
+    # wins. Non-str/blank/raising/timed-out callbacks leave the text unchanged (fail-open); an accepted
+    # replacement is re-normalized. Not bounded by plugins.hook_callback_timeout (may wrap an LLM call):
+    # own bound is tts.transform_timeout_seconds (default 45). Privacy: full spoken response text.
+    "transform_tts_text",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.
     "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
