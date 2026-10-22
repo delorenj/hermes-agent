@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import Context
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from agent.i18n import t
 from gateway.config import Platform
@@ -148,6 +148,10 @@ def _send_failed(result: Any) -> bool:
 def _send_error(result: Any) -> str:
     """Error text of a failed ``send()`` result (adapters may omit it)."""
     return getattr(result, "error", "send returned success=False")
+
+
+# Shutdown-time fan-outs (home-channel notices, adapter teardown) run this many at once.
+_SHUTDOWN_NOTICE_CONCURRENCY = 16
 
 
 def _notice_target_key(platform_value: str, chat_id, thread_id) -> tuple:
@@ -1871,13 +1875,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
         if cancel_completion_batches is not None:
             await cancel_completion_batches()
-        for platform, adapter in list(self.adapters.items()):
-            await self._bounded_adapter_teardown(adapter, platform)
-        # Disconnect secondary-profile adapters (multiplex mode).
+        # Primary and secondary-profile (multiplex) adapters tear down together: each call is already bounded
+        # (cancel + disconnect, HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT apiece), so the total is the slowest
+        # adapter instead of the sum of ~60 of them.
         _profile_adapters = getattr(self, "_profile_adapters", {})
+        _teardowns = [(adapter, platform, None) for platform, adapter in list(self.adapters.items())]
         for _prof, _amap in list(_profile_adapters.items()):
-            for platform, adapter in list(_amap.items()):
-                await self._bounded_adapter_teardown(adapter, platform, profile=_prof)
+            _teardowns.extend((adapter, platform, _prof) for platform, adapter in list(_amap.items()))
+        await self._bounded_adapter_teardown_all(_teardowns)
+        for _amap in list(_profile_adapters.values()):
             _amap.clear()
         _profile_adapters.clear()
         logger.info("Shutdown phase: all adapters disconnected at +%.2fs", ctx.elapsed())

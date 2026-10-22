@@ -13,6 +13,7 @@ import faulthandler
 import logging
 import os
 import signal
+import threading
 import time
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
@@ -42,13 +43,17 @@ logger = logging.getLogger("gateway.run")
 _HANDOFF_SHARED_CHAT_TYPES = frozenset({"group", "channel", "forum", "room", "supergroup", "thread"})
 
 
+_LEFT_CORE_RECOVERY_LOCK = threading.Lock()
+
+
 def recover_left_core_in(home: Path, *, hydrate_secrets: bool = True) -> list[str]:
     """Install the catalog plugin of every feature that left core (Home Assistant) *home* uses, in
     *home*'s runtime scope (its config, secrets and allow_lazy_installs); once per process per home.
     Returns the installed plugin names. Blocking: call it off the event loop."""
     from gateway.run import _profile_runtime_scope
     from hermes_cli.left_core_migration import recover_at_startup
-    with _profile_runtime_scope(Path(home), hydrate_secrets=hydrate_secrets):
+    # Profiles start concurrently: one plugin install at a time, so the second home finds it installed.
+    with _LEFT_CORE_RECOVERY_LOCK, _profile_runtime_scope(Path(home), hydrate_secrets=hydrate_secrets):
         return recover_at_startup(gateway_start=True)
 
 

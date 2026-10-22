@@ -57,10 +57,19 @@ DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["cron_drain_t
 # disconnect adapters). Waiting for cron past that trades a job killed *and recorded* for one
 # SIGKILLed mid-write and wedged at ``last_status=running`` forever.
 CRON_DRAIN_CLEANUP_RESERVE_S = 10.0
-# systemd TimeoutStopSec headroom after the stop-path drain budget, and the floor when that
+# systemd TimeoutStopSec headroom around the stop-path drain budget, and the floor when that
 # budget is still the default immediate (0s) chat drain. Keep in lockstep with generate_systemd_unit().
-# See #94759.
-SYSTEMD_STOP_HEADROOM_S = 30.0
+# See #94759. The headroom is the sum of the bounded phases that run outside the drain window, so a
+# multiplexed host (dozens of profiles, ~60 adapters) still unwinds inside it without a SIGKILL:
+SYSTEMD_STOP_NOTICE_RESERVE_S = 20.0    # pre-drain active-chat + home-channel shutdown notices
+SYSTEMD_STOP_UNWIND_RESERVE_S = 10.0    # post-interrupt grace + agent unwind
+SYSTEMD_STOP_TEARDOWN_RESERVE_S = 40.0  # finalize agents, adapter teardown (cancel + disconnect, 5s each), DB close
+SYSTEMD_STOP_EXEC_RESERVE_S = 20.0      # ExecStop (stop mark) + ExecStopPost (cgroup cleanup)
+SYSTEMD_STOP_MARGIN_S = 20.0            # slack for a slow disk or a busy loop
+SYSTEMD_STOP_HEADROOM_S = (
+    SYSTEMD_STOP_NOTICE_RESERVE_S + SYSTEMD_STOP_UNWIND_RESERVE_S + SYSTEMD_STOP_TEARDOWN_RESERVE_S
+    + SYSTEMD_STOP_EXEC_RESERVE_S + SYSTEMD_STOP_MARGIN_S
+)
 SYSTEMD_TIMEOUT_STOP_SEC_FLOOR = 60.0
 
 # launchd is the one supervisor whose stop budget the gateway cannot size:

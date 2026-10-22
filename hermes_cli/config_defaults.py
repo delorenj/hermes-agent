@@ -2070,6 +2070,11 @@ DEFAULT_CONFIG = {
         # negative disables the timeout entirely (wait indefinitely). Bridged to
         # HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, which wins if set explicitly.
         "platform_connect_timeout": 30,
+        # Multiplex boot: how many secondary profiles start (config, adapters, first connect) at once.
+        # Each Telegram bot waits ~10s for its first long-poll, so a serial start of dozens of
+        # profiles takes minutes. ``1`` restores the serial start. Token/listener uniqueness across
+        # profiles is still decided in profile order, before any connect.
+        "profile_startup_concurrency": 8,
         # Event-loop liveness watchdog: a daemon thread probes the asyncio loop; after consecutive
         # missed probes it dumps all-thread stacks and hard-exits with the service-restart code so
         # systemd/launchd revives the process instead of leaving a wedged-but-alive zombie.

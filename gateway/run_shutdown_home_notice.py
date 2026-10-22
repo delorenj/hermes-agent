@@ -8,9 +8,10 @@ a "Gateway online" on the next boot once it was delivered.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import nullcontext
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger("gateway.run")
 
@@ -105,7 +106,7 @@ class GatewayHomeShutdownNoticeMixin:
         (_handle_fatal) that pops the adapter -> "dictionary changed size during iteration".
         """
         from gateway.run import _async_profile_runtime_scope
-        from gateway.run_shutdown import _delivery_target_key
+        from gateway.run_shutdown import _SHUTDOWN_NOTICE_CONCURRENCY, _delivery_target_key, _log_suppressed
         from gateway.warning_notifications import present_notification
 
         if self._home_got_active_session_notice(delivered):
@@ -114,6 +115,8 @@ class GatewayHomeShutdownNoticeMixin:
             logger.info("Home-channel shutdown broadcast suppressed: %s", skip_reason)
             return
         profile_adapters = getattr(self, "_profile_adapters", None) or {}
+        # Planned here, delivered below: dedup key -> senders in served-profile order.
+        home_jobs: dict[tuple, list[Callable[[], Awaitable[None]]]] = {}
         for profile, platform, platform_cfg in list(self._served_home_channel_configs()):
             home = platform_cfg.home_channel
             if not home or not home.chat_id:
@@ -142,5 +145,30 @@ class GatewayHomeShutdownNoticeMixin:
 
             # present_notification reads the ACTIVE profile's display settings: bind the served one's.
             profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
-            async with _async_profile_runtime_scope(profile_home) if profile_home else nullcontext():
-                await present_notification(_send_home, platform=platform)
+
+            async def _present_home(_send_home=_send_home, platform=platform, profile_home=profile_home):
+                async with _async_profile_runtime_scope(profile_home) if profile_home else nullcontext():
+                    await present_notification(_send_home, platform=platform)
+            home_jobs.setdefault(dedup_key, []).append(_present_home)
+
+        async def _deliver_home_group(senders: list[Callable[[], Awaitable[None]]], dedup_key: tuple) -> None:
+            # Profiles sharing one home chat owe it ONE notice: the next bot is tried only if the previous failed.
+            for sender in senders:
+                if dedup_key in notified:
+                    return
+                with _log_suppressed(logging.DEBUG, "Home-channel shutdown notification raised: %s"):
+                    await sender()
+
+        # Fork: each distinct chat is independent (and each send is a network round trip, ~0.2-0.5s, some of them
+        # to chats that no longer exist), so a serial pass over ~40 served profiles cost seconds of the stop budget.
+        # Every task gets its own context: the per-profile scope binds and resets inside it.
+        gate = asyncio.Semaphore(_SHUTDOWN_NOTICE_CONCURRENCY)
+
+        async def _bounded_group(senders, dedup_key):
+            async with gate:
+                await _deliver_home_group(senders, dedup_key)
+
+        if home_jobs:
+            await asyncio.gather(
+                *(_bounded_group(senders, key) for key, senders in home_jobs.items()), return_exceptions=True,
+            )
