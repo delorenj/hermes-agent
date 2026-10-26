@@ -1685,6 +1685,32 @@ def _normalize_job_optional_text(
     return (value.strip().rstrip("/") if strip_trailing_slash else value.strip()) or None
 
 
+SCHEDULER_INTERNAL = "internal"
+SCHEDULER_EXTERNAL = "external"
+
+
+def _normalize_scheduler(value: Any) -> Optional[str]:
+    """``scheduler`` pin: ``"external"`` or None (internal, the default, stored as absent).
+
+    ``external`` means another system (Candybar) owns WHEN the job fires: the ticker never
+    dispatches it on its own schedule, and only an explicit trigger (``hermes cron run``) runs it.
+    Anything else raises so a typo cannot silently leave a job on two schedulers."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    text = str(value).strip().lower()
+    if text == SCHEDULER_INTERNAL:
+        return None
+    if text == SCHEDULER_EXTERNAL:
+        return SCHEDULER_EXTERNAL
+    raise ValueError(
+        f"Invalid scheduler {value!r}: expected '{SCHEDULER_INTERNAL}' or '{SCHEDULER_EXTERNAL}'.")
+
+
+def is_external_scheduler(job: dict[str, Any]) -> bool:
+    """True when the job's timing is owned by an external scheduler (see ``_normalize_scheduler``)."""
+    return str(job.get("scheduler") or "").strip().lower() == SCHEDULER_EXTERNAL
+
+
 def _normalize_base_url(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value, strip_trailing_slash=True)
 
@@ -1767,6 +1793,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "scheduler": _normalize_scheduler,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1781,6 +1808,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "scheduler": _normalize_scheduler,
 }
 
 
@@ -1835,6 +1863,7 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    scheduler: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1847,7 +1876,9 @@ def create_job(
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
-    (0 = never catch up)."""
+    (0 = never catch up). scheduler: ``"external"`` hands the job's
+    timing to another system; the ticker never fires it on its own and ``hermes cron run`` is the
+    only trigger (AD-19 of the Candybar architecture)."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1939,6 +1970,7 @@ def create_job(
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
         ("catch_up", f["catch_up"]),
+        ("scheduler", f["scheduler"]),
     ):
         if value is not None:
             job[key] = value
@@ -2749,6 +2781,8 @@ def claim_job_for_fire(
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
+        if is_external_scheduler(job) and not manual_fire:
+            return False  # a provider/webhook callback never fires an externally scheduled job
         instant = None if manual_fire else scheduled_instant(job.get("next_run_at"))
         # A scheduled tick only ever fires when now >= next_run_at
         # (_evaluate_due_job returns False while the stored occurrence is still
@@ -3180,6 +3214,15 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     recurring jobs; then once due: re-anchor stale cron instants, fast-forward missed recurring
     runs, retire/guard one-shots, and finally stamp the run claim / dispatch record."""
     now = scan.now
+    # External scheduler (Candybar, AD-19): the job's own natural schedule never fires it. Only a
+    # trigger_job stamp (manual_run_at == next_run_at, string-exact like ``manual_run`` below) makes
+    # it due. Checked FIRST so none of the repair/catch-up/re-arm passes below can turn a stale
+    # natural instant into a fire — and a trigger never re-enables the natural schedule, because
+    # mark_job_run's advance to the next natural instant is refused here again.
+    if is_external_scheduler(job) and (
+        not job.get("next_run_at") or job.get("manual_run_at") != job.get("next_run_at")
+    ):
+        return False
     # Cross-process guard: another process's live one-shot run_claim (younger than TTL) — do NOT
     # re-dispatch. Malformed/future-dated claims (clock/TZ skew) count as stale, never eternally
     # fresh.

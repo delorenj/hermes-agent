@@ -779,7 +779,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
                    ("interpreter", "interpreter"), ("timezone", "timezone"),
-                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"))
+                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"),
+                   ("scheduler", "scheduler"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
@@ -795,7 +796,8 @@ _JOB_DETAIL_LINES = (
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
     ("timezone", "  Timezone: {} (schedule runs on this zone's wall clock)"),
     ("workdir", "  Workdir: {}"),
-    ("interpreter", "  Python: {}"))
+    ("interpreter", "  Python: {}"),
+    ("scheduler", "  Scheduler: {} (fires only on `hermes cron run`)"))
 
 
 def _print_job_details(job_data: dict[str, Any]) -> None:
@@ -906,6 +908,17 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
                 and not job.get('delegation_id') and job.get('execution_mode') != 'background'):
             return 1
     return 0
+
+
+def cron_run(args) -> int:
+    """``hermes cron run <job> [--wait [--timeout S]]`` (see ``hermes_cli/cron_wait.py``)."""
+    if not getattr(args, "wait", False):
+        return _job_action("run", args.job_id, "Triggered")
+    from hermes_cli.cron_wait import run_and_wait
+
+    return run_and_wait(
+        args.job_id, timeout=float(getattr(args, "timeout", 3600.0) or 0),
+        trigger=lambda ref: _job_action("run", ref, "Triggered"))
 
 
 def _run_outcome(job: dict[str, Any]) -> str:
@@ -1025,7 +1038,7 @@ _CRON_SUBCOMMANDS = {
     "edit": lambda a: cron_edit(a),
     "pause": lambda a: _job_action("pause", a.job_id, "Paused"),
     "resume": lambda a: cron_resume(a),
-    "run": lambda a: _job_action("run", a.job_id, "Triggered"),
+    "run": lambda a: cron_run(a),
     "cancel": lambda a: cron_cancel(a),
     "remove": lambda a: _job_action("remove", a.job_id, "Removed"),
 }

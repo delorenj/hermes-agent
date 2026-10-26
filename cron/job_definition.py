@@ -16,6 +16,7 @@ JOB_DEFINITION_FIELDS = frozenset({
     "schedule", "schedule_display", "deliver", "origin", "enabled_toolsets",
     "workdir", "attach_to_session", "reasoning_effort", "failure_deliver",
     "timezone", "grace_minutes", "catch_up",
+    "scheduler",
 })
 
 
