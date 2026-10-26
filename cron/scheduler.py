@@ -2542,8 +2542,11 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
 class _FireAudit:
     """One usage_audit.jsonl line per fire (created once the agent exists; fire id + start clock)."""
 
-    def __init__(self, job: dict, job_id: str, model: str, *, admission=None, runtime: Optional[dict] = None, cfg=None):
+    def __init__(self, job: dict, job_id: str, model: str, *, admission=None, runtime: Optional[dict] = None, cfg=None,
+                 execution_id: Optional[str] = None):
         self.job, self.job_id, self.model = job, job_id, model
+        # Links the usage line to its durable attempt (``hermes cron run --wait`` reads it back).
+        self.execution_id = execution_id or job.get("execution_id")
         self.admission, self.runtime, self.cfg = admission, runtime or {}, cfg
         self.fire_id = uuid.uuid4().hex
         self.t_start = time.monotonic()
@@ -2582,6 +2585,7 @@ class _FireAudit:
             "ts": _utcnow_iso_ms(),
             "job_id": self.job_id,
             "fire_id": self.fire_id,
+            "execution_id": self.execution_id,
             "status": "failed" if error else "completed",
             "outcome": "failed" if error else "completed",
             "prompt_fingerprint": getattr(self.admission, "prompt_fingerprint", None),
@@ -2655,7 +2659,8 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
-        _audit = _FireAudit(job, job_id, model, admission=setup.admission, runtime=setup.runtime, cfg=_cfg)
+        _audit = _FireAudit(job, job_id, model, admission=setup.admission, runtime=setup.runtime, cfg=_cfg,
+                            execution_id=execution_id)
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,

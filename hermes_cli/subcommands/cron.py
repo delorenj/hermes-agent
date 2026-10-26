@@ -81,6 +81,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Absolute or ~ path to a Python in your own venv (e.g. ~/venvs/report/bin/python) "
             "for a .py --script / --monitor-script, so it can import packages Hermes does not "
             "ship. .sh/.bash still run under bash. Omit to use Hermes' Python.")
+    cron_create.add_argument("--scheduler", choices=("internal", "external"),
+        help="'external' = another scheduler (Candybar) owns when this job fires: the ticker "
+            "never runs it on its own and only `hermes cron run` does. Default: internal.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -152,6 +155,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Absolute or ~ path to a Python for a .py script / monitor script. "
             "Pass empty string to clear (back to Hermes' Python).")
 
+    cron_edit.add_argument("--scheduler", choices=("internal", "external"),
+        help="'external' hands this job's timing to Candybar (the ticker never fires it; only "
+            "`hermes cron run` does). 'internal' returns it to the ticker's own schedule.")
+
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
     cron_pause.add_argument("job_id", help="Job ID to pause")
@@ -163,6 +170,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_run = cron_subparsers.add_parser("run", help="Run a job on the next scheduler tick")
     cron_run.add_argument("job_id", help="Job ID to trigger")
+    _flag(cron_run, "--wait",
+        help="Block until the run's durable attempt is terminal. Exit 0 on success, 1 otherwise; "
+            "the last stdout line is 'cron-run-result: <json>' with the attempt id, status and "
+            "token usage. A run already in flight is joined, never started twice.")
+    cron_run.add_argument("--timeout", type=float, default=3600.0,
+        help="With --wait: give up after this many seconds (default 3600; 0 = no bound).")
     add_accept_hooks_flag(cron_run)
 
     cron_remove = cron_subparsers.add_parser(

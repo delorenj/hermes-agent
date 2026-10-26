@@ -20,6 +20,16 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   session is hard-interrupted so it cannot monopolise the scheduler, while a long-but-active job
   is never cut off. Attached scripts (pre-run or `no_agent`) are bounded separately by the script
   timeout (`_DEFAULT_SCRIPT_TIMEOUT`, 3600s).
+- **`scheduler: external` (Candybar, AD-19).** A job pinned `external` (`hermes cron create|edit
+  --scheduler external`, CLI-only, never the model's) is never fired by its own schedule: the due scan
+  returns False unless `manual_run_at == next_run_at` (a `trigger_job` stamp), and
+  `claim_job_for_fire` refuses a non-manual claim, so a provider callback cannot fire it either. A
+  trigger does not re-enable the natural schedule — `mark_job_run` advances to the next natural
+  instant and the guard refuses it again. `hermes cron run <job> --wait [--timeout S]`
+  (`hermes_cli/cron_wait.py`) triggers via the normal run path, follows the attempt in the executions
+  ledger to terminal, exits 0 only on `completed`, and prints `cron-run-result: <json>` (attempt id,
+  status, error, token usage read from `usage_audit.jsonl` by `execution_id`). A concurrent caller
+  joins the in-flight attempt; the claim CAS means never two attempts for one job.
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
 - Every recurring occurrence is accounted for: `tick()` advances `next_run_at` BEFORE dispatch
   (at-most-once across a mid-run crash) and stamps `pending_slot` in the same save; a scan that
