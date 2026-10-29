@@ -2625,10 +2625,6 @@ def run_job(
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job. Returns (success, full_output_doc, final_response, error).
-    ``defer_agent_teardown``: if a list, the live agent is appended instead of torn down; the caller
-    MUST call ``_teardown_cron_agent(agent)`` AFTER delivery (a torn-down async client can't
-    deliver). ``extra_prompt``: per-fire context, never persisted.
-
     ``defer_agent_teardown``: when a caller passes a list, ``run_job`` skips the agent's async-resource
     teardown (``agent.close()`` + ``cleanup_stale_async_clients()``) in its ``finally`` block and instead
     appends the live agent to that list. The caller is then responsible for calling
@@ -2636,8 +2632,9 @@ def run_job(
     #58720 where delivery ran against a torn-down async client (defense-in-depth alongside the
     interpreter-shutdown guard). When ``None`` (the default) teardown happens inline as before, so every
     existing caller is unchanged.
-    ``extra_prompt``: optional per-run context from ``cronjob(action='run', prompt=...)`` (#57331). Appended
-    to the stored prompt for this fire only — never persisted to the job definition.
+    ``extra_prompt``: per-fire context, never persisted. This primitive returns a provisional
+    agent result, NOT terminal scheduler success. Monitor acknowledgement belongs to run_one_job's
+    owner-fenced semantic completion, after failure/empty/interruption classification.
     """
     from gateway.session_cron import current_execution
     owner_execution = current_execution()
@@ -2648,6 +2645,7 @@ def run_job(
         return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
                                  execution_id=execution_id)
     job_id = job["id"]
+    job.pop("_monitor_observation", None)  # a reused dict cannot acknowledge an earlier attempt
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
     early, prompt, observation = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
@@ -2711,11 +2709,7 @@ def run_job(
         logger.info("Job '%s' completed successfully", job_name)
         _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
         if observation is not None:
-            from cron.monitor import acknowledge_monitor
-            try:
-                acknowledge_monitor(job_id, observation)
-            except Exception:
-                logger.exception("Job '%s': monitor acknowledgement failed; keeping observation pending", job_id)
+            job["_monitor_observation"] = observation  # provisional until owner-fenced terminal success
         return True, output, final_response, None
 
     except (Exception, ConfigBackendUnavailable) as e:  # the plane being down fails THIS fire only
@@ -3504,8 +3498,8 @@ def _run_one_job_body(
             finish_interrupted_run(job, execution_id, delivery_error)
             return True
 
-        from cron.scheduler_bookkeeping import finish_completed_run
-        return finish_completed_run(d, fire_owner, execution_id)
+        from cron.monitor import finish_monitor_run
+        return finish_monitor_run(d, fire_owner, execution_id)
 
     except BaseException as e:
         from cron.scheduler_authority import CronExecutionUnknown

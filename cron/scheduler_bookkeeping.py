@@ -122,6 +122,10 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         # Legacy direct calls may have no execution row; an already-finished row is also safe.
         if current is not None and current['status'] not in FIRER_FINISHED_STATES:
             return False
+    # A changed monitor observation is acknowledged only by a durable terminal success receipt
+    # written under the owner fence (cron/monitor.py), never by bare run_job completion.
+    from cron.monitor import acknowledge_completed_monitor
+    acknowledge_completed_monitor(job, finished, success=bool(d.success and marked))
     if job.get("last_delivery_queued"):
         # A drain that settled before this run's own bookkeeping landed found nothing to fence on.
         settle_quietly(job["id"], execution_id)
