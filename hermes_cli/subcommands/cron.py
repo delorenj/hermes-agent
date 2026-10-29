@@ -83,7 +83,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "ship. .sh/.bash still run under bash. Omit to use Hermes' Python.")
     cron_create.add_argument("--scheduler", choices=("internal", "external"),
         help="'external' = another scheduler (Candybar) owns when this job fires: the ticker "
-            "never runs it on its own and only `hermes cron run` does. Default: internal.")
+            "never runs it on its own and only `hermes cron run` does. Recurring schedules "
+            "(interval/cron) require 'external' (Candybar is the single clock) unless "
+            "cron.recurring_policy is off or you pass 'internal' deliberately. Default: internal.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -157,7 +159,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_edit.add_argument("--scheduler", choices=("internal", "external"),
         help="'external' hands this job's timing to Candybar (the ticker never fires it; only "
-            "`hermes cron run` does). 'internal' returns it to the ticker's own schedule.")
+            "`hermes cron run` does). 'internal' returns it to the ticker's own schedule "
+            "(an operator override of the Candybar single-clock policy).")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

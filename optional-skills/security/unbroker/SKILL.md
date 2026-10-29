@@ -28,7 +28,7 @@ The Python CLI (`scripts/pdd.py`) owns the deterministic state - config, dossier
 broker database, tier planning, the ledger, drafts, reports, **email sending (SMTP), verification-link
 polling (IMAP), and the autonomous action queue (`next`)**. You (the agent) do the scanning and
 form-driving with native tools: `web_extract` and `browser_navigate` for searching and web forms, and
-`cronjob` for recurring re-scans.
+Candybar (an external Hermes job) for recurring re-scans; `cronjob` only for one-shots.
 
 ## Autonomy contract
 

@@ -35,6 +35,7 @@ from cron.jobs import (
     AmbiguousJobReference,
     claim_job_for_fire,
     get_job,
+    is_external_scheduler,
     is_job_runnable,
     list_jobs,
     mark_job_run,
@@ -639,11 +640,51 @@ def _with_guidance(result: dict[str, Any], job: dict[str, Any], deliver: Optiona
     return result
 
 
+def _candybar_policy_on() -> bool:
+    """True when ``cron.recurring_policy`` is "candybar" (the default): Candybar owns WHEN recurring work
+    runs, so Hermes' own ticker refuses new recurring jobs. "off" restores the legacy behaviour."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        policy = cfg_get(load_config_readonly(), "cron", "recurring_policy", default="candybar")
+        return str(policy or "").strip().lower() == "candybar"
+    except Exception:
+        return True
+
+
+_CANDYBAR_REFUSAL = (
+    "Hermes does not run recurring schedules: Candybar is the single clock. Register a candybar.toml "
+    "manifest with a hermes runner ({kind: hermes, profile, job_id}) in ~/code/33GOD/candybar instead "
+    "(see the candybar skill; lint with `uv run candybar doctor --repo . --live --json`). The Hermes "
+    "job it fires is created with `hermes -p <profile> cron create --scheduler external ...`. "
+    "For a one-time reminder use schedule 'in 30m' or an ISO timestamp.")
+
+
+def _candybar_recurring_refusal(
+        schedule: Optional[str], scheduler: Optional[str], already_external: bool) -> Optional[str]:
+    """Refusal text when ``schedule`` is recurring (interval/cron) on a job that is not Candybar's, else None.
+
+    Allowed: one-shots, ``scheduler=external`` (Candybar fires it; also a job already external), and an
+    explicit ``scheduler=internal`` operator override (CLI only: the model schema never carries it).
+    Invalid schedules fall through to the normal parse error."""
+    if not schedule or already_external or not _candybar_policy_on():
+        return None
+    if str(scheduler or "").strip().lower() in ("external", "internal"):
+        return None
+    try:
+        kind = parse_schedule(schedule).get("kind")
+    except ValueError:
+        return None
+    return _CANDYBAR_REFUSAL if kind in ("interval", "cron") else None
+
+
 def _action_create(a: dict[str, Any]) -> str:
     prompt, script = a["prompt"], a["script"]
     deliver = _normalize_deliver_param(a["deliver"])
     if not a["schedule"]:
         return tool_error("schedule is required for create", success=False)
+    _refusal = _candybar_recurring_refusal(a["schedule"], a["scheduler"], False)
+    if _refusal:
+        return tool_error(_refusal, success=False)
     canonical_skills = _canonical_skills(a["skill"], a["skills"])
     _no_agent = bool(a["no_agent"])
     # no_agent=True -> the script IS the job (prompt/skills optional); else prompt or skills.
@@ -945,6 +986,13 @@ _UPDATE_STEPS = (_update_core_fields, _update_script_fields, _update_context_fro
 
 
 def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:
+    if a["schedule"] is not None:
+        # Only a schedule change is gated: prompt/deliver/scheduler edits and every other action stay open.
+        _refusal = _candybar_recurring_refusal(
+            a["schedule"], a["scheduler"],
+            is_external_scheduler(job) or str(a["scheduler"] or "").strip().lower() == "external")
+        if _refusal:
+            return tool_error(_refusal, success=False)
     updates: dict[str, Any] = {}
     for step in _UPDATE_STEPS:
         error = step(job, a, updates)
@@ -1056,7 +1104,23 @@ def _cronjob_schema_overrides() -> dict:
     that process, so a path baked in at import would name the launch profile's home (#95685)."""
     params = copy.deepcopy(CRONJOB_SCHEMA["parameters"])
     params["properties"]["script"]["description"] = _script_description(display_hermes_home())
-    return {"parameters": params}
+    overrides: dict = {"parameters": params}
+    if _candybar_policy_on():
+        # Steer the model before it tries: recurring schedules belong to Candybar (cron.recurring_policy).
+        params["properties"]["schedule"]["description"] = (
+            _CANDYBAR_SCHEDULE_PREFIX + params["properties"]["schedule"]["description"])
+        overrides["description"] = _CANDYBAR_DESCRIPTION_PREFIX + CRONJOB_SCHEMA["description"]
+    return overrides
+
+
+_CANDYBAR_DESCRIPTION_PREFIX = (
+    "RECURRING SCHEDULES ARE DISABLED HERE: Candybar is the single clock. Never create interval or cron "
+    "jobs with this tool; register a candybar.toml manifest with a hermes runner instead (see the candybar "
+    "skill). Use create only for one-shot reminders ('in 30m', ISO timestamp); list/run/pause/resume/remove/"
+    "update are unaffected.\n\n")
+_CANDYBAR_SCHEDULE_PREFIX = (
+    "ONE-SHOT ONLY: recurring forms (1), (3) and (4) below are refused; Candybar owns recurring work. "
+    "Use (2) or (5). ")
 
 
 CRONJOB_SCHEMA = {

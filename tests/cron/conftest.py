@@ -14,6 +14,14 @@ inside the test, which overrides this fixture's value for that scope.
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _recurring_policy_off(monkeypatch):
+    """cron.recurring_policy defaults to "candybar" (refuse recurring jobs not pinned scheduler=external).
+    These tests legitimately create interval/cron jobs through cronjob() and the CLI, so run them on the
+    legacy policy; the policy itself is covered by tests/tools/test_cronjob_tools.py."""
+    monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: False)
+
+
 @pytest.fixture()
 def make_cron_provider():
     """Factory for minimal CronScheduler test doubles.

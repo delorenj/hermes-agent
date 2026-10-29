@@ -109,6 +109,8 @@ def test_host_record_rung_names_the_roster_and_a_runnable_restart(served_root, c
 
 @pytest.mark.parametrize("heartbeat", ["missing", "fresh", "stale"])
 def test_satellite_list_and_create_require_own_heartbeat(served_root, capsys, monkeypatch, heartbeat):
+    # This test creates a recurring job through the CLI; the Candybar policy is covered elsewhere.
+    monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: False)
     from argparse import Namespace
     from cron import jobs
     from hermes_cli import cron

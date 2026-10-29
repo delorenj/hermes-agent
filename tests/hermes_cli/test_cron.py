@@ -22,6 +22,12 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _recurring_policy_off(monkeypatch):
+    """Legacy behaviour for this module; TestCronCreateRecurringPolicy overrides it with the policy on."""
+    monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: False)
+
+
 class TestCronCommandLifecycle:
 
     def test_edit_persists_user_owned_inference_pins(self, tmp_cron_dir, capsys):
@@ -673,3 +679,59 @@ class TestSlashCronRunSkipped:
         out = capsys.readouterr().out
         assert "Job is paused/disabled; resume it before running." in out
         assert "Triggered" not in out and "next scheduler tick" not in out
+
+
+class TestCronCreateRecurringPolicy:
+    """`hermes cron create` goes through cronjob(): recurring needs --scheduler external (Candybar)."""
+
+    @pytest.fixture(autouse=True)
+    def _recurring_policy_off(self, tmp_cron_dir, monkeypatch):  # overrides the module fixture
+        monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: True)
+
+    @staticmethod
+    def _parse(*argv):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        return parser.parse_args(["cron", *argv])
+
+    def test_recurring_create_refused_without_scheduler(self, capsys):
+        rc = cron_command(self._parse("create", "every 1h", "ping"))
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "Candybar" in out and "--scheduler external" in out
+        assert list_jobs(include_disabled=True) == []
+
+    def test_recurring_create_allowed_with_external(self, capsys):
+        rc = cron_command(self._parse("create", "every 1h", "ping", "--scheduler", "external"))
+        assert not rc
+        (job,) = list_jobs(include_disabled=True)
+        assert job["scheduler"] == "external"
+
+    def test_one_shot_create_allowed(self, capsys):
+        assert not cron_command(self._parse("create", "in 30m", "ping"))
+        assert len(list_jobs(include_disabled=True)) == 1
+
+    def test_recurring_create_allowed_with_operator_internal_override(self, capsys):
+        assert not cron_command(self._parse("create", "every 1h", "ping", "--scheduler", "internal"))
+        assert len(list_jobs(include_disabled=True)) == 1
+
+    def test_edit_scheduler_pin_is_not_gated(self, capsys):
+        job = create_job(prompt="legacy", schedule="every 1h")
+        assert not cron_command(self._parse("edit", job["id"], "--scheduler", "external"))
+        assert get_job(job["id"])["scheduler"] == "external"
+        assert not cron_command(self._parse("edit", job["id"], "--scheduler", "internal"))
+
+    def test_edit_reschedule_internal_job_refused(self, capsys):
+        job = create_job(prompt="legacy", schedule="in 30m")
+        rc = cron_command(self._parse("edit", job["id"], "--schedule", "every 5m"))
+        assert rc == 1
+        assert "Candybar" in capsys.readouterr().out
+
+    def test_scheduler_help_names_candybar(self):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        cron_sub = subparsers.choices["cron"]._subparsers._group_actions[0].choices
+        for name in ("create", "edit"):
+            assert "Candybar" in cron_sub[name].format_help()

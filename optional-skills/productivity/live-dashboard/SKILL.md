@@ -19,7 +19,7 @@ metadata:
 
 Turn one sentence — "make a dashboard for our visa applications, update it daily from the email threads and the case-status site" — into a persistent, self-refreshing status page. The user describes what they want to see; you define the data contract, build a self-contained HTML dashboard, verify one live refresh, then schedule the recurring tick.
 
-Setup runs once in the foreground; the recurring refresh runs as a `cronjob` tick. Installing this skill offers a daily all-dashboards sweep via `/suggestions` (the frontmatter blueprint).
+Setup runs once in the foreground; the recurring refresh runs as a Hermes job tick that Candybar fires. Installing this skill offers a daily all-dashboards sweep via `/suggestions` (the frontmatter blueprint).
 
 ## When to Use
 
@@ -34,7 +34,7 @@ Don't use for: one-off status questions (answer directly), price/availability th
 ## Prerequisites
 
 - At least one source connector the dashboard will read from: email/calendar via `himalaya` or `google-workspace`, websites via `web_extract` or `browser_navigate`, local files via `read_file`. If none is configured, renegotiate the sources in step 1 before writing any artifact.
-- `cronjob` for the recurring tick.
+- `terminal` for `hermes cron create --scheduler external` (Candybar fires the recurring tick; `cronjob` refuses recurring schedules).
 - Optional: the `desktop_preview` tool (Hermes desktop app sessions). When it is in the toolset, dashboards render in the in-app preview pane; otherwise the user is given the file path.
 
 ## Procedure — Setup (foreground, once)
@@ -61,11 +61,10 @@ Populate both from the step-2 reads, then show the result (step 8). Done when th
 Only after step 3 succeeded, schedule the tick. If the daily all-dashboards sweep from `/suggestions` is already scheduled and its cadence suits, it will pick this dashboard up — say so and stop. Otherwise create a per-dashboard job whose prompt names the state file:
 
 ```
-cronjob(action="create",
-        schedule=<cadence from the contract, e.g. "0 8 * * *">,
-        prompt="Load the live-dashboard skill and run the refresh tick for the dashboard at <absolute path to dashboards/<slug>/dashboard.json>.",
-        deliver=<user's destination>)
+terminal(command="hermes cron create --scheduler external '<cadence from the contract, e.g. 0 8 * * *>' 'Load the live-dashboard skill and run the refresh tick for the dashboard at <absolute path to dashboards/<slug>/dashboard.json>.' --deliver <user's destination>")
 ```
+
+The job is pinned `--scheduler external`: Candybar owns recurring schedules (the `cronjob` tool refuses them). Register a `candybar.toml` manifest with a hermes runner (`{kind: hermes, profile, job_id}`) at the cadence; follow the `candybar` skill.
 
 Pick a cadence that respects source rate limits. Done when a job covering this dashboard exists and its prompt names the state-file path (or the sweep).
 

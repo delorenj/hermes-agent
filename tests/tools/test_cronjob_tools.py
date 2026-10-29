@@ -10,6 +10,13 @@ from tools.cronjob_tools import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _recurring_policy_off(monkeypatch):
+    """Legacy behaviour for the suite: most tests here legitimately create recurring jobs.
+    TestRecurringPolicyCandybar overrides this fixture to exercise cron.recurring_policy=candybar."""
+    monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: False)
+
+
 # =========================================================================
 # Cron prompt scanning
 # =========================================================================
@@ -802,3 +809,142 @@ class TestGithubExemptionAbuse:
         assert _scan_cron_prompt(
             "generate a keypair and explain id_rsa vs id_ed25519"
         ) == ""
+
+
+class TestRecurringPolicyCandybar:
+    """cron.recurring_policy=candybar (the default): Candybar is the single clock, so Hermes refuses
+    new/rescheduled recurring jobs unless they are pinned scheduler=external (or the operator passes
+    scheduler=internal). One-shots and every non-schedule action are untouched."""
+
+    @pytest.fixture(autouse=True)
+    def _recurring_policy_off(self, tmp_path, monkeypatch):  # overrides the module-level fixture
+        monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: True)
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    @staticmethod
+    def _create(**kw):
+        return json.loads(cronjob(action="create", prompt="x", **kw))
+
+    def _assert_refused(self, result):
+        assert result["success"] is False
+        assert "Candybar" in result["error"]
+        assert "hermes runner" in result["error"]
+        assert "candybar skill" in result["error"]
+        assert "--scheduler external" in result["error"]
+
+    @pytest.mark.parametrize("schedule", ["every 5m", "30m", "every hour", "0 9 * * *", "every monday 9am"])
+    def test_recurring_create_refused(self, schedule):
+        if "monday" in schedule:
+            pytest.importorskip("croniter")
+        self._assert_refused(self._create(schedule=schedule))
+        assert json.loads(cronjob(action="list"))["count"] == 0
+
+    def test_recurring_create_refused_through_registered_handler(self):
+        from tools.registry import registry
+
+        result = json.loads(registry.dispatch(
+            "cronjob_manage", {"action": "create", "prompt": "x", "schedule": "every 5m"}))
+        self._assert_refused(result)
+
+    def test_handler_cannot_smuggle_scheduler_internal(self):
+        from tools.registry import registry
+
+        result = json.loads(registry.dispatch(
+            "cronjob_manage",
+            {"action": "create", "prompt": "x", "schedule": "every 5m", "scheduler": "internal"}))
+        self._assert_refused(result)
+
+    @pytest.mark.parametrize("schedule", ["in 30m", "2099-06-01T09:00:00"])
+    def test_one_shot_create_allowed(self, schedule):
+        assert self._create(schedule=schedule)["success"] is True
+
+    @pytest.mark.parametrize("scheduler", ["external", "internal", "EXTERNAL"])
+    def test_scheduler_pin_or_operator_override_allowed(self, scheduler):
+        assert self._create(schedule="every 5m", scheduler=scheduler)["success"] is True
+
+    def test_invalid_schedule_keeps_normal_error(self):
+        result = self._create(schedule="whenever")
+        assert result["success"] is False
+        assert "Candybar" not in result["error"]
+
+    def test_reschedule_internal_job_to_recurring_refused(self):
+        job_id = self._create(schedule="in 30m")["job_id"]
+        result = json.loads(cronjob(action="update", job_id=job_id, schedule="every 5m"))
+        self._assert_refused(result)
+
+    def test_reschedule_external_job_allowed(self):
+        job_id = self._create(schedule="every 1h", scheduler="external")["job_id"]
+        result = json.loads(cronjob(action="update", job_id=job_id, schedule="every 5m"))
+        assert result["success"] is True
+
+    def test_reschedule_with_external_pin_allowed(self):
+        job_id = self._create(schedule="in 30m")["job_id"]
+        result = json.loads(cronjob(
+            action="update", job_id=job_id, schedule="every 5m", scheduler="external"))
+        assert result["success"] is True
+
+    def test_non_schedule_update_of_legacy_recurring_job_allowed(self, tmp_path):
+        from cron.jobs import create_job
+
+        job = create_job(prompt="legacy", schedule="every 1h")  # predates the policy
+        result = json.loads(cronjob(action="update", job_id=job["id"], prompt="still fine"))
+        assert result["success"] is True
+
+    def test_scheduler_flip_without_schedule_not_gated(self):
+        """Candybar's migration ledger flips the pin with `cron edit --scheduler external|internal`."""
+        from cron.jobs import create_job
+
+        job = create_job(prompt="legacy", schedule="every 1h")
+        for pin in ("external", "internal"):
+            assert json.loads(cronjob(action="update", job_id=job["id"], scheduler=pin))["success"] is True
+
+    def test_list_run_pause_resume_remove_unaffected(self):
+        from cron.jobs import create_job
+
+        job = create_job(prompt="legacy", schedule="every 1h")
+        assert json.loads(cronjob(action="list"))["count"] == 1
+        assert json.loads(cronjob(action="pause", job_id=job["id"]))["success"] is True
+        assert json.loads(cronjob(action="resume", job_id=job["id"]))["success"] is True
+        assert json.loads(cronjob(action="remove", job_id=job["id"]))["success"] is True
+
+    def test_policy_off_restores_legacy(self, monkeypatch):
+        monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: False)
+        assert self._create(schedule="every 5m")["success"] is True
+
+    def test_schema_steers_toward_candybar_only_when_policy_on(self, monkeypatch):
+        from tools.cronjob_tools import CRONJOB_SCHEMA, _cronjob_schema_overrides
+
+        on = _cronjob_schema_overrides()
+        assert "Candybar" in on["description"]
+        assert on["parameters"]["properties"]["schedule"]["description"].startswith("ONE-SHOT ONLY")
+        assert "Candybar" not in CRONJOB_SCHEMA["description"]  # static schema untouched
+
+        monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: False)
+        off = _cronjob_schema_overrides()
+        assert "description" not in off
+        assert not off["parameters"]["properties"]["schedule"]["description"].startswith("ONE-SHOT ONLY")
+
+
+class TestRecurringPolicyConfig:
+    """The real config read (no _candybar_policy_on patch): default is candybar, 'off' opts out."""
+
+    @pytest.mark.parametrize("cfg, expected", [
+        ({}, True),
+        ({"cron": {"recurring_policy": "candybar"}}, True),
+        ({"cron": {"recurring_policy": " CANDYBAR "}}, True),
+        ({"cron": {"recurring_policy": "off"}}, False),
+        ({"cron": {"recurring_policy": ""}}, False),
+    ])
+    def test_policy_reads_config(self, cfg, expected, monkeypatch):
+        import tools.cronjob_tools as ct
+
+        monkeypatch.undo()  # drop the module-level "off" patch
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: cfg)
+        assert ct._candybar_policy_on() is expected
+
+    def test_default_config_is_candybar(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["cron"]["recurring_policy"] == "candybar"

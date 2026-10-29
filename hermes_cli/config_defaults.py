@@ -1807,6 +1807,10 @@ DEFAULT_CONFIG = {
         # created this way are user-owned in the same flat jobs table. Interactive toolsets
         # (messaging/clarify) stay denied in cron regardless.
         "allow_agent_scheduling": False,
+        # Candybar is the single clock for recurring work. "candybar" refuses creating or rescheduling
+        # a recurring (interval/cron) job unless it is pinned scheduler=external (or the operator
+        # passes scheduler=internal explicitly); one-shots are unaffected. "off" = legacy behaviour.
+        "recurring_policy": "candybar",
         # Pre-dispatch validation: before building any agent machinery, verify the provider API key
         # resolves (unless a fallback chain exists), attached skills are ready, and delivery
         # platforms are configured. Failure -> last_status=blocked_config, ONE alert, no LLM call.

@@ -42,6 +42,17 @@ Whichever provider a job resolves to, its provider-specific request settings (e.
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::
 
+## Recurring schedules: Candybar is the single clock
+
+On a host where Candybar (`~/code/33GOD/candybar`) owns recurring work, set `cron.recurring_policy: candybar` (the default in this fork). Hermes then refuses to create, or reschedule to, a recurring (interval or cron-expression) job unless the job is pinned `scheduler: external`:
+
+- One-shot schedules (`in 30m`, an ISO timestamp) are unaffected, as are `list`, `run`, `pause`, `resume`, `remove` and any edit that does not change the schedule.
+- `hermes cron create --scheduler external <schedule> <prompt>` creates a job the built-in ticker never fires; Candybar fires it through a `candybar.toml` manifest with a hermes runner (`{kind: hermes, profile, job_id}`), which runs `hermes -p <profile> cron run <id> --wait`.
+- `--scheduler internal` is a deliberate operator override. The `cronjob_manage` tool never accepts it, so an agent cannot self-grant it.
+- `cron.recurring_policy: off` restores the legacy behavior. Jobs created before the policy keep running; the policy only gates new and rescheduled jobs.
+
+The same refusal applies to `hermes cron create/edit`, the `/cron` slash command and the TUI, because they all go through `cronjob()`. Dashboard, API-server, blueprint and suggestion creators are operator surfaces and are not gated.
+
 ## Creating scheduled tasks
 
 ### In chat with `/cron`
