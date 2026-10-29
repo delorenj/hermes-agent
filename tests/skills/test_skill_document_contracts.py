@@ -61,7 +61,7 @@ def test_required_references_are_present_and_routed(skill, references):
      ("claude", "slash command", "disable-model-invocation")),
     (ACTUAL, ("--provider actual",), ("hermes config set providers.actual.api ", "key_env")),
     (MEETING, ("never invent", "before creating anything", "`unresolved`"), (r"\bLinear\b",)),
-    (PRICE, ("Setup (foreground, once)", "Tick (each scheduled run)", "cronjob(action=",
+    (PRICE, ("Setup (foreground, once)", "Tick (each scheduled run)", "cron create --scheduler external",
              "Do not schedule until one foreground fetch works",
              "never overwrite the last good observation", "fingerprint"), ("flight-research",)),
     (EMAIL, ("read + draft", "does not imply permission", "Calibrate the user's voice",

@@ -16,6 +16,12 @@ from cron.lifecycle_guard import contains_gateway_lifecycle_command as _contains
 from hermes_cli.cron import cron_command
 
 
+@pytest.fixture(autouse=True)
+def _recurring_policy_off(monkeypatch):
+    """These tests create recurring jobs to exercise the lifecycle guard, not the Candybar policy."""
+    monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: False)
+
+
 # ---------------------------------------------------------------------------
 # Defense 2: _contains_gateway_lifecycle_command pattern tests
 # ---------------------------------------------------------------------------

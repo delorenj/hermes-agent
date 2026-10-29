@@ -18,7 +18,7 @@ when_to_use:
 when_not_to_use:
   - Small bounded task (under ~10 units) - do it inline or call the tool directly
   - Tight serial dependency (B needs A's output) - orchestration overhead is wasted
-  - Work that must outlive this process (days, restarts) - use `cronjob` or the kanban swarm instead
+  - Work that must outlive this process (days, restarts) - use a one-shot `cronjob`, a Candybar-fired job, or the kanban swarm instead
 ---
 
 # Dynamic Workflow Skill

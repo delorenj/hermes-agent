@@ -13,7 +13,7 @@ metadata:
 
 # Competitor News Monitor
 
-Track a declared company set and report only material, new developments with primary-source evidence. This is not a generic page-diff watcher: it applies company-news categories, source hierarchy, event deduplication, and business significance. Setup runs once in the foreground; the recurring check runs as a `cronjob` tick (the `competitor-watch` automation blueprint scaffolds this).
+Track a declared company set and report only material, new developments with primary-source evidence. This is not a generic page-diff watcher: it applies company-news categories, source hierarchy, event deduplication, and business significance. Setup runs once in the foreground; the recurring check runs as a Hermes job tick that Candybar fires (the `competitor-watch` automation blueprint scaffolds this).
 
 ## When to Use
 
@@ -45,11 +45,10 @@ For each company include, where available:
 Use `rss-feeds` (optional) or `blogwatcher` (optional, stateful) for feeds, `reddit-reading` for community discussion, and `web_search`/`web_extract` for pages. Write the watch contract (watchlist, categories, materiality threshold, last cutoff) to a state file under `~/.hermes/competitor-watches/<watch-slug>.json`, then create the job:
 
 ```
-cronjob(action="create",
-        schedule="every monday 9am",
-        prompt="Load the competitor-news-monitor skill and run the tick for the watch contract at ~/.hermes/competitor-watches/<watch-slug>.json.",
-        deliver=<user's destination>)
+terminal(command="hermes cron create --scheduler external 'every monday 9am' 'Load the competitor-news-monitor skill and run the tick for the watch contract at ~/.hermes/competitor-watches/<watch-slug>.json.' --deliver <user's destination>")
 ```
+
+The job is pinned `--scheduler external` because Candybar owns recurring schedules (the `cronjob` tool refuses them): register a `candybar.toml` manifest with a hermes runner (`{kind: hermes, profile, job_id}`) at the cadence; follow the `candybar` skill.
 
 Done when each requested event category has at least one intended primary source or a documented gap, and the job exists.
 
