@@ -42,6 +42,23 @@ def test_unchanged_prompt_on_a_stateful_job_is_suppressed_before_inference(tmp_p
     assert adm.reason.startswith("identical expanded prompt")
 
 
+def test_refused_monitor_prompt_is_retryable_without_weakening_daily_guard(tmp_path):
+    prompt = "unchanged expanded monitor prompt"
+    fp = economics.prompt_fingerprint(prompt)
+    now = datetime.now(timezone.utc).isoformat()
+    monitor_job = {"id": "job1", "monitor_script": "source.sh"}
+    path = tmp_path / "usage_audit.jsonl"
+    _audit(path, [{"ts": now, "job_id": "job1", "status": "skipped",
+                   "outcome": "blocked", "prompt_fingerprint": fp}])
+    assert _admit(tmp_path, job=monitor_job, prompt=prompt).allowed
+    _audit(path, [{"ts": now, "job_id": "job1", "status": "completed",
+                   "outcome": "completed", "prompt_fingerprint": fp, "total_tokens": 10}])
+    assert _admit(tmp_path, job=monitor_job, prompt=prompt).allowed
+    guarded = _admit(tmp_path, job=monitor_job, prompt=prompt,
+                     config={"cron": {"economics": {"max_daily_runs": 1}}})
+    assert not guarded.allowed and guarded.reason and "daily run limit" in guarded.reason
+
+
 def test_daily_run_cap_blocks_and_alerts_once(tmp_path):
     now = datetime.now(timezone.utc).isoformat()
     rows = [
