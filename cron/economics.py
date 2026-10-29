@@ -212,7 +212,11 @@ def admit(
         or job.get("context_from")
         or (isinstance(job.get("economics"), dict) and job["economics"].get("dedupe_static_prompt"))
     )
-    if policy.suppress_identical_prompts and stateful_job and records:
+    # Monitor output is already compared against its acknowledged snapshot by the monitor gate;
+    # its prompt may legitimately repeat while an earlier observation is pending or a gate refused it.
+    # Keep the daily token/run/dollar and per-run limits above; only prompt dedupe is inapplicable.
+    if (policy.suppress_identical_prompts and stateful_job and records
+            and not (job.get("monitor_script") or job.get("monitor_url"))):
         current = (now or datetime.now(_UTC)).astimezone(_UTC)
         for record in reversed(records):
             if record.get("prompt_fingerprint") != fingerprint:
