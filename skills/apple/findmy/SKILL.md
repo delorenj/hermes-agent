@@ -127,5 +127,5 @@ Analyze each screenshot with vision to extract coordinates, then compile a route
 
 1. Keep FindMy app in the foreground when tracking AirTags (updates stop when minimized)
 2. Use `vision_analyze` to read screenshot content — don't try to parse pixels
-3. For ongoing tracking, use a cronjob to periodically capture and log locations
+3. For ongoing tracking, have Candybar fire a periodic capture job (recurring schedules are Candybar's, not `cronjob`'s) that logs locations
 4. Respect privacy — only track devices/items the user owns

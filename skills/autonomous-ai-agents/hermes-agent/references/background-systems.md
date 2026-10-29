@@ -29,6 +29,10 @@ Durable scheduler — `cron/jobs.py` + `cron/scheduler.py`. Drive it via
 the `cronjob` tool, the `hermes cron` CLI (`list`, `add`, `edit`,
 `pause`, `resume`, `run`, `remove`), or the `/cron` slash command.
 
+- **Candybar is the single clock.** With `cron.recurring_policy: candybar` (default) the
+  `cronjob` tool and `hermes cron create` refuse recurring (interval/cron) schedules unless the
+  job is pinned `--scheduler external`; Candybar then fires it with `hermes cron run <id> --wait`.
+  One-shots (`"in 30m"`, ISO timestamp) are unaffected.
 - **Schedules:** duration (`"30m"`, `"2h"`), "every" phrase
   (`"every monday 9am"`), 5-field cron (`"0 9 * * *"`), or ISO timestamp.
 - **Per-job knobs:** `skills`, `model`/`provider` override, `script`

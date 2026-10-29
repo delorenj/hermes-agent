@@ -1478,7 +1478,7 @@ todo("update", id=1, status="completed")
 
 ### Cron Monitoring with `cronjob`
 
-Use the `cronjob` tool to schedule periodic experiment checks:
+Recurring checks belong to Candybar: pin the job `hermes cron create --scheduler external` and register it with Candybar (the `cronjob` tool refuses recurring schedules; one-shot deadlines like `in 3d` still work). The prompt shapes below are the job bodies:
 
 ```
 cronjob("create", {
