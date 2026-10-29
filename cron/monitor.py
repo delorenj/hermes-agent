@@ -1,13 +1,8 @@
 """Monitor-mode cron support — hash-suppressed change detection.
 
-A monitor job attaches a cheap source (``monitor_script`` / ``monitor_url``) to an LLM cron job.
-Each tick runs the source FIRST and hashes its EXACT output bytes (no timestamp/whitespace
-normalization — scripts must emit stable output) against the hash from the last agent-triggering
-tick: unchanged → agent run suppressed (silent ``no_change`` run); changed/first run → a "MONITOR
-CHANGE DETECTED" block (capped unified diff + new output) is injected into the prompt; source
-failure → an ERROR, never a change, and the stored hash is left untouched. State:
-``job["monitor_state"]`` in jobs.json (hash + last_changed_at) and
-``OUTPUT_DIR/<job_id>/monitor_last_output.txt`` (for the diff).
+The source is evaluated on each scheduled tick. A changed observation stays pending until an
+agent run completes; only then does its exact output become the acknowledged hash and diff
+snapshot. Refused or failed runs leave the acknowledged baseline untouched.
 """
 
 from __future__ import annotations
@@ -15,6 +10,8 @@ from __future__ import annotations
 import difflib
 import hashlib
 import logging
+import os
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -39,6 +36,9 @@ class MonitorOutcome:
     first_run: bool = False
     context_block: Optional[str] = None
     error: Optional[str] = None
+    output: str = ""
+    output_hash: str = ""
+    previous_hash: Optional[str] = None
 
 
 def hash_monitor_output(output: str) -> str:
@@ -72,17 +72,6 @@ def _read_last_output(job_id: str) -> str:
     except Exception as exc:
         logger.warning("Monitor: failed to read last output for %r: %s", job_id, exc)
     return ""
-
-
-def _write_last_output(job_id: str, output: str) -> None:
-    try:
-        from cron.jobs import _ensure_cron_dir
-
-        path = _snapshot_path(job_id)
-        _ensure_cron_dir(path.parent)
-        path.write_text(output, encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Monitor: failed to persist last output for %r: %s", job_id, exc)
 
 
 def _fetch_monitor_url(url: str) -> tuple[bool, str]:
@@ -124,27 +113,35 @@ def job_has_monitor(job: dict) -> bool:
 
 
 def check_monitor(job: dict) -> MonitorOutcome:
-    """Run the monitor source and decide whether the agent should run.
-
-    On change (or first run) the new hash + snapshot are persisted BEFORE the agent runs — detection
-    time is the state boundary, so a failed agent run doesn't re-alert on the same content forever.
-    On failure nothing is persisted.
-    """
+    """Observe the source; record pending work without advancing the acknowledged baseline."""
     job_id = str(job.get("id") or "")
     ok, output = _run_monitor_source(job)
     if not ok:
         return MonitorOutcome(ok=False, error=output)
 
     new_hash = hash_monitor_output(output)
-    raw_state = job.get("monitor_state")
-    last_hash = raw_state.get("last_output_hash") if isinstance(raw_state, dict) else None
+    from cron.jobs import _with_job, save_jobs
 
+    def observe(jobs, i, stored):
+        raw_state = stored.get("monitor_state")
+        state = dict(raw_state) if isinstance(raw_state, dict) else {}
+        last_hash = state.get("last_output_hash")
+        if last_hash == new_hash:
+            if state.pop("pending_output_hash", None) is not None:
+                stored["monitor_state"] = state
+                save_jobs(jobs)
+            return last_hash
+        state["pending_output_hash"] = new_hash
+        stored["monitor_state"] = state
+        save_jobs(jobs)
+        return last_hash
+
+    last_hash = _with_job(job_id, observe)
     if last_hash is not None and new_hash == last_hash:
         return MonitorOutcome(ok=True, changed=False)
 
     first_run = last_hash is None
     old_output = "" if first_run else _read_last_output(job_id)
-
     shown_output = output
     if len(shown_output) > MAX_OUTPUT_CHARS:
         shown_output = shown_output[:MAX_OUTPUT_CHARS] + "\n... [output truncated]"
@@ -164,23 +161,36 @@ def check_monitor(job: dict) -> MonitorOutcome:
             f"### Diff (previous → current)\n\n```diff\n{diff}\n```\n\n" + current
         )
 
-    _persist_monitor_state(job_id, new_hash, output)
-    return MonitorOutcome(ok=True, changed=True, first_run=first_run, context_block=context_block)
+    return MonitorOutcome(ok=True, changed=True, first_run=first_run, context_block=context_block,
+                          output=output, output_hash=new_hash, previous_hash=last_hash)
 
 
-def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:
-    from cron.jobs import _hermes_now, update_job
+def acknowledge_monitor(job_id: str, observation: MonitorOutcome) -> bool:
+    """Advance the baseline only for the exact pending observation a completed agent saw."""
+    if not observation.changed or not observation.output_hash:
+        return False
+    from cron.jobs import _hermes_now, _with_job, save_jobs
 
-    _write_last_output(job_id, output)
-    try:
-        update_job(
-            job_id,
-            {
-                "monitor_state": {
-                    "last_output_hash": new_hash,
-                    "last_changed_at": _hermes_now().isoformat(),
-                }
-            },
-        )
-    except Exception as exc:
-        logger.warning("Monitor: failed to persist state for %r: %s", job_id, exc)
+    def acknowledge(jobs, i, stored):
+        raw_state = stored.get("monitor_state")
+        state = dict(raw_state) if isinstance(raw_state, dict) else {}
+        if (state.get("pending_output_hash") != observation.output_hash
+                or state.get("last_output_hash") != observation.previous_hash):
+            return False
+        path = _snapshot_path(job_id)
+        from cron.jobs import _ensure_cron_dir
+        _ensure_cron_dir(path.parent)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(observation.output, encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        state.pop("pending_output_hash", None)
+        state.update(last_output_hash=observation.output_hash,
+                     last_changed_at=_hermes_now().isoformat())
+        stored["monitor_state"] = state
+        save_jobs(jobs)
+        return True
+
+    return bool(_with_job(job_id, acknowledge))

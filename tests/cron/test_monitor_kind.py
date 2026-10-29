@@ -23,6 +23,7 @@ enabler: #80774.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import pytest
@@ -37,6 +38,10 @@ def hermes_env(tmp_path, monkeypatch):
     (home / "cron").mkdir()
 
     monkeypatch.setenv("HERMES_HOME", str(home))
+    from tools.environments import local
+    monkeypatch.setattr(local, "build_subprocess_env", lambda **_kwargs: {
+        "PATH": os.environ["PATH"], "HERMES_HOME": str(home),
+    })
 
     # Reload modules that cache get_hermes_home() at import time.
     import importlib
@@ -415,6 +420,108 @@ def test_monitor_script_failure_is_error_not_change(hermes_env, monkeypatch):
     assert observed["agent_runs"] == 1  # agent NOT invoked on source failure
     # Stored hash untouched — a later recovery to 'state A' still suppresses.
     assert get_job(job["id"])["monitor_state"]["last_output_hash"] == stored_hash
+
+
+def test_refused_monitor_run_retries_and_acknowledges_exact_snapshot(hermes_env, monkeypatch):
+    from cron import economics, monitor
+    from cron.jobs import _job_output_dir, get_job
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    observed = {}
+    _install_agent_stubs(monkeypatch, observed)
+    assert run_job(job)[0]
+    snapshot = _job_output_dir(job["id"]) / "monitor_last_output.txt"
+    assert snapshot.read_text() == "state A"
+
+    _write_script(hermes_env, "mon.sh", "echo 'state B'\n")
+    original_admit = economics.admit
+    def refuse_once(**kwargs):
+        monkeypatch.setattr(economics, "admit", original_admit)
+        return economics.Admission(False, "refused", 5, 60, 12, reason="daily run limit reached (24)")
+    monkeypatch.setattr(economics, "admit", refuse_once)
+    assert run_job(get_job(job["id"]))[2] == SILENT_MARKER
+    state = get_job(job["id"])["monitor_state"]
+    assert state["last_output_hash"] == monitor.hash_monitor_output("state A")
+    assert state["pending_output_hash"] == monitor.hash_monitor_output("state B")
+    assert snapshot.read_text() == "state A"
+    assert observed["agent_runs"] == 1
+
+    # A refused audit must not itself poison the next identical expanded prompt.
+    assert run_job(get_job(job["id"]))[0]
+    assert observed["agent_runs"] == 2
+    assert "-state A" in observed["prompts"][-1]
+    assert "+state B" in observed["prompts"][-1]
+    assert snapshot.read_text() == "state B"
+    assert "pending_output_hash" not in get_job(job["id"])["monitor_state"]
+    success, doc, final, _ = run_job(get_job(job["id"]))
+    assert success and final == SILENT_MARKER and "no_change" in doc
+    assert observed["agent_runs"] == 2
+
+
+def test_failure_before_agent_retains_pending_monitor(hermes_env, monkeypatch):
+    from cron import monitor, scheduler
+    from cron.jobs import get_job
+
+    job = _make_monitor_job(hermes_env, "echo pending\n")
+    observed = {}
+    _install_agent_stubs(monkeypatch, observed)
+    original = scheduler._load_cron_job_config
+    def fail(*_args):
+        raise RuntimeError("configuration unavailable")
+    monkeypatch.setattr(scheduler, "_load_cron_job_config", fail)
+    assert scheduler.run_job(job)[0] is False
+    assert observed["agent_runs"] == 0
+    state = get_job(job["id"])["monitor_state"]
+    assert state["pending_output_hash"] == monitor.hash_monitor_output("pending")
+    assert state.get("last_output_hash") is None
+    monkeypatch.setattr(scheduler, "_load_cron_job_config", original)
+    assert scheduler.run_job(get_job(job["id"]))[0]
+    assert observed["agent_runs"] == 1
+
+
+def test_newer_observation_cannot_be_acknowledged_by_older_run(hermes_env, monkeypatch):
+    from cron import monitor
+    from cron.jobs import _job_output_dir, get_job
+    from cron.scheduler import run_job
+
+    job = _make_monitor_job(hermes_env, "echo A\n")
+    observed = {}
+    _install_agent_stubs(monkeypatch, observed)
+    assert run_job(job)[0]
+    snapshot = _job_output_dir(job["id"]) / "monitor_last_output.txt"
+    _write_script(hermes_env, "mon.sh", "echo B\n")
+    from run_agent import AIAgent
+    original = AIAgent.run_conversation
+    def observe_newer(self, prompt, *args, **kwargs):
+        _write_script(hermes_env, "mon.sh", "echo C\n")
+        newer = monitor.check_monitor(get_job(job["id"]))
+        assert newer.changed and newer.output == "C"
+        monkeypatch.setattr(AIAgent, "run_conversation", original)
+        return original(self, prompt, *args, **kwargs)
+    monkeypatch.setattr(AIAgent, "run_conversation", observe_newer)
+    assert run_job(get_job(job["id"]))[0]
+    assert snapshot.read_text() == "A"
+    assert get_job(job["id"])["monitor_state"]["pending_output_hash"] == monitor.hash_monitor_output("C")
+    assert run_job(get_job(job["id"]))[0]
+    assert snapshot.read_text() == "C"
+    assert "-A" in observed["prompts"][-1] and "+C" in observed["prompts"][-1]
+
+
+def test_monitor_source_failure_does_not_ack_pending(hermes_env, monkeypatch):
+    from cron import monitor
+    from cron.jobs import get_job
+    from cron.scheduler import run_job
+    job = _make_monitor_job(hermes_env, "echo pending\n")
+    observed = {}
+    _install_agent_stubs(monkeypatch, observed)
+    from cron import economics
+    monkeypatch.setattr(economics, "admit", lambda **kw: economics.Admission(
+        False, "refused", 5, 60, 12, reason="daily run limit reached"))
+    run_job(job)
+    _write_script(hermes_env, "mon.sh", "exit 3\n")
+    assert run_job(get_job(job["id"]))[0] is False
+    assert get_job(job["id"])["monitor_state"]["pending_output_hash"] == monitor.hash_monitor_output("pending")
 
 
 # ---------------------------------------------------------------------------
