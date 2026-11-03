@@ -21,7 +21,7 @@ import logging
 import os
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -265,6 +265,25 @@ def acknowledge_monitor(job_id: str, observation: MonitorOutcome) -> bool:
     return bool(_with_job(job_id, acknowledge))
 
 
+def observation_job_flag(job: dict) -> dict:
+    """The run's provisional observation as a JSON-safe job flag for the canonical owner result.
+
+    Agent-backed fires run inside the gateway owner (gateway/session_cron.py) on a copy of the
+    job; only flags that ride the cron result reach the firing scheduler's bookkeeping tail."""
+    observation = job.get("_monitor_observation")
+    return {"_monitor_observation": asdict(observation)} if isinstance(observation, MonitorOutcome) else {}
+
+
+def _rehydrate_observation(value) -> Optional[MonitorOutcome]:
+    if isinstance(value, dict):
+        try:
+            return MonitorOutcome(**value)
+        except TypeError:
+            logger.warning("Ignoring a malformed monitor observation flag")
+            return None
+    return value
+
+
 def finish_monitor_run(delivery, fire_owner: Optional[str], execution_id: str) -> bool:
     """Hold the fire lock across claim retirement, ledger CAS and monitor hash commit.
 
@@ -286,7 +305,7 @@ def finish_monitor_run(delivery, fire_owner: Optional[str], execution_id: str) -
 
 def acknowledge_completed_monitor(job: dict, receipt: Optional[dict], *, success: bool) -> None:
     """Only a new durable terminal success receipt can acknowledge a provisional observation."""
-    observation = job.pop("_monitor_observation", None)
+    observation = _rehydrate_observation(job.pop("_monitor_observation", None))
     if not success or not receipt or receipt.get("status") != "completed" or observation is None:
         return
     try:
