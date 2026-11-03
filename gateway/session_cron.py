@@ -308,6 +308,10 @@ async def execute(authority, ref, row, policy):
         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
         # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
         flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}
+        # A provisional monitor observation is acknowledged by the firing scheduler's terminal
+        # bookkeeping, so it crosses the boundary too (as JSON; cron/monitor.py rehydrates it).
+        from cron.monitor import observation_job_flag
+        flags.update(observation_job_flag(job))
         authority.pending_results[row['admission_id']] = {
             'result': {'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
                        'failed': not result[0], 'completed': result[0]}, 'usage': {}}

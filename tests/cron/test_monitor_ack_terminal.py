@@ -25,6 +25,20 @@ def running_monitor(hermes_env, monkeypatch):
     return job["id"], observed
 
 
+def _hook_delivery(monkeypatch, hook):
+    """Run ``hook`` at the delivery boundary, after the agent returned and before terminal bookkeeping.
+
+    Wraps the whole save/compose/deliver step rather than one send lane: a ``local`` agent-backed
+    fire queues nothing and calls no sender, but its terminal write still follows this step."""
+    from cron import scheduler
+    original = scheduler._save_compose_deliver
+    def save_compose_deliver(*args, **kwargs):
+        result = original(*args, **kwargs)
+        hook()
+        return result
+    monkeypatch.setattr(scheduler, "_save_compose_deliver", save_compose_deliver)
+
+
 def _assert_pending(job_id):
     from cron import monitor
     from cron.jobs import get_job, _job_output_dir
@@ -139,7 +153,7 @@ def test_lost_owner_cannot_ack(running_monitor, hermes_env, monkeypatch, boundar
             return result
         monkeypatch.setattr(AIAgent, "run_conversation", run)
     elif boundary == "delivery":
-        monkeypatch.setattr(scheduler, "_deliver_result", lambda *_a, **_kw: steal())
+        _hook_delivery(monkeypatch, steal)
     else:
         original = scheduler.mark_job_run
         def mark(*args, **kwargs):
@@ -165,7 +179,7 @@ def test_interrupted_after_agent_return_cannot_ack(running_monitor, hermes_env, 
             cancel.set()
         else:
             scheduler._interrupted_job_ids.add(scheduler._inflight_key(job_id))
-    monkeypatch.setattr(scheduler, "_deliver_result", interrupt)
+    _hook_delivery(monkeypatch, interrupt)
     assert scheduler.run_one_job(job, cancel_event=cancel)
     _assert_pending(job_id)
 
