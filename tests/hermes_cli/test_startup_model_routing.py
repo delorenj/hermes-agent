@@ -243,6 +243,8 @@ def test_oneshot_and_tui_qualified_model_never_reaches_default_provider(tmp_path
 
     cfg = _write_named_provider(tmp_path, monkeypatch)
     from tui_gateway import server as tui_server  # binds the config path at import: after HERMES_HOME
+    # An earlier test may have imported it under another home; point the launch home here.
+    monkeypatch.setattr(tui_server, "_hermes_home", tmp_path / "hermes-home")
     monkeypatch.delenv("HERMES_INFERENCE_PROVIDER", raising=False)
     monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
     monkeypatch.setattr(
