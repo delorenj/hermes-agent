@@ -1015,6 +1015,24 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         logger.info("[MULTIPLEX] Starting %d secondary profile(s) (concurrency=%d)", len(targets), concurrency)
         permits = asyncio.Semaphore(concurrency)
         abort = asyncio.Event()
+        followers: list[asyncio.Task] = []  # settles waiting on the previous profile's; retained (not GC'd mid-wait)
+
+        async def _follow(prev_settled, settled):
+            try:
+                await prev_settled.wait()
+            finally:
+                settled.set()
+
+        def _settle(prev_settled, settled):
+            # Never ahead of the previous profile: one that raised before its claim step (a config load) must not
+            # let the next claim before the previous one, which would win a token a serial boot gives the earlier
+            # profile. The first profile settles at once, so every chain ends (a cancelled boot cancels these too).
+            if settled.is_set():
+                return
+            if prev_settled is None or prev_settled.is_set():
+                settled.set()
+            else:
+                followers.append(asyncio.create_task(_follow(prev_settled, settled), name="profile-startup-settle"))
 
         async def _run(profile_name: str, profile_home: Path, prev_settled, settled):
             began = time.monotonic()
@@ -1030,7 +1048,7 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
                 logger.error("Failed to start adapters for profile '%s': %s", profile_name, e, exc_info=True)
                 return e
             finally:
-                settled.set()  # idempotent: a profile that failed before its claim step must not stall the next
+                _settle(prev_settled, settled)  # in order, also when it failed before its claim step
                 permits.release()
             logger.info(
                 "[MULTIPLEX] Profile '%s' started: %d adapter(s) connected in %.1fs",
@@ -1053,10 +1071,14 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
                 )))
                 prev_settled = settled
             results = await asyncio.gather(*(task for _n, task in tasks), return_exceptions=True)
+            await asyncio.gather(*followers)  # all profiles ended, so every chain has a settled head
         except BaseException:
             for _name, task in tasks:
                 task.cancel()
             await asyncio.gather(*(task for _n, task in tasks), return_exceptions=True)
+            for follower in followers:
+                follower.cancel()
+            await asyncio.gather(*followers, return_exceptions=True)
             raise
         logger.info(
             "[MULTIPLEX] Secondary profile startup finished: %d/%d launched in %.1fs",
