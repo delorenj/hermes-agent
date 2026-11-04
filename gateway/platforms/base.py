@@ -4326,19 +4326,25 @@ class BasePlatformAdapter(ABC):
                 event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
                 record_delivery)
         chat_id = event.source.chat_id
+        audio_metadata = metadata
+        if getattr(self, "_outbound_audio_spool", None) is not None:  # only an enabled Telegram spool
+            from plugins.platforms.telegram.outbound_audio_provenance import native_reply_metadata
+            audio_metadata = native_reply_metadata(self, event, metadata)  # marker only for audio sends
 
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
             """MEDIA-tag files (``media_tag``) may route to send_voice; bare local files never
             do."""
             ext = Path(path).suffix.lower()
             if media_tag and should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata, is_voice=is_voice)
+                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=audio_metadata,
+                                               is_voice=is_voice)
             elif ext in _VIDEO_EXTS:
                 if media_tag:
                     logger.info("[%s] Sending video attachment (%s) to %s", self.name, ext, chat_id)
                 result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
             else:
-                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                result = await self.send_document(chat_id=chat_id, file_path=path,
+                                                  metadata=audio_metadata if media_tag else metadata)
             if not result.success:
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)

@@ -144,11 +144,25 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
             return await self._primary.handle_async_request(request)
         last_error: Exception | None = None
-        for ip in self._attempt_order():
+        attempts = self._attempt_order()
+        if _is_replayable_media_retrieval(request):
+            # DoH often returns just the same IP as system DNS. A stalled file read
+            # needs an independent Telegram endpoint, not the same peer by hostname.
+            seeds = [ip for ip in SEED_FALLBACK_IPS if ip not in attempts]
+            attempts = attempts[:-1] + seeds + [None] if attempts[-1] is None else attempts + seeds
+        for ip in attempts:
             candidate = request if ip is None else _rewrite_request_for_ip(request, ip)
             transport = self._primary if ip is None else await self._get_fallback(ip)
             try:
                 response = await transport.handle_async_request(candidate)
+                # httpx normally reads the body after leaving the transport. Keep retrieval
+                # body errors inside the same failover boundary as response-header errors.
+                if _is_replayable_media_retrieval(request):
+                    try:
+                        await response.aread()
+                    except Exception:
+                        await response.aclose()
+                        raise
                 if self._last_failure is not None:
                     failed_path, failure = self._last_failure
                     self._last_failure = None
@@ -168,7 +182,10 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 return response
             except Exception as exc:
                 last_error = exc
-                if not _is_retryable_connect_error(exc):
+                if not (_is_retryable_connect_error(exc) or (
+                    isinstance(exc, (httpx.ReadTimeout, httpx.ReadError))
+                    and _is_replayable_media_retrieval(request)
+                )):
                     raise
                 path = ip or _TELEGRAM_API_HOST
                 failure = _describe_transport_error(exc)
@@ -301,6 +318,32 @@ def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:
     extensions = dict(request.extensions)
     extensions["sni_hostname"] = original_host
     return httpx.Request(method=request.method, url=url, headers=headers, stream=request.stream, extensions=extensions)
+
+
+def _is_replayable_media_retrieval(request: httpx.Request) -> bool:
+    """Only Telegram file reads with a buffered body may replay after an ambiguous read failure.
+
+    Bot API calls use POST even for reads. Never infer safety from POST/GET alone:
+    sendVoice may already have delivered when its response times out.
+    """
+    if request.url.host != _TELEGRAM_API_HOST:
+        return False
+    parts = request.url.path.split("/")
+    get_file = (
+        request.method in {"GET", "POST"} and len(parts) == 3
+        and parts[1].startswith("bot") and parts[2] == "getFile"
+    )
+    download = (
+        request.method == "GET" and len(parts) >= 4 and parts[1] == "file"
+        and parts[2].startswith("bot")
+    )
+    if not (get_file or download):
+        return False
+    try:
+        request.content
+    except httpx.RequestNotRead:
+        return False
+    return True
 
 
 def _is_retryable_connect_error(exc: Exception) -> bool:

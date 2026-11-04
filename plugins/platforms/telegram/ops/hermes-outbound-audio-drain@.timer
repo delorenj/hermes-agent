@@ -1,0 +1,11 @@
+# A oneshot service cannot be re-activated while running, so passes never overlap.
+[Unit]
+Description=Hermes private outbound-audio drain (%i) - every 30s
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

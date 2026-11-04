@@ -2521,12 +2521,18 @@ class GatewayTurnMixin:
             # streaming + kanban paths do.
             from gateway.platforms.base import should_send_media_as_audio as _should_send_media_as_audio
             from gateway.run_notifications import _IMAGE_EXTS, _VIDEO_EXTS
+            # /bg completions keep the operator's originating source and trigger id; audio only.
+            _audio_metadata = _thread_metadata
+            if getattr(adapter, "_outbound_audio_spool", None) is not None:  # only an enabled Telegram spool
+                from plugins.platforms.telegram.outbound_audio_provenance import native_reply_metadata_for_source
+                _audio_metadata = native_reply_metadata_for_source(
+                    adapter, source, event_message_id or getattr(source, "message_id", None), _thread_metadata)
             for media_path, _is_voice in (media_files or []):
                 _ext = os.path.splitext(media_path)[1].lower()
                 with suppress(Exception):
                     if _should_send_media_as_audio(source.platform, _ext, _is_voice):
                         await adapter.send_voice(
-                            chat_id=source.chat_id, audio_path=media_path, metadata=_thread_metadata,
+                            chat_id=source.chat_id, audio_path=media_path, metadata=_audio_metadata,
                             is_voice=_is_voice,
                         )
                     else:
@@ -2535,7 +2541,8 @@ class GatewayTurnMixin:
                             else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
                             else (adapter.send_document, "file_path")
                         )
-                        await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                        _meta = _audio_metadata if sender == adapter.send_document else _thread_metadata
+                        await sender(chat_id=source.chat_id, metadata=_meta, **{key: media_path})
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)

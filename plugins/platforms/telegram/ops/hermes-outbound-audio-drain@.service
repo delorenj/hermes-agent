@@ -1,0 +1,14 @@
+# Private outbound-audio drain, one bounded pass per activation, for Hermes profile %i (e.g. holocene-pm).
+# Install to ~/.config/systemd/user/, then enable ONLY the timer: hermes-outbound-audio-drain@holocene-pm.timer
+[Unit]
+Description=Hermes private outbound-audio drain (%i) - one pass
+ConditionPathExists=%h/.hermes/profiles/%i/outbound-audio-drain.env.op
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.hermes/hermes-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/op run --env-file=%h/.hermes/profiles/%i/outbound-audio-drain.env.op -- %h/.hermes/hermes-agent/plugins/platforms/telegram/ops/outbound-audio-drain.sh %i
+TimeoutStartSec=300
+NoNewPrivileges=yes
+PrivateTmp=yes

@@ -451,6 +451,9 @@ class GatewayVoiceMixin:
         # adapters (Telegram "important" mode) deliver it. Clone: shared w/ typing-indicator state.
         thread_meta = dict(self._thread_metadata_for_source(event.source, reply_anchor) or {})
         thread_meta["notify"] = True
+        if getattr(adapter, "_outbound_audio_spool", None) is not None:  # only an enabled Telegram spool
+            from plugins.platforms.telegram.outbound_audio_provenance import native_reply_metadata
+            thread_meta = native_reply_metadata(adapter, event, thread_meta)
         for path in audio_paths:
             await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
                              metadata=thread_meta)

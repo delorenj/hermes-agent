@@ -393,17 +393,21 @@ class GatewayNotificationsMixin:
                     await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+            _audio_meta = _thread_meta
+            if getattr(adapter, "_outbound_audio_spool", None) is not None:  # only an enabled Telegram spool
+                from plugins.platforms.telegram.outbound_audio_provenance import native_reply_metadata
+                _audio_meta = native_reply_metadata(adapter, event, _thread_meta)
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
                         await adapter.send_voice(
-                            chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
+                            chat_id=chat_id, audio_path=media_path, metadata=_audio_meta, is_voice=is_voice,
                         )
                     elif ext in _VIDEO_EXTS:
                         await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_audio_meta)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 

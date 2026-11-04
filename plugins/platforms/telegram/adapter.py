@@ -181,6 +181,7 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+from plugins.platforms.telegram.outbound_audio_spool import build_spool, prepare_capture
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from utils import env_float, env_int
@@ -589,6 +590,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # Resolved now: secondary profiles construct adapters inside their own home scope.
         from hermes_constants import get_hermes_home
         self._update_receipt_dir = get_hermes_home()
+        self._outbound_audio_spool = build_spool(extra, self._update_receipt_dir)
         self._update_receipts_loaded: set = set()
         self._update_receipts_dirty: set = set()
         self._update_receipt_flush: Optional[asyncio.Task] = None
@@ -5128,8 +5130,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         reset_media: Optional[Any] = None, **media_kwargs: Any) -> Any:
         """Send one native media payload with thread routing + DM-topic anchor retry."""
         reply_to_id, kwargs = self._media_send_kwargs(chat_id, reply_to, metadata)
-        return await self._send_with_dm_topic_reply_anchor_retry(
-            send_fn, {**kwargs, **media_kwargs}, metadata, reply_to_id, media_label, reset_media=reset_media)
+        # Every native voice/audio/document send lands here while the handle is open, before transcode cleanup.
+        capture = await prepare_capture(self._outbound_audio_spool, metadata, media_label, media_kwargs)
+        try:
+            msg = await self._send_with_dm_topic_reply_anchor_retry(
+                send_fn, {**kwargs, **media_kwargs}, metadata, reply_to_id, media_label, reset_media=reset_media)
+            await capture.finish(self._bot, chat_id, msg)
+            return msg
+        finally:
+            capture.close()
 
     @staticmethod
     def _caption_1024(caption: Optional[str]) -> Optional[str]:
