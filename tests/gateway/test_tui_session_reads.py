@@ -13,6 +13,14 @@ import pytest
 import pytest_asyncio
 
 
+@pytest.fixture(autouse=True)
+def _recurring_policy_off(monkeypatch):
+    """cron.recurring_policy defaults to "candybar" (refuse recurring jobs not pinned scheduler=external).
+    The /cron write test adds an interval job through the CLI handler, so run on the legacy policy; the
+    policy itself is covered by tests/tools/test_cronjob_tools.py."""
+    monkeypatch.setattr("tools.cronjob_tools._candybar_policy_on", lambda: False)
+
+
 @pytest_asyncio.fixture
 async def owner(tmp_path, monkeypatch):
     from gateway import run

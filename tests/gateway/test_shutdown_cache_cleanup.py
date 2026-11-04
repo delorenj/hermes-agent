@@ -77,6 +77,9 @@ class _FakeGateway:
     def _update_runtime_status(self, *_a, **_kw):
         pass
 
+    # Real fan-out: stop() always tears primary + profile adapters down through it (no-op while none are in).
+    _bounded_adapter_teardown_all = gw_mod.GatewayRunner._bounded_adapter_teardown_all
+
     def _clear_plugin_message_injector(self):
         pass
 
