@@ -244,6 +244,66 @@ async def test_shared_token_is_refused_deterministically_under_concurrency(tmp_p
     assert set(claimed.values()) == {"a", "c"}
 
 
+def _ordering_runner(monkeypatch, gates, b_fails=True):
+    """Profiles "a" and "c" share a telegram token; "b" fails its config load (or serves no platform). Each
+    profile's config load first awaits ``gates.get(name)``; "c"'s load sets ``c_loaded``."""
+    adapters = {"a": _TokenAdapter("shared"), "c": _TokenAdapter("shared")}
+    runner, connects = _real_start_runner(monkeypatch, adapters, connect_delay=0)
+    current = {}
+    c_loaded = asyncio.Event()
+
+    async def load_config(name, home):
+        if name in gates:
+            await gates[name].wait()
+        if name == "b" and b_fails:
+            raise RuntimeError("config load failed")
+        cfg = GatewayConfig(multiplex_profiles=True)
+        if name == "b":
+            return cfg  # no platform at all: still settles, in order
+        cfg.platforms = {Platform.TELEGRAM: PlatformConfig(enabled=True)}
+        current[asyncio.current_task()] = adapters[name]
+        if name == "c":
+            c_loaded.set()
+        return cfg
+
+    monkeypatch.setattr(runner, "_load_secondary_profile_config", load_config)
+    monkeypatch.setattr(runner, "_create_adapter", lambda p, c: current[asyncio.current_task()])
+    return runner, adapters, connects, c_loaded
+
+
+@pytest.mark.parametrize("b_fails", [True, False], ids=["b-raises", "b-no-platforms"])
+@pytest.mark.asyncio
+async def test_a_profile_failing_before_its_claim_step_does_not_let_the_next_claim_first(
+        tmp_path, monkeypatch, b_fails):
+    a_may_load = asyncio.Event()
+    runner, adapters, connects, c_loaded = _ordering_runner(monkeypatch, {"a": a_may_load}, b_fails)
+    # "a" reaches its claim step only once "c" has loaded and could claim: "b" failing in between must not
+    # settle the order early, or "c" would win the token a serial boot gives "a".
+    c_loaded_then_a = asyncio.create_task(c_loaded.wait())
+    c_loaded_then_a.add_done_callback(lambda _t: a_may_load.set())
+    claimed = {}
+    results = dict(await runner._start_profiles_bounded(_homes(tmp_path, ["a", "b", "c"]), claimed))
+    assert isinstance(results["b"], RuntimeError) if b_fails else results["b"][0] == 0
+    assert results["a"][0] == 1 and results["c"][0] == 0
+    assert runner._profile_adapters["a"][Platform.TELEGRAM] is adapters["a"]
+    assert not runner._profile_adapters.get("c")
+    assert connects == ["shared"]
+    assert set(claimed.values()) == {"a"}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_boot_with_a_settle_pending_still_finishes(tmp_path, monkeypatch):
+    never = asyncio.Event()
+    runner, _adapters, connects, c_loaded = _ordering_runner(monkeypatch, {"a": never})
+    boot = asyncio.create_task(runner._start_profiles_bounded(_homes(tmp_path, ["a", "b", "c"]), {}))
+    await c_loaded.wait()  # "a" hangs in its load, "b" failed (its settle waits on "a"), "c" waits on "b"
+    boot.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(boot, timeout=5)
+    assert connects == []
+    assert all(t.done() for t in asyncio.all_tasks() if t.get_name().startswith("profile-startup"))
+
+
 @pytest.mark.asyncio
 async def test_inflight_claim_blocks_duplicate_and_failed_connect_releases_it(tmp_path, monkeypatch):
     adapters = {"a": _TokenAdapter("t"), "b": _TokenAdapter("t")}
