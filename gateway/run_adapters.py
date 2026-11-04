@@ -1435,7 +1435,7 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
                 ready.append((platform, adapter, claims))
         except BaseException:
             for platform, adapter, _claims in ready:
-                self._release_secondary_claims(profile_name, platform, adapter)
+                self._release_unreached_secondary_platform(profile_name, platform, adapter)
             raise
         finally:
             if gate is not None:
@@ -1474,8 +1474,9 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
             # A raise or cancellation part-way (a shutdown during boot) must not strand the holds of the platforms it
             # never reached: a re-scan skips a held platform. Only those: a reached one released its own hold, or
             # handed it to its reconnect, and a fatal teardown since may hold it again under the same adapter.
+            # Their ownership goes too: nothing will serve them.
             for platform, adapter, _claims in ready[started:]:
-                self._release_secondary_claims(profile_name, platform, adapter)
+                self._release_unreached_secondary_platform(profile_name, platform, adapter)
         return connected
 
     def _wire_adapter_handlers(

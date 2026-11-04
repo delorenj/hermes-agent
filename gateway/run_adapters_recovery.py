@@ -128,6 +128,17 @@ class GatewaySecondaryReconnectMixin:
         if entry is not None and entry[0] is owner:
             del held[(profile_name, platform)]
 
+    def _release_unreached_secondary_platform(self, profile_name: str, platform: Platform, owner) -> None:
+        """A staged platform boot claimed and held but never connected (a raise or cancellation part-way): drop
+        ``owner``'s hold AND the ownership ``_claim_secondary_platform`` recorded, or cron and the delivery drain
+        keep treating the profile as owning a bot nothing serves. Not when it is live after all, or still held by
+        another owner (a reconnect bridge took it over): that owner settles ownership when it ends."""
+        self._release_secondary_claims(profile_name, platform, owner)
+        if platform in ((getattr(self, "_profile_adapters", None) or {}).get(profile_name) or {}) or (
+                (profile_name, platform) in (getattr(self, "_secondary_held_claims", None) or {})):
+            return
+        self._disown_secondary_platform(profile_name, platform)
+
     def _held_claim_owners(self, exclude: Optional[tuple] = None) -> dict[tuple, str]:
         """Claim -> profile for every held secondary claim but the ``exclude`` (profile, platform) hold."""
         held = getattr(self, "_secondary_held_claims", None) or {}

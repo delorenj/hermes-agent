@@ -308,6 +308,65 @@ async def test_cancelled_boot_releases_the_holds_of_platforms_it_never_reached(t
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not runner._secondary_held_claims  # neither the one in flight nor the one never reached stays held
+    assert Platform.DISCORD not in runner._profile_bot_platforms["a"]  # never reached: not owned either
+
+
+def _two_platform_runner(monkeypatch, configure):
+    """A runner whose profile builds a telegram and a discord adapter and runs ``configure`` per reached platform."""
+    adapters = {Platform.TELEGRAM: _TokenAdapter("t1"), Platform.DISCORD: _TokenAdapter("t2")}
+    runner, connects = _real_start_runner(monkeypatch, {})
+
+    async def load_config(name, home):
+        cfg = GatewayConfig(multiplex_profiles=True)
+        cfg.platforms = {p: PlatformConfig(enabled=True) for p in adapters}
+        return cfg
+
+    monkeypatch.setattr(runner, "_load_secondary_profile_config", load_config)
+    monkeypatch.setattr(runner, "_create_adapter", lambda p, c: adapters[p])
+    monkeypatch.setattr(runner, "_configure_profile_adapter", configure)
+    return runner, adapters, connects
+
+
+@pytest.mark.asyncio
+async def test_a_raise_part_way_disowns_the_platforms_boot_never_reached(tmp_path, monkeypatch):
+    seen = {}
+
+    def configure(adapter, profile_name, platform):
+        seen["owned"] = set(runner._profile_bot_platforms["P"])
+        seen["held"] = set(runner._secondary_held_claims)
+        raise RuntimeError("configure failed")
+
+    runner, _adapters, connects = _two_platform_runner(monkeypatch, configure)
+    with pytest.raises(RuntimeError):
+        await runner._start_one_profile_adapters("P", tmp_path, {})
+    both = {Platform.TELEGRAM, Platform.DISCORD}
+    assert seen == {"owned": both, "held": {("P", p) for p in both}}  # both claimed and held before the raise
+    assert connects == []
+    assert not runner._secondary_held_claims
+    # cron preflight and authz read this: P must not look like it owns a discord bot nothing serves
+    assert Platform.DISCORD not in runner._profile_bot_platforms["P"]
+
+
+@pytest.mark.parametrize("taken_by", ["reconnect", "live"])
+@pytest.mark.asyncio
+async def test_an_unreached_platform_another_owner_took_keeps_its_ownership(tmp_path, monkeypatch, taken_by):
+    bridge = object()
+
+    def configure(adapter, profile_name, platform):
+        discord = adapters[Platform.DISCORD]
+        if taken_by == "reconnect":  # e.g. a reconnect bridge now holds the bot
+            claims = runner._adapter_claims(Platform.DISCORD, discord)
+            runner._hold_secondary_claims("P", Platform.DISCORD, bridge, claims)
+        else:
+            runner._profile_adapters["P"][Platform.DISCORD] = discord
+        raise RuntimeError("configure failed")
+
+    runner, adapters, _connects = _two_platform_runner(monkeypatch, configure)
+    with pytest.raises(RuntimeError):
+        await runner._start_one_profile_adapters("P", tmp_path, {})
+    assert Platform.DISCORD in runner._profile_bot_platforms["P"]
+    if taken_by == "reconnect":
+        assert runner._secondary_held_claims[("P", Platform.DISCORD)][0] is bridge
 
 
 # ── shutdown ───────────────────────────────────────────────────────────────────────────────────────────────
