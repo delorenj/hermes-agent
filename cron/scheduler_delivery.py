@@ -956,8 +956,13 @@ def _send_media_via_adapter(
             # transcodes non-Opus only when it is set), matching the gateway dispatch
             # in BasePlatformAdapter._send_one.
             extra = {"is_voice": _is_voice} if method == "send_voice" else {}
+            audio_metadata = metadata
+            if getattr(adapter, "_outbound_audio_spool", None) is not None:
+                from plugins.platforms.telegram.outbound_audio_provenance import cron_reply_metadata
+                audio_metadata = cron_reply_metadata(adapter, job, chat_id, media_path, metadata)
             coro = getattr(adapter, method)(
-                chat_id=chat_id, metadata=metadata, **{path_kw: media_path}, **extra)
+                chat_id=chat_id, metadata=audio_metadata if method in ("send_voice", "send_document") else metadata,
+                **{path_kw: media_path}, **extra)
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
                 _note_target_error(

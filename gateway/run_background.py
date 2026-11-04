@@ -23,18 +23,18 @@ class GatewayBackgroundMixin:
     async def _run_background_task(
         self, prompt: str, source: SessionSource, task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[list[str]] = None,
-        media_types: Optional[list[str]] = None,
+        media_types: Optional[list[str]] = None, reply_event=None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task (mirrors ``_run_agent``)."""
         with self._profile_scope_for_source(source):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt, source, task_id, event_message_id, media_urls, media_types, reply_event,
             )
 
     async def _run_background_task_inner(
         self, prompt: str, source: SessionSource, task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[list[str]] = None,
-        media_types: Optional[list[str]] = None,
+        media_types: Optional[list[str]] = None, reply_event=None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from gateway.run import (
@@ -146,12 +146,16 @@ class GatewayBackgroundMixin:
             # streaming + kanban paths do.
             from gateway.platforms.base import should_send_media_as_audio as _should_send_media_as_audio
             from gateway.run_notifications import _IMAGE_EXTS, _VIDEO_EXTS
+            audio_metadata = _thread_metadata
+            if getattr(adapter, "_outbound_audio_spool", None) is not None:
+                from plugins.platforms.telegram.outbound_audio_provenance import native_reply_metadata
+                audio_metadata = native_reply_metadata(adapter, reply_event, _thread_metadata)
             for media_path, _is_voice in (media_files or []):
                 _ext = os.path.splitext(media_path)[1].lower()
                 with suppress(Exception):
                     if _should_send_media_as_audio(source.platform, _ext, _is_voice):
                         await adapter.send_voice(
-                            chat_id=source.chat_id, audio_path=media_path, metadata=_thread_metadata,
+                            chat_id=source.chat_id, audio_path=media_path, metadata=audio_metadata,
                             is_voice=_is_voice,
                         )
                     else:
@@ -160,7 +164,9 @@ class GatewayBackgroundMixin:
                             else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
                             else (adapter.send_document, "file_path")
                         )
-                        await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                        await sender(chat_id=source.chat_id,
+                                     metadata=audio_metadata if key == "file_path" else _thread_metadata,
+                                     **{key: media_path})
 
         except Exception:
             logger.exception("Background task %s failed", task_id)

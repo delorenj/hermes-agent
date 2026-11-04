@@ -4135,11 +4135,13 @@ class BasePlatformAdapter(ABC):
     async def _play_tts_file(
         self, event: MessageEvent, text_content: str, tts_path: str, first: bool,
         metadata: dict[str, Any], record_delivery: Callable) -> bool:
-        """Play one synthesized TTS file. Returns True when the ORIGINAL reply text rode
-        along as a Telegram caption (first file, ≤1024 chars) so the text send is skipped."""
+        """Play TTS; True means the first Telegram caption carried the full reply, so skip its text send."""
         caption = None
         if first and self.platform == Platform.TELEGRAM and text_content and text_content[:1024] == text_content:
             caption = text_content
+        if getattr(self, "_outbound_audio_spool", None) is not None:
+            from plugins.platforms.telegram.outbound_audio_provenance import native_reply_metadata
+            metadata = native_reply_metadata(self, event, metadata)
         tts_result = await self.play_tts(
             chat_id=event.source.chat_id, audio_path=tts_path, caption=caption, metadata=metadata)
         record_delivery(tts_result)
@@ -4214,10 +4216,8 @@ class BasePlatformAdapter(ABC):
         self, event: MessageEvent, media_files: list, local_files: list, *,
         force_document_attachments: bool, human_delay: float, metadata: dict[str, Any],
         record_delivery: Callable) -> None:
-        """Deliver MEDIA-tag files and detected local files by type: images batched via
-        ``send_multiple_images`` unless ``[[as_document]]``; otherwise audio → send_voice (MEDIA
-        tags only, never bare local files), video → send_video, else send_document. Every failure is
-        reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS."""
+        """Deliver by type (voice only for MEDIA tags, never bare paths), batching images unless as_document.
+        Feed every outcome to ``record_delivery`` so media-only turns report success or failure."""
         from urllib.parse import quote as _quote
 
         def _as_image(path: str) -> bool:
@@ -4229,18 +4229,22 @@ class BasePlatformAdapter(ABC):
                 event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
                 record_delivery)
         chat_id = event.source.chat_id
-
+        audio_metadata = metadata
+        if getattr(self, "_outbound_audio_spool", None) is not None:
+            from plugins.platforms.telegram.outbound_audio_provenance import native_reply_metadata
+            audio_metadata = native_reply_metadata(self, event, metadata)
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
             """MEDIA tags may route to send_voice (bare files never); an adapter's own failure notice is not repeated."""
             ext = Path(path).suffix.lower()
             if media_tag and should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata, is_voice=is_voice)
+                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=audio_metadata, is_voice=is_voice)
             elif ext in _VIDEO_EXTS:
                 if media_tag:
                     logger.info("[%s] Sending video attachment (%s) to %s", self.name, ext, chat_id)
                 result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
             else:
-                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                result = await self.send_document(chat_id=chat_id, file_path=path,
+                                                  metadata=audio_metadata if media_tag else metadata)
             if not result.success:
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
@@ -4347,9 +4351,7 @@ class BasePlatformAdapter(ABC):
     async def _deliver_attachments(self, event: MessageEvent, extracted: _ExtractedResponse,
                                    metadata: dict[str, Any], *, anything_sent: bool,
                                    record_delivery: Callable) -> None:
-        """Send extracted image URLs, MEDIA files and bare local files (human-paced),
-        then fail loudly if a non-empty response produced nothing deliverable. Attachment
-        results feed ``record_delivery`` so the turn outcome reflects them."""
+        """Send human-paced attachments and record their outcomes; flag non-empty undeliverable replies."""
         human_delay = self._get_human_delay()
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
         if images:
@@ -4379,10 +4381,8 @@ class BasePlatformAdapter(ABC):
 
     async def _extract_response_content(self, response: str, event: MessageEvent, session_key: str,
                                         *, is_ephemeral_response: bool) -> _ExtractedResponse:
-        """Split a handler response into deliverable text + attachments. Order matters: MEDIA tags →
-        image URLs → residual directives → bare local paths (skipped for ephemeral notices so config
-        paths stay text; unknown-extension MEDIA tags survive for the bare-path detector). History
-        dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
+        """Extract MEDIA, images, directives, then bare paths (not in ephemeral notices).
+        History dedup is bare-path only, off-loop and fail-open; recover emptied non-empty replies."""
         # Captured before extract_media strips it: images then go via send_document (no recompression).
         force_document = "[[as_document]]" in response
         pre_extract = response
