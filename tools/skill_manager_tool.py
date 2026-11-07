@@ -431,6 +431,8 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
             return _err(err)
         if active_personal_source():
             fm, _ = _parse_frontmatter(content)
+            if fm.get("name") != skill_dir.name:
+                return _err("Personal skill frontmatter name must match the skill directory name before writing.")
             before_fm, _ = _parse_frontmatter(original or "")
             check_personal_name(fm.get("name"), skill_dir,
                                 new_name=original is not None and fm.get("name") != before_fm.get("name"))
@@ -495,6 +497,8 @@ def _create_skill(name: str, content: str, category: str | None = None) -> dict[
     if active_personal_source():
         fm, _ = _parse_frontmatter(content)
         check_personal_name(fm.get("name"), skill_dir)
+        if fm.get("name") != name:
+            return _err("Personal skill frontmatter name must match the skill directory name before writing.")
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(skill_dir.parent)
     try:

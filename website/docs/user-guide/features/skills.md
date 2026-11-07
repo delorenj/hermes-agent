@@ -167,7 +167,11 @@ with a directory field, a URL field, and an open-ended text box; it composes a
 There is no model-tool footprint: `/learn` builds a standards-guided prompt and
 hands it to the agent as a normal turn. The agent saves the result with the
 `skill_manage` tool, so the [write-approval gate](#gating-agent-skill-writes-skillswrite_approval)
-applies if you have it on.
+applies if you have it on. For a profile opted into a personal learned source,
+Hermes validates the bound source and skill name before writing, then invokes
+its Skillex checkpoint bridge after a successful mutation (once per batch).
+The bridge call has a 300-second timeout. A failed checkpoint reports failure
+and retains applied content for a retry; it never claims the change was pushed.
 
 ## Progressive Disclosure
 
