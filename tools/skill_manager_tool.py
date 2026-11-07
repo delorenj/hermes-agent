@@ -34,6 +34,8 @@ from tools.skill_manager_guards import (
 from tools.skill_manager_batch import (
     _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _op_shape_error, _skill_manage_batch)
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
+from tools.skill_manager_personal import (
+    active_personal_source, check_personal_name, require_personal_target, personal_checkpoint)
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +212,9 @@ def _description_preview(content: str) -> str:
 
 
 def _resolve_skill_dir(name: str, category: str | None = None) -> Path:
-    """New-skill dir; honors ``skills.create_dir`` (e.g. a shared fleet dir)."""
+    """New-skill dir; a bound personal source wins over ``skills.create_dir``."""
+    if binding := active_personal_source():
+        return binding.source / (category or "") / name
     base = _skills_dir()
     try:
         from agent.skill_utils import get_skill_create_dir
@@ -277,7 +281,10 @@ def _find_skill(name: str) -> Optional[dict[str, Any]]:
             local_root = _skills_dir()
     display_matches: list[Path] = []
     seen_display: set = set()
-    for skills_dir in get_all_skills_dirs():
+    roots = get_all_skills_dirs()
+    if binding := active_personal_source():
+        roots = [binding.source, *roots]
+    for skills_dir in roots:
         if not skills_dir.exists():
             continue
         for skill_dir in _iter_skill_dirs(skills_dir):
@@ -285,8 +292,11 @@ def _find_skill(name: str) -> Optional[dict[str, Any]]:
                 return {"path": skill_dir}
             if local_root is not None:
                 resolved = skill_dir.resolve()
-                if (resolved.is_relative_to(local_root)
-                        and resolved.relative_to(local_root).as_posix() == name):  # POSIX form
+                roots_for_relative = [local_root]
+                if binding := active_personal_source():
+                    roots_for_relative.append(binding.source)
+                if any(resolved.is_relative_to(root)
+                       and resolved.relative_to(root).as_posix() == name for root in roots_for_relative):
                     return {"path": skill_dir}
             if _read_frontmatter_name(skill_dir / "SKILL.md") == name:
                 key = skill_dir / "SKILL.md"
@@ -400,6 +410,7 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = ""):
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
+    require_personal_target(skill_dir)
     guard = _background_review_delete_guard(name, skill_dir) if action == "delete" else None
     return (None, guard) if guard else (skill_dir, None)
 
@@ -409,13 +420,20 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
     """Read-before-write guard (existing targets only), the description budget for the root SKILL.md
     (whichever action and file_path reach it), atomic write, then the security scan; a blocked scan
     restores the original (or unlinks a new file). Error dict or None."""
+    require_personal_target(target)
     original = None
     if target.exists():
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
         original = target.read_text(encoding="utf-8-sig")
-    if target == skill_dir / "SKILL.md" and (err := _description_budget_error(content, before=original)):
-        return _err(err)
+    if target == skill_dir / "SKILL.md":
+        if err := _description_budget_error(content, before=original):
+            return _err(err)
+        if active_personal_source():
+            fm, _ = _parse_frontmatter(content)
+            before_fm, _ = _parse_frontmatter(original or "")
+            check_personal_name(fm.get("name"), skill_dir,
+                                new_name=original is not None and fm.get("name") != before_fm.get("name"))
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(target.parent)
     atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
@@ -472,6 +490,11 @@ def _create_skill(name: str, content: str, category: str | None = None) -> dict[
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
     skill_dir = _resolve_skill_dir(name, category)
+    require_personal_target(skill_dir)
+    check_personal_name(name, skill_dir)
+    if active_personal_source():
+        fm, _ = _parse_frontmatter(content)
+        check_personal_name(fm.get("name"), skill_dir)
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(skill_dir.parent)
     try:
@@ -651,6 +674,7 @@ def _remove_file(name: str, file_path: str) -> dict[str, Any]:
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if err:
         return err
+    require_personal_target(target)
     if not target.exists():  # list what IS there so the model can pick the right path
         available = [str(f.relative_to(skill_dir)) for subdir in ALLOWED_SUBDIRS
                      if (skill_dir / subdir).exists() for f in (skill_dir / subdir).rglob("*") if f.is_file()]
@@ -780,6 +804,7 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
             forget(name)
 
 
+@personal_checkpoint
 def skill_manage(
     action: str, name: str, content: str | None = None, category: str | None = None, file_path: str | None = None,
     file_content: str | None = None, old_string: str | None = None, new_string: str | None = None,

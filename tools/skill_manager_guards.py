@@ -81,7 +81,10 @@ def _resolved_roots(skill_path: Path):
     except OSError:
         resolved = skill_path
     roots = []
-    for root in get_all_skills_dirs():
+    from tools.skill_manager_personal import active_personal_source
+    binding = active_personal_source()
+    search_roots = get_all_skills_dirs() + ([binding.source] if binding else [])
+    for root in search_roots:
         with suppress(OSError):
             roots.append((root, root.resolve()))
     return resolved, roots
@@ -91,6 +94,9 @@ def _containing_skills_root(skill_path: Path) -> Path:
     """Skills root (local or external_dirs) containing ``skill_path``; local dir if none match."""
     from tools import skill_manager_tool as _smt
     resolved, roots = _resolved_roots(skill_path)
+    if binding := _smt.active_personal_source():
+        if resolved.is_relative_to(binding.source):
+            return binding.source
     return next((root for root, r in roots if resolved.is_relative_to(r)), _smt._skills_dir())
 
 
