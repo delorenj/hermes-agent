@@ -254,6 +254,15 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
     # skill_manage() calls re-enter them. Without the outer fence a concurrent writer landing
     # between the snapshot and a rollback would be silently reverted.
     with _smt._skill_mutation_locks(names):
+        # A personal batch must refuse selected shared targets BEFORE snapshot/rollback:
+        # restoring an untouched foreign snapshot would itself mutate that shared source.
+        if _smt.active_personal_source():
+            for i, op in enumerate(operations):
+                existing = _smt._find_skill(names[i])
+                if existing:
+                    _smt.require_personal_target(existing["path"])
+                if op["action"] == "create":
+                    _smt.require_personal_target(_smt._resolve_skill_dir(names[i], op.get("category")))
         snap_root = Path(tempfile.mkdtemp(prefix="skill_batch_"))
         create_targets = {names[i]: _smt._resolve_skill_dir(names[i], op.get("category"))
                           for i, op in enumerate(operations) if op.get("action") == "create"}
