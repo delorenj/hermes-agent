@@ -202,6 +202,27 @@ def test_rename_collision_cannot_write_skill(desk):
     assert (source / "learned/SKILL.md").read_text() == content()
 
 
+def test_rename_to_unique_name_is_rejected_before_write(desk):
+    profile, source, _, _ = desk
+    skill = seed(source)
+    original_inode = (skill / "SKILL.md").stat().st_ino
+    result = invoke(action="patch", name="learned", old_string="name: learned", new_string="name: brand-new")
+    assert result["success"] is False
+    assert "must match the skill directory name" in result["error"]
+    assert (skill / "SKILL.md").read_text() == content()
+    assert (skill / "SKILL.md").stat().st_ino == original_inode
+    assert not any(row["argv"][0] == "checkpoint" for row in calls(profile))
+
+
+def test_create_with_unique_mismatched_frontmatter_is_rejected_before_write(desk):
+    profile, source, _, _ = desk
+    result = invoke(action="create", name="learned", content=content("brand-new"))
+    assert result["success"] is False
+    assert "must match the skill directory name" in result["error"]
+    assert not (source / "learned").exists()
+    assert not any(row["argv"][0] == "checkpoint" for row in calls(profile))
+
+
 @pytest.mark.parametrize("mode", ["checkpoint", "invalid-json"])
 def test_bridge_failure_is_visible_and_content_retained(desk, mode):
     profile, source, _, _ = desk
