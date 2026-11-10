@@ -571,6 +571,12 @@ class GatewayProfileReconcileMixin:
                     await asyncio.to_thread(release_profile_log_handlers, home)
             finally:
                 release_profile_home(self, home)
+            # Hydration is once-per-home; drop this home's snapshot so the next serve re-pulls its
+            # secret sources. Without it a credential reference added since the first serve (a newly
+            # wired chat bot) never reaches the rebuilt adapters until the whole gateway restarts.
+            with _log_suppressed(logging.DEBUG, "profile secret snapshot reset failed", exc_info=True):
+                from hermes_cli.env_loader import reset_secret_source_cache
+                reset_secret_source_cache(home)
             logger.info("[MULTIPLEX] Profile '%s' unserved — %d adapter(s) stopped and unrouted", name, len(adapters))
 
 
