@@ -13,7 +13,8 @@ unmounted volume records paths this process cannot see. So a dir is an orphan on
 checkout sat where this process can see that it was deleted -- under the data root that owns
 ``installs/`` (scratch clones, the runtime checkout) or directly in a ``.worktrees/`` dir that
 still exists. Removal still fails closed on anything a live process could hold: the install
-lock, or a dependency / PM runtime generation lease.
+lock, a dependency / PM runtime generation lease, or a live process running from it
+(:func:`hermes_cli.runtime_state_users.unused`).
 
 A checkout elsewhere (``~/.cache/review-1/head``, a scratch clone outside the data root) can never
 be proved deleted, so its missing checkout alone would keep the state forever. It is reclaimed
@@ -151,13 +152,17 @@ def collect_orphan_install_states(installs: Path) -> list[Path]:
 
     Each candidate is re-checked under its install lock right before removal: removing a large
     orphan takes long enough for another state to be synced or launched (lease taken and
-    released) since the candidates were listed, and that use must keep it."""
+    released) since the candidates were listed, and that use must keep it. A state a live process
+    runs from is kept before any of that, whether or not it holds a lease."""
+    from hermes_cli.runtime_state_users import unused
+
     if not installs.is_dir():
         return []
     data_root = installs.resolve().parent
     retention = _retention_seconds(installs.parent)
     removed: list[Path] = []
-    for state in [s for s in sorted(installs.iterdir()) if _is_orphan(s, data_root, retention)]:
+    orphans = [s for s in sorted(installs.iterdir()) if _is_orphan(s, data_root, retention)]
+    for state in unused(orphans, kind="orphaned install state"):
         with _install_lock(state) as locked:
             if not locked or not _is_orphan(state, data_root, retention) or _leased(state):
                 logger.debug("orphan install state %s is held or back in use; skipped", state.name)

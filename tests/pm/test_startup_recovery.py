@@ -51,7 +51,7 @@ def test_bootstrap_repairs_before_dependency_activation(tmp_path, monkeypatch, m
     cli.mkdir()
     # Include the real preimport protocol, including its ownership check. Do
     # not stub prepare_launch: the same files are also saved in PM's workspace.
-    for name in ("__init__.py", "runtime_state.py", "_early_recovery.py",
+    for name in ("__init__.py", "runtime_state.py", "runtime_state_users.py", "_early_recovery.py",
                  "_parser.py", "venv_sync.py", "steward.py"):
         shutil.copy2(repo / "hermes_cli" / name, cli / name)
     wheels = tmp_path / "wheels"

@@ -180,7 +180,13 @@ def lease_directory(generation: Path) -> Callable[[], None]:
 
 
 def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> list[Path]:
-    """Remove unselected lease-managed generations after their readers exit."""
+    """Remove unselected lease-managed generations after their readers exit.
+
+    A generation no lease covers but a live process runs from (an MCP server started from its
+    ``venv/bin/python``, a launchd job whose ``PATH`` names it) is kept too; see
+    :func:`hermes_cli.runtime_state_users.unused`.
+    """
+    from hermes_cli.runtime_state_users import unused
     from pm.environments import selected_venv
     removed = []
     root = install_state_dir(project)
@@ -194,6 +200,7 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
         generations = root / "environments"
         if not generations.is_dir():
             return removed
+        unleased = []
         for generation in generations.iterdir():
             if generation.is_symlink() or not generation.is_dir() or generation.resolve() == selected:
                 continue
@@ -201,8 +208,10 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
             if not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds:
                 continue
             if not leases_held(generation):
-                shutil.rmtree(generation)
-                removed.append(generation)
+                unleased.append(generation)
+        for generation in unused(unleased, kind="unleased dependency generation"):
+            shutil.rmtree(generation)
+            removed.append(generation)
     return removed
 
 

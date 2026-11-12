@@ -122,7 +122,14 @@ Their configuration and credentials remain profile-scoped.
 Do not edit facts or generation paths manually. Launchers resolve the selected
 environment before third-party imports. Processes retain their existing imports
 until they restart. Garbage collection preserves selected generations and
-lease-managed generations with live readers.
+lease-managed generations with live readers. It also preserves a generation a
+live process runs from without holding a lease (an MCP server started from its
+`venv/bin/python`, a launchd job or systemd unit whose `PATH` names it): any
+process whose executable, working directory, open files, arguments or
+environment name a path inside it, or any launchd agent or systemd user unit of
+the account that does, however it was started. Each generation kept this way
+is logged with the reason. When the process table cannot be read, nothing is
+collected.
 
 Downloads share a lock per partial URL. A failed or paused transfer cannot
 publish a partial destination, and garbage collection cannot delete a live
@@ -587,7 +594,7 @@ hermes pm install chromium
 | `pm repair` | Rebuild the recorded Python dependency set in a new generation, validate it, then select it. Does not update pins, features, or plugin configuration. |
 | `pm environment NAME --extra EXTRA` / `--requirement REQ` | Make the isolated side environment `HERMES_HOME/environments/NAME` current and print only its Python path on stdout (progress goes to stderr), for shell callers such as skills: `PY="$(hermes pm environment documents --extra documents --extra documents-pdf)"`. `--extra` installs the pinned requirements of extras declared in `pyproject.toml`; `--requirement` takes bounded ad hoc requirements. The environment records its own lock, and only a changed requirement set or Python pin builds a new generation. Concurrent calls serialize on the environment's lock, and a rebuild lands in a new generation, so a caller already using the previous one keeps its files. An explicit install: it runs even where lazy installs are off. Never `pip install` into the result. |
 | `pm status` | Print the latest sync/update receipt as JSON, or report that no receipt exists. |
-| `pm gc` | Remove unreferenced tool-store entries, eligible download partials, unused lease-managed Python generations, and the `installs/INSTALL_KEY/` state of deleted checkouts (a worktree removed from a `.worktrees/` dir that still exists, or a clone under the data root; a missing checkout anywhere else, such as a host install viewed from a container sharing the data root, is kept until its state has gone unused, with no sync and no launch, for `worktrees.install_state_retention_days` (default 14, 0 = forever); state whose install lock or generation lease is still held is always kept). The worktree pruner that runs at startup reclaims those orphaned state dirs too. |
+| `pm gc` | Remove unreferenced tool-store entries, eligible download partials, unused lease-managed Python generations (a generation a live process runs from is not unused, lease or not), and the `installs/INSTALL_KEY/` state of deleted checkouts (a worktree removed from a `.worktrees/` dir that still exists, or a clone under the data root; a missing checkout anywhere else, such as a host install viewed from a container sharing the data root, is kept until its state has gone unused, with no sync and no launch, for `worktrees.install_state_retention_days` (default 14, 0 = forever); state whose install lock or generation lease is still held, or that a live process runs from or a launchd agent or systemd user unit names, is always kept). The worktree pruner that runs at startup reclaims those orphaned state dirs too. |
 
 `pm env` excludes inherited process variables, including credentials. Its
 output can still reveal local installation paths; review it before sharing.
