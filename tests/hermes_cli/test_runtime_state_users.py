@@ -429,6 +429,42 @@ def test_an_interrupt_right_after_a_rename_still_puts_it_back(tmp_path, monkeypa
 
 
 @pytest.mark.platforms("posix")
+@pytest.mark.parametrize("keep", [None, frozenset({"inputs"})], ids=["generation", "state contents"])
+def test_a_set_aside_name_that_is_taken_is_never_reused_or_touched(tmp_path, monkeypatch, keep):
+    """The name a candidate is set aside under is one nothing has. A leftover that already carries
+    the first name drawn stays exactly as it was, through the move and the put-back."""
+    old = tmp_path / "old"
+    (old / "inputs").mkdir(parents=True)
+    (old / "payload").write_text("x", encoding="utf-8")
+    taken = old / f"{runtime_state_users.ASIDE_MARK}aaaaaaaa" if keep else tmp_path / f"old{runtime_state_users.ASIDE_MARK}aaaaaaaa"
+    taken.mkdir()
+    (taken / "theirs").write_text("not ours", encoding="utf-8")
+    tokens = iter(["aaaaaaaa", "bbbbbbbb"])
+    monkeypatch.setattr(runtime_state_users.secrets, "token_hex", lambda _n: next(tokens))
+
+    with runtime_state_users.set_aside([old], kind="test", held=lambda _aside: True, keep=keep) as idle:
+        assert idle == {}  # held: put back
+    assert (taken / "theirs").read_text(encoding="utf-8") == "not ours"
+    assert (old / "payload").is_file() and not (old / "theirs").exists()
+    assert sorted(p.name for p in taken.parent.iterdir() if runtime_state_users.ASIDE_MARK in p.name) == [taken.name]
+
+
+@pytest.mark.platforms("posix")
+def test_a_put_back_never_moves_onto_a_name_that_is_in_use(tmp_path, caplog):
+    """If the candidate's own name exists, the move was not made by us (an interrupt before it):
+    whatever sits at the set-aside name is left alone rather than moved onto it."""
+    old, other = tmp_path / "old", tmp_path / f"old{runtime_state_users.ASIDE_MARK}cccccccc"
+    for directory, name in ((old, "mine"), (other, "theirs")):
+        directory.mkdir()
+        (directory / name).write_text(name, encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        runtime_state_users._put_back(old, other, kind="test", keep=None)
+    assert (old / "mine").is_file() and (other / "theirs").is_file()
+    assert not (old / "theirs").exists() and not (other / "mine").exists()
+    assert any("left alone" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.platforms("posix")
 def test_what_appeared_in_an_install_state_after_the_second_look_is_not_removed(tmp_path, monkeypatch):
     """Only what was set aside and looked at is deleted. A directory that shows up in the state in
     the meantime (a launch from the recreated checkout) was never looked at: it stays, with the
