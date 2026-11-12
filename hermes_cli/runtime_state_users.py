@@ -19,7 +19,9 @@ enough for a process to start using an idle one in between. So a collector remov
 :func:`set_aside` renames what :func:`unused` cleared away from the path a process would open
 it by, looks again, and only then yields what is still idle for deletion; anything that turned
 out to be in use is renamed back. The new name is random and nothing configured names it, but it
-is not hidden: a process that goes looking in the directory by hand can still reach it.
+is not hidden: a process that goes looking in the directory by hand can still reach it. What a
+probe cannot see it cannot protect: another user's process shows only its argv, and a process
+whose only link to a generation is code already imported into memory shows nothing at all.
 """
 from __future__ import annotations
 
@@ -90,9 +92,11 @@ def set_aside(candidates: Collection[Path], *, kind: str, held: Callable[[Path],
 
     Never raises for the checks: a candidate that cannot be renamed, a listing that fails, or a
     ``held`` that raises keeps the candidate. Whatever is not yielded is renamed back on the way out,
-    also when the caller raises or is interrupted; what is yielded is the caller's to delete, and
-    what it leaves behind keeps its new name, collected by a later pass (which still probes the
-    name it had).
+    also when the caller raises or is interrupted (one exception: an interrupt that lands in the
+    few instructions between the second look's verdict and the hand-over leaves that candidate set
+    aside; it was judged idle, and a later pass collects it). What is yielded is the caller's to
+    delete, and what it leaves behind keeps its new name, collected by a later pass (which still
+    probes the name it had).
 
     ``keep=None`` renames each candidate beside itself. With ``keep`` (names that stay put, which
     this process may hold open: an install lock whose path a launcher may recreate) the
@@ -102,9 +106,9 @@ def set_aside(candidates: Collection[Path], *, kind: str, held: Callable[[Path],
     pending: dict[Path, Path] = {}
     try:
         for path in candidates:
-            target = _move_aside(path, keep, kind=kind)
-            if target is not None:
-                pending[path] = target
+            pending[path] = target = _aside_name(path, keep)  # known before the move, so an interrupt in it is undone
+            if not _move_aside(path, target, keep, kind=kind):
+                del pending[path]
         idle = _second_look(pending, kind=kind, held=held, keep=keep)
         for path in idle:  # only now are they the caller's: until here an interrupt puts them back
             del pending[path]
@@ -115,17 +119,22 @@ def set_aside(candidates: Collection[Path], *, kind: str, held: Callable[[Path],
             del pending[path]
 
 
-def _move_aside(path: Path, keep: Collection[str] | None, *, kind: str) -> Path | None:
+def _aside_name(path: Path, keep: Collection[str] | None) -> Path:
     token = secrets.token_hex(4)
     if keep is None:
-        target = path.with_name(f"{_original(path.name)}{ASIDE_MARK}{token}")
+        return path.with_name(f"{_original(path.name)}{ASIDE_MARK}{token}")
+    return path / f"{ASIDE_MARK}{token}"
+
+
+def _move_aside(path: Path, target: Path, keep: Collection[str] | None, *, kind: str) -> bool:
+    """Move ``path`` (or its contents, with ``keep``) to ``target``; False, with nothing moved, when it cannot."""
+    if keep is None:
         try:
             os.rename(path, target)
         except OSError as exc:
             LOG.info("kept %s %s: cannot set it aside (%s)", kind, path, exc)
-            return None
-        return target
-    target = path / f"{ASIDE_MARK}{token}"
+            return False
+        return True
     try:
         target.mkdir()
         for child in sorted(path.iterdir()):
@@ -136,8 +145,8 @@ def _move_aside(path: Path, keep: Collection[str] | None, *, kind: str) -> Path 
         if not isinstance(exc, OSError):
             raise
         LOG.info("kept %s %s: cannot set its contents aside (%s)", kind, path, exc)
-        return None
-    return target
+        return False
+    return True
 
 
 def _second_look(pending: dict[Path, Path], *, kind: str, held: Callable[[Path], bool] | None,
