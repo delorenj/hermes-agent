@@ -136,7 +136,12 @@ collected. A generation that passes that check is not deleted on its word: it is
 first renamed out of the way (`<name>.collecting-<id>`, or inside an install
 state), looked at once more, by lease as well, and renamed back if a process or
 reader turned up in between, so a process that starts using it during collection
-finds nothing at the old path rather than losing files while it runs.
+finds nothing at the old path rather than losing files while it runs. The new
+name is random and Hermes selects a generation by its recorded path, never by
+listing the directory, so only a process that goes looking in the directory by
+hand can still reach it. A process that merely imports from a generation and
+holds no open file, argument, environment entry or service definition naming it
+is invisible to any scan, before or after this check.
 
 A launch writes its leases and locks beside the generations, never inside
 them. A sandbox (Landlock, a rootless container mount, systemd
