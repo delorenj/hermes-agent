@@ -543,9 +543,12 @@ def _psutil_users(spellings: dict[bytes, list[Path]], *, ignore: frozenset[bytes
         for pid in pids:
             try:
                 process = psutil.Process(pid)
-                started = process.create_time()
             except (psutil.Error, OSError):
                 continue  # gone already: nothing left to read
+            try:
+                started = process.create_time()
+            except (psutil.Error, OSError):
+                started = None  # a system process that hides its start time is still read
             listed[(str(pid), started)] = process
         return list(listed)
 

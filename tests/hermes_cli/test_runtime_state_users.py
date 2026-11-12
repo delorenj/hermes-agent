@@ -867,6 +867,37 @@ def test_the_psutil_listing_reads_a_pid_that_went_to_a_new_process(tmp_path, mon
     assert users is not None and users[old] == "pid 7: open file"
 
 
+@pytest.mark.platforms("any")
+def test_the_psutil_listing_reads_a_process_that_hides_its_start_time(tmp_path, monkeypatch):
+    """Access denied on the start time (a system process on Windows) is not a reason to skip the process."""
+    old = tmp_path / "old"
+    old.mkdir()
+
+    class Error(Exception):
+        pass
+
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            raise Error("access denied")
+
+        def cmdline(self):
+            return ["python"]
+
+        def open_files(self):
+            return [SimpleNamespace(path=str(old / "held.bin"))] if self.pid == 7 else []
+
+        def __getattr__(self, name):
+            return list
+
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Error=Error, Process=Process,
+                                                               pids=lambda: [os.getpid(), 7]))
+    users = runtime_state_users._psutil_users(runtime_state_users._spellings([old]))
+    assert users is not None and users[old] == "pid 7: open file"
+
+
 def test_a_listing_that_comes_back_empty_is_no_answer():
     """The table was there a moment ago: an empty relisting is a view that vanished, not a settled one."""
     lists, reads = [[1], []], []
