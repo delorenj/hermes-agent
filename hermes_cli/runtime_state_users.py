@@ -13,13 +13,21 @@ bootstrap interpreter. One probe per OS family (``/proc`` on Linux, ``lsof`` + `
 the BSDs, psutil on Windows when it imports), so every route that collects on a host answers the
 same way whatever interpreter it runs in. Only ``hermes_constants`` (the account home) is imported
 besides the standard library: a closure that ships ``runtime_state.py`` ships that too.
+
+:func:`unused` answers for the moment it looked, and removing a large generation takes long
+enough for a process to start using an idle one in between. So a collector removes in two phases:
+:func:`set_aside` renames what :func:`unused` cleared out of every path a process could
+open it by, looks again, and only then yields what is still idle for deletion; anything that
+turned out to be in use is renamed back.
 """
 from __future__ import annotations
 
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
+import contextlib
 import logging
 import os
 from pathlib import Path
+import secrets
 import subprocess
 
 LOG = logging.getLogger(__name__)
@@ -57,26 +65,162 @@ def unused(candidates: Collection[Path], *, kind: str) -> list[Path]:
     return [path for path in candidates if path not in users]
 
 
-def users_of(candidates: Collection[Path]) -> dict[Path, str] | None:
+# Where a collector sets a candidate aside: ``<generation>.collecting-<hex>`` beside it, or
+# ``<state>/.collecting-<hex>`` holding a state's contents.
+ASIDE_MARK = ".collecting-"
+
+
+@contextlib.contextmanager
+def set_aside(candidates: Collection[Path], *, kind: str, held: Callable[[Path], bool] | None = None,
+              keep: Collection[str] | None = None) -> Iterator[dict[Path, Path]]:
+    """Second phase of a collect: set what :func:`unused` cleared aside, look again, and yield
+    ``{candidate: where it is now}`` for what is still idle, for the caller to delete.
+
+    :func:`unused` answers for the instant it looked; deleting a large generation comes seconds
+    later, and a process may have started using it by then (an MCP server launched from its
+    ``venv/bin/python``) with nothing the collector could see. Renaming first closes that: a
+    process that starts afterwards finds nothing at the old path, and one that started in between
+    shows up in a second look at the old path (its argv and environment) and the new one (its
+    files and working directory), or through ``held`` (a lease taken in the gap; the one signal
+    that crosses a PID namespace). What is in use is renamed back and never yielded.
+
+    Never raises for the checks: a candidate that cannot be renamed, a listing that fails, or a
+    ``held`` that raises keeps the candidate. Whatever is not yielded is renamed back on the way out,
+    also when the caller raises or is interrupted; what is yielded is the caller's to delete, and
+    what it leaves behind keeps its new name, collected by a later pass.
+
+    ``keep=None`` renames each candidate beside itself. With ``keep`` (names that stay put) the
+    candidate's own directory stays where it is, because something holds files in it (an install
+    lock, whose path a launcher may recreate), and its other contents move into a ``.collecting-*``
+    directory inside it.
+    """
+    pending: dict[Path, Path] = {}
+    try:
+        for path in candidates:
+            target = _move_aside(path, keep, kind=kind)
+            if target is not None:
+                pending[path] = target
+        idle = _second_look(pending, kind=kind, held=held, keep=keep)
+        yield idle
+    finally:
+        for path in list(pending):
+            _put_back(path, pending[path], kind=kind, keep=keep)
+            del pending[path]
+
+
+def _move_aside(path: Path, keep: Collection[str] | None, *, kind: str) -> Path | None:
+    token = secrets.token_hex(4)
+    if keep is None:
+        target = path.with_name(f"{path.name}{ASIDE_MARK}{token}")
+        try:
+            os.rename(path, target)
+        except OSError as exc:
+            LOG.info("kept %s %s: cannot set it aside (%s)", kind, path, exc)
+            return None
+        return target
+    target = path / f"{ASIDE_MARK}{token}"
+    try:
+        target.mkdir()
+        for child in sorted(path.iterdir()):
+            if child.name not in keep and child != target:
+                os.rename(child, target / child.name)
+    except BaseException as exc:  # part-way: what moved goes back, an interrupt still propagates
+        _put_back(path, target, kind=kind, keep=keep)
+        if not isinstance(exc, OSError):
+            raise
+        LOG.info("kept %s %s: cannot set its contents aside (%s)", kind, path, exc)
+        return None
+    return target
+
+
+def _second_look(pending: dict[Path, Path], *, kind: str, held: Callable[[Path], bool] | None,
+                 keep: Collection[str] | None) -> dict[Path, Path]:
+    """Of the candidates in ``pending`` (moved by now), pop and return those still idle; the rest
+    are put back and popped. An entry still in ``pending`` when this raises is the caller's to put back."""
+    if not pending:
+        return {}
+    where = {} if keep is not None else {target: path for path, target in pending.items()}
+    try:
+        users = users_of(list(pending), also=where, others_only=True)
+    except Exception:
+        LOG.warning("kept %d %s(s): probing the processes that may run from them failed",
+                    len(pending), kind, exc_info=True)
+        users = None
+    if users is None:
+        LOG.warning("kept %d %s(s): cannot list the processes that may run from them", len(pending), kind)
+    idle: dict[Path, Path] = {}
+    for path in list(pending):
+        target = pending[path]
+        reason = None if users is None else users.get(path) or _lease_reason(held, target)
+        if users is not None and reason is None:
+            idle[path] = pending.pop(path)
+            continue
+        if reason is not None:
+            LOG.info("kept %s %s (second look): %s", kind, path, reason)
+        _put_back(path, target, kind=kind, keep=keep)
+        del pending[path]
+    return idle
+
+
+def _lease_reason(held: Callable[[Path], bool] | None, target: Path) -> str | None:
+    if held is None:
+        return None
+    try:
+        return "a lease was taken on it" if held(target) else None
+    except Exception:  # unreadable leases are an owner we cannot rule out
+        LOG.debug("lease check of %s failed", target, exc_info=True)
+        return "its leases cannot be read"
+
+
+def _put_back(path: Path, target: Path, *, kind: str, keep: Collection[str] | None) -> None:
+    """Undo :func:`_move_aside`. What cannot be moved back stays where it is, named in a warning:
+    still in use it is found at its new name by the next pass, and never removed in the meantime."""
+    if not os.path.lexists(target):
+        return
+    try:
+        if keep is None:
+            os.rename(target, path)
+            return
+        for child in sorted(target.iterdir()):
+            try:
+                os.rename(child, path / child.name)
+            except OSError:
+                LOG.warning("%s %s: %s stays set aside in %s; could not put it back", kind, path, child.name,
+                            target, exc_info=True)
+        with contextlib.suppress(OSError):
+            target.rmdir()
+    except OSError:
+        LOG.warning("%s %s stays set aside as %s; could not put it back", kind, path, target, exc_info=True)
+
+
+def users_of(candidates: Collection[Path], *, also: Mapping[Path, Path] | None = None,
+             others_only: bool = False) -> dict[Path, str] | None:
     """Why each candidate directory is in use; a candidate that is not is absent.
 
     In use: a live process's executable, working directory, open or mapped files, argv or
     environment name a path inside it, or one of this account's launchd agents or systemd user
     units names it (program, arguments, ``PATH``; loaded or not, since it can start at any time).
     None when the processes cannot be listed.
+
+    ``also`` maps another path to the candidate it stands for (where :func:`set_aside` moved
+    it): a process that started before the move still names the old path in its argv and
+    environment, and shows the new one for its files. ``others_only`` leaves this process out
+    of the answer, for a collector that holds files of its own in what it set aside (an install
+    lock); it must still see itself in the listing for the listing to count.
     """
-    spellings = _spellings(candidates)
-    users = _process_users(spellings)
+    spellings = _spellings(candidates, also)
+    users = _process_users(spellings, skip=os.getpid() if others_only else None)
     if users is not None:
         for path, reason in _unit_users(spellings).items():
             users.setdefault(path, reason)
     return users
 
 
-def _spellings(candidates: Collection[Path]) -> dict[bytes, Path]:
+def _spellings(candidates: Collection[Path], also: Mapping[Path, Path] | None = None) -> dict[bytes, Path]:
     """Each candidate as given and as the kernel reports it (``/tmp`` is ``/private/tmp`` on macOS)."""
-    return {os.fsencode(os.path.normcase(spelling)): path for path in candidates
-            for spelling in (os.path.abspath(path), os.path.realpath(path))}
+    named = [(path, path) for path in candidates] + [(other, path) for other, path in (also or {}).items()]
+    return {os.fsencode(os.path.normcase(spelling)): path for where, path in named
+            for spelling in (os.path.abspath(where), os.path.realpath(where))}
 
 
 def _matches(spellings: dict[bytes, Path], users: dict[Path, str], blob: bytes) -> list[Path]:
@@ -85,31 +229,34 @@ def _matches(spellings: dict[bytes, Path], users: dict[Path, str], blob: bytes) 
     return [path for spelling, path in spellings.items() if path not in users and spelling in blob]
 
 
-def _process_users(spellings: dict[bytes, Path]) -> dict[Path, str] | None:
+def _process_users(spellings: dict[bytes, Path], *, skip: int | None = None) -> dict[Path, str] | None:
     if os.path.isdir("/proc/self/fd"):
-        return _proc_users(spellings)
+        return _proc_users(spellings, skip=skip)
     if os.name == "posix":
-        return _listing_users(spellings)
-    return _psutil_users(spellings)
+        return _listing_users(spellings, skip=skip)
+    return _psutil_users(spellings, skip=skip)
 
 
-def _proc_users(spellings: dict[bytes, Path]) -> dict[Path, str] | None:
+def _proc_users(spellings: dict[bytes, Path], *, skip: int | None = None) -> dict[Path, str] | None:
     """Linux: what ``/proc`` shows of every process.
 
     Another user's process shows only its argv; one that exits mid-scan shows nothing more. The
     scan counts only if it saw this process's own argv: a ``/proc`` that hides even that is no
-    listing at all.
+    listing at all. ``skip`` is a pid whose uses are not recorded.
     """
     try:
         pids = [entry.name for entry in os.scandir("/proc") if entry.name.isdigit()]
     except OSError:
         return None
     own = str(os.getpid())
+    ignored = None if skip is None else str(skip)
     users: dict[Path, str] = {}
     witnessed = False
     for pid in pids:
         for what, blob in _proc_views(pid):
             witnessed = witnessed or (pid == own and what == "argv")
+            if pid == ignored:
+                continue
             for path in _matches(spellings, users, blob):
                 users[path] = f"pid {pid} ({_comm(pid)}): {what}"
     return users if witnessed else None
@@ -155,7 +302,7 @@ def _comm(pid: str) -> str:
     return (_read(f"/proc/{pid}/comm") or b"?").decode("utf-8", "replace").strip()
 
 
-def _listing_users(spellings: dict[bytes, Path]) -> dict[Path, str] | None:
+def _listing_users(spellings: dict[bytes, Path], *, skip: int | None = None) -> dict[Path, str] | None:
     """macOS and the BSDs: ``lsof`` for executables, cwds, open and mapped files, ``ps`` for argv
     and environment (a venv's ``bin/python`` is a symlink: ``lsof`` reports the interpreter it
     resolves to, only argv still names the venv).
@@ -171,7 +318,9 @@ def _listing_users(spellings: dict[bytes, Path]) -> dict[Path, str] | None:
         return None
     users: dict[Path, str] = {}
     own = str(os.getpid())
-    if _scan_lsof(files, spellings, users, own) and _scan_ps(table, spellings, users, own):
+    ignored = str(skip) if skip is not None else None
+    if (_scan_lsof(files, spellings, users, own, ignored)
+            and _scan_ps(table, spellings, users, own, ignored)):
         return users
     return None
 
@@ -202,24 +351,31 @@ def _lsof_files(listing: bytes) -> Iterator[tuple[str, str, str, bytes]]:
             yield pid, command, fd, value
 
 
-def _scan_lsof(listing: bytes, spellings: dict[bytes, Path], users: dict[Path, str], own: str) -> bool:
+def _scan_lsof(listing: bytes, spellings: dict[bytes, Path], users: dict[Path, str], own: str,
+               skip: str | None = None) -> bool:
     """Record what ``lsof`` names; True when the listing includes ``own`` (it always lists a cwd)."""
     witnessed = False
     for pid, command, fd, name in _lsof_files(listing):
         witnessed = witnessed or pid == own
+        if pid == skip:
+            continue
         for path in _matches(spellings, users, name):
             users[path] = f"pid {pid} ({command}): file, fd {fd}"
     return witnessed
 
 
-def _scan_ps(table: bytes, spellings: dict[bytes, Path], users: dict[Path, str], own: str) -> bool:
+def _scan_ps(table: bytes, spellings: dict[bytes, Path], users: dict[Path, str], own: str,
+             skip: str | None = None) -> bool:
     """Record what ``ps -E -o pid= -o command=`` names; True when the table includes ``own``."""
     witnessed = False
     for line in table.split(b"\n"):
-        pid, _, rest = line.strip().partition(b" ")
-        witnessed = witnessed or pid.decode("ascii", "replace") == own
+        raw, _, rest = line.strip().partition(b" ")
+        pid = raw.decode("ascii", "replace")
+        witnessed = witnessed or pid == own
+        if pid == skip:
+            continue
         for path in _matches(spellings, users, rest):
-            users[path] = f"pid {pid.decode('ascii', 'replace')}: argv or environment"
+            users[path] = f"pid {pid}: argv or environment"
     return witnessed
 
 
@@ -227,7 +383,7 @@ _PSUTIL_VIEWS = (("exe", "executable"), ("cwd", "working directory"), ("open_fil
                  ("memory_maps", "mapped file"), ("cmdline", "argv"), ("environ", "environment"))
 
 
-def _psutil_users(spellings: dict[bytes, Path]) -> dict[Path, str] | None:
+def _psutil_users(spellings: dict[bytes, Path], *, skip: int | None = None) -> dict[Path, str] | None:
     """Windows: psutil, when this interpreter has it (the ``-I -S`` bootstrap does not)."""
     try:
         import psutil
@@ -238,6 +394,8 @@ def _psutil_users(spellings: dict[bytes, Path]) -> dict[Path, str] | None:
     for process in psutil.process_iter():
         for what, blob in _psutil_views(process, psutil):
             witnessed = witnessed or (process.pid == os.getpid() and what == "argv")
+            if process.pid == skip:
+                continue
             for path in _matches(spellings, users, blob):
                 users[path] = f"pid {process.pid}: {what}"
     return users if witnessed else None
