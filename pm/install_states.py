@@ -118,9 +118,15 @@ def _install_lock(state: Path):
 
 def _leased(state: Path) -> bool:
     """True while a generation lease (dependency env or PM runtime) is held."""
+    return _leases_under(state)
+
+
+def _leases_under(root: Path) -> bool:
+    """True while a lease is held in a generation under *root*: the state, or where its contents
+    were set aside."""
     from hermes_cli.runtime_state import leases_held
 
-    for generations in (state / "environments", state / "pm-runtime" / "generations"):
+    for generations in (root / "environments", root / "pm-runtime" / "generations"):
         if generations.is_dir():
             for generation in generations.iterdir():
                 if generation.is_dir() and (generation / ".leases").is_dir() and leases_held(generation):
@@ -153,8 +159,11 @@ def collect_orphan_install_states(installs: Path) -> list[Path]:
     Each candidate is re-checked under its install lock right before removal: removing a large
     orphan takes long enough for another state to be synced or launched (lease taken and
     released) since the candidates were listed, and that use must keep it. A state a live process
-    runs from is kept before any of that, whether or not it holds a lease."""
-    from hermes_cli.runtime_state_users import unused
+    runs from is kept before any of that, whether or not it holds a lease. Under the lock the
+    contents are first moved into a ``.collecting-*`` directory of the state and looked at again
+    (:func:`hermes_cli.runtime_state_users.set_aside`): a process that began using the state after
+    the first check finds nothing at the old paths, or shows up and has the contents moved back."""
+    from hermes_cli.runtime_state_users import set_aside, unused
 
     if not installs.is_dir():
         return []
@@ -162,20 +171,25 @@ def collect_orphan_install_states(installs: Path) -> list[Path]:
     retention = _retention_seconds(installs.parent)
     removed: list[Path] = []
     orphans = [s for s in sorted(installs.iterdir()) if _is_orphan(s, data_root, retention)]
-    for state in unused(orphans, kind="orphaned install state"):
+    kind = "orphaned install state"
+    for state in unused(orphans, kind=kind):
         with _install_lock(state) as locked:
             if not locked or not _is_orphan(state, data_root, retention) or _leased(state):
                 logger.debug("orphan install state %s is held or back in use; skipped", state.name)
                 continue
-            emptied = _remove_contents(state)
-            if emptied:  # still under the lock: only the record is left, so it goes last
-                shutil.rmtree(state / "inputs", ignore_errors=True)
-                # POSIX: unlink while still holding it. A launcher already waiting on this file
-                # then sees it gone once it gets the lock and retries on a fresh one (lock_path);
-                # unlinked after release, the path could be a file that launcher just made.
-                if os.name != "nt":
-                    with contextlib.suppress(OSError):
-                        (state / ".install.lock").unlink()
+            with set_aside([state], kind=kind, keep=_KEPT_UNTIL_LAST, held=_leases_under) as idle:
+                if not idle:
+                    logger.debug("orphan install state %s is in use or cannot be set aside; skipped", state.name)
+                    continue
+                emptied = _remove_contents(state)
+                if emptied:  # still under the lock: only the record is left, so it goes last
+                    shutil.rmtree(state / "inputs", ignore_errors=True)
+                    # POSIX: unlink while still holding it. A launcher already waiting on this file
+                    # then sees it gone once it gets the lock and retries on a fresh one (lock_path);
+                    # unlinked after release, the path could be a file that launcher just made.
+                    if os.name != "nt":
+                        with contextlib.suppress(OSError):
+                            (state / ".install.lock").unlink()
         if not emptied:
             logger.debug("orphan install state %s only partly removed; retried next pass", state.name)
             continue

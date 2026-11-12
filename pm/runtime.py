@@ -189,11 +189,13 @@ def collect_runtime_generations(root: Path) -> list[Path]:
     (no ``pm-runtime.json``) is an aborted stage. A superseded published generation goes
     once every worker launched from it has exited; generations published before leases
     existed stay, as the application collector keeps its own. A generation a live process still
-    runs from without a lease (see :func:`hermes_cli.runtime_state_users.unused`) stays as well.
+    runs from without a lease (see :func:`hermes_cli.runtime_state_users.unused`) stays as well,
+    including one that started using it after that check: each is renamed out of the way and looked
+    at again before it is deleted (:func:`hermes_cli.runtime_state_users.set_aside`).
     """
     from pm.filesystem import lock_fd
     from hermes_cli.runtime_state import leases_held
-    from hermes_cli.runtime_state_users import unused
+    from hermes_cli.runtime_state_users import set_aside, unused
 
     generations = root / "generations"
     removed: list[Path] = []
@@ -214,9 +216,11 @@ def collect_runtime_generations(root: Path) -> list[Path]:
             if published and (not (generation / ".lease-managed").is_file() or leases_held(generation)):
                 continue
             stale.append(generation)
-        for generation in unused(stale, kind="PM runtime generation"):
-            shutil.rmtree(generation)
-            removed.append(generation)
+        kind = "PM runtime generation"
+        with set_aside(unused(stale, kind=kind), kind=kind, held=leases_held) as idle:
+            for generation, aside in idle.items():
+                shutil.rmtree(aside)
+                removed.append(generation)
     return removed
 
 

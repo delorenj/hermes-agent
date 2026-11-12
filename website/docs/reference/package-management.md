@@ -129,7 +129,11 @@ process whose executable, working directory, open files, arguments or
 environment name a path inside it, or any launchd agent or systemd user unit of
 the account that does, however it was started. Each generation kept this way
 is logged with the reason. When the process table cannot be read, nothing is
-collected.
+collected. A generation that passes that check is not deleted on its word: it is
+first renamed out of the way (`<name>.collecting-<id>`, or inside an install
+state), looked at once more, by lease as well, and renamed back if a process or
+reader turned up in between, so a process that starts using it during collection
+finds nothing at the old path rather than losing files while it runs.
 
 Downloads share a lock per partial URL. A failed or paused transfer cannot
 publish a partial destination, and garbage collection cannot delete a live

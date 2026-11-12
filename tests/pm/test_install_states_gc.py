@@ -82,7 +82,10 @@ def test_partly_removed_orphan_keeps_its_record_until_retried(tmp_path):
         assert collect_orphan_install_states(installs) == []
         assert orphan_install_states(installs) == [state]
     finally:
-        stuck.chmod(0o700)
+        # The contents were set aside before removal (``.collecting-*`` in the state): the part
+        # that would not go is still there, under the state's record.
+        (stuck_aside,) = state.glob(".collecting-*/environments/gen/venv")
+        stuck_aside.chmod(0o700)
     assert collect_orphan_install_states(installs) == [state] and not state.exists()
 
 
@@ -186,7 +189,7 @@ def test_state_used_while_another_orphan_is_removed_is_kept(tmp_path, monkeypatc
     rmtree = pm.install_states.shutil.rmtree
 
     def remove_then_launch(path, *args, **kwargs):
-        if path == deleted / "environments":
+        if path.parent == deleted and path.name != "inputs":  # the contents, set aside before removal
             release = lease_directory(used / "environments" / "gen")
             release()
         return rmtree(path, *args, **kwargs)

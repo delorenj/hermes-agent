@@ -184,9 +184,11 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
 
     A generation no lease covers but a live process runs from (an MCP server started from its
     ``venv/bin/python``, a launchd job whose ``PATH`` names it) is kept too; see
-    :func:`hermes_cli.runtime_state_users.unused`.
+    :func:`hermes_cli.runtime_state_users.unused`. One that starts being used after that check is
+    caught by a second look at the generation renamed out of the way before it is deleted
+    (:func:`hermes_cli.runtime_state_users.set_aside`).
     """
-    from hermes_cli.runtime_state_users import unused
+    from hermes_cli.runtime_state_users import set_aside, unused
     from pm.environments import selected_venv
     removed = []
     root = install_state_dir(project)
@@ -209,9 +211,11 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
                 continue
             if not leases_held(generation):
                 unleased.append(generation)
-        for generation in unused(unleased, kind="unleased dependency generation"):
-            shutil.rmtree(generation)
-            removed.append(generation)
+        kind = "unleased dependency generation"
+        with set_aside(unused(unleased, kind=kind), kind=kind, held=leases_held) as idle:
+            for generation, aside in idle.items():
+                shutil.rmtree(aside)
+                removed.append(generation)
     return removed
 
 
