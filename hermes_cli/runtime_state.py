@@ -188,7 +188,7 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
     caught by a second look at the generation renamed out of the way before it is deleted
     (:func:`hermes_cli.runtime_state_users.set_aside`).
     """
-    from hermes_cli.runtime_state_users import set_aside, unused
+    from hermes_cli.runtime_state_users import ASIDE_MARK, set_aside, unused
     from pm.environments import selected_venv
     removed = []
     root = install_state_dir(project)
@@ -207,7 +207,10 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
             if generation.is_symlink() or not generation.is_dir() or generation.resolve() == selected:
                 continue
             marker = generation / ".lease-managed"
-            if not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds:
+            # Left set aside by a collector that was killed or could not put it back: already
+            # chosen for removal, and maybe part-way through it, marker gone with it.
+            if ASIDE_MARK not in generation.name and (
+                    not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds):
                 continue
             if not leases_held(generation):
                 unleased.append(generation)

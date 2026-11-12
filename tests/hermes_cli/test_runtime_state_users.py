@@ -132,7 +132,7 @@ def _debris(old: Path, kind: str) -> list[Path]:
 
 def _after_the_first_look(monkeypatch, then):
     """Run ``then()`` once, right after the collector's first look at the process table: the gap
-    between inspecting a generation and deleting it. Later looks (``others_only``) are untouched."""
+    between inspecting a generation and deleting it. Later looks are untouched."""
     real, calls = runtime_state_users.users_of, []
 
     def users_of(*args, **kwargs):
@@ -213,7 +213,7 @@ def test_a_second_look_that_fails_puts_everything_back(tmp_path, monkeypatch, ca
     real = runtime_state_users.users_of
 
     def users_of(*args, **kwargs):
-        if not kwargs.get("others_only"):
+        if "own_files" not in kwargs:  # the first look; the second one names the files it may hold
             return real(*args, **kwargs)
         if failure == "raises":
             raise RuntimeError("the probe fell over")
@@ -239,16 +239,21 @@ def test_a_candidate_is_out_of_reach_while_it_is_looked_at_again(tmp_path, monke
     old, idle = make("old"), make("idle")
     for generation in (old, idle):
         (generation / "payload").write_text("x", encoding="utf-8")
-    real, reachable = runtime_state_users.users_of, []
+    real, reachable, looked_at = runtime_state_users.users_of, [], []
 
     def users_of(candidates, **kwargs):
-        if kwargs.get("others_only"):
-            reachable.extend((candidate / "payload").exists() for candidate in candidates)
+        if "own_files" in kwargs:  # the second look: by now the old names must lead nowhere
+            for path in candidates:  # the name a process could open it by: the old one
+                original = path.with_name(path.name.rpartition(runtime_state_users.ASIDE_MARK)[0] or path.name)
+                reachable.append((original / "payload").exists())
+                looked_at.append(path)
         return real(candidates, **kwargs)
 
     monkeypatch.setattr(runtime_state_users, "users_of", users_of)
     assert sorted(collect()) == sorted([old, idle])
-    assert len(reachable) >= 2 and not any(reachable)
+    assert reachable == [False, False] and len(looked_at) == 2
+    if kind != "orphans":  # what is looked at is the renamed directory, which holds the files
+        assert all(runtime_state_users.ASIDE_MARK in path.name for path in looked_at)
 
 
 @pytest.mark.platforms("posix")
@@ -300,6 +305,78 @@ def test_what_cannot_be_put_back_is_never_removed(tmp_path, monkeypatch, caplog,
     finally:
         running.close()
     assert collect() and not any(path.exists() for path in kept)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("kind", ["dependencies", "runtime", "orphans"])
+def test_a_use_by_this_very_process_between_inspection_and_removal_keeps_it(tmp_path, monkeypatch, caplog, kind):
+    """The collector's own process is not exempt: a thread of it can start using a candidate (a
+    working directory, a file, with no lease) after the first look. Only the install lock it holds
+    on purpose is not a use."""
+    make, collect = _collector(kind, tmp_path, monkeypatch)
+    old, idle = make("old"), make("idle")
+    opened = []
+
+    def use():
+        (old / "held.bin").write_bytes(b"x")
+        opened.append(open(old / "held.bin", "rb"))
+
+    try:
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            _after_the_first_look(monkeypatch, use)
+            assert collect() == [idle]
+        assert (old / "held.bin").is_file() and _debris(old, kind) == []
+        kept = [r.getMessage() for r in caplog.records if r.getMessage().startswith("kept")]
+        assert len(kept) == 1 and f"pid {os.getpid()}" in kept[0] and "second look" in kept[0], kept
+    finally:
+        for handle in opened:
+            handle.close()
+    assert collect() == [old]
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("kind", ["dependencies", "runtime"])
+def test_a_generation_left_set_aside_is_still_probed_under_its_old_name(tmp_path, monkeypatch, kind):
+    """A collector killed between the rename and the delete leaves ``<name>.collecting-<hex>``. A
+    process that started from the old path names it in its argv, which the new name does not contain."""
+    make, collect = _collector(kind, tmp_path, monkeypatch)
+    old = make("old")
+    with _running(old, "argv"):
+        left = old.with_name(f"old{runtime_state_users.ASIDE_MARK}deadbeef")
+        os.rename(old, left)
+        assert collect() == []
+        assert left.is_dir()
+    assert collect() == [left]
+
+
+@pytest.mark.platforms("any")
+@pytest.mark.parametrize("kind", ["dependencies", "runtime"])
+def test_a_generation_left_set_aside_is_collected_without_its_marker(tmp_path, monkeypatch, kind):
+    """A removal that failed part-way may already have deleted ``.lease-managed``; what a collector
+    set aside is collected anyway, where a pre-lease generation without one is kept."""
+    make, collect = _collector(kind, tmp_path, monkeypatch)
+    legacy, left = make("legacy"), make(f"half{runtime_state_users.ASIDE_MARK}cafef00d")
+    for generation in (legacy, left):
+        (generation / ".lease-managed").unlink()
+    assert collect() == [left]
+    assert legacy.is_dir()
+
+
+@pytest.mark.platforms("posix")
+def test_a_lease_inside_what_an_install_state_left_set_aside_keeps_it(tmp_path, monkeypatch):
+    """A reader in another PID namespace shows in no process table, only by its lease; the contents a
+    killed collector moved aside still hold it."""
+    make, collect = _collector("orphans", tmp_path, monkeypatch)
+    state = make("old")
+    generation = state / f"{runtime_state_users.ASIDE_MARK}deadbeef" / "environments" / "gen"
+    generation.mkdir(parents=True)
+    (generation / ".lease-managed").touch()
+    release = lease_directory(generation)
+
+    assert collect() == []
+    assert generation.is_dir()
+    release()
+    assert collect() == [state]
 
 
 @pytest.mark.platforms("posix")
@@ -415,28 +492,40 @@ def test_the_psutil_listing_names_a_working_directory(tmp_path, monkeypatch):
 
 
 @pytest.mark.platforms("posix")
-def test_others_only_leaves_this_process_out_of_the_answer(tmp_path, monkeypatch):
-    """The collector holds files in what it set aside (an install lock): its own uses must not keep
-    the candidate, while the listing must still include it to count."""
+def test_this_process_may_hold_only_the_files_it_names_open(tmp_path, monkeypatch):
+    """The collector holds the install lock of what it set aside: that file is not a use. Anything
+    else this process does inside a candidate still is, a thread of it that began using one included."""
     old = tmp_path / "old"
     old.mkdir()
+    lock, other = old / ".install.lock", old / "other"
+    lock.touch()
+    other.touch()
+    me = f"pid {os.getpid()}"
+    with open(lock):
+        assert me in runtime_state_users.users_of([old])[old]
+        assert runtime_state_users.users_of([old], own_files=[lock]) == {}
+        with open(other):
+            assert me in runtime_state_users.users_of([old], own_files=[lock])[old]
     monkeypatch.chdir(old)
-    assert f"pid {os.getpid()}" in runtime_state_users.users_of([old])[old]
-    assert runtime_state_users.users_of([old], others_only=True) == {}
-    assert runtime_state_users.users_of([old], also={tmp_path / "moved": old}, others_only=True) == {}
+    assert me in runtime_state_users.users_of([old], own_files=[lock])[old]
 
 
 @pytest.mark.platforms("posix")
-def test_the_macos_listing_skips_one_process_and_still_needs_to_see_it(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("fd", "name", "ignored"), [("f9", ".install.lock", True), ("f9", "other", False),
+                                                    ("fcwd", "", False)])
+def test_the_macos_listing_ignores_only_the_named_open_files(tmp_path, monkeypatch, fd, name, ignored):
     old = tmp_path / "old"
     old.mkdir()
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _fake(bin_dir, "lsof", f"p{{me}}\ncpytest\nfcwd\nn{old}\np88\ncmcp\nfcwd\nn/elsewhere", 0)
-    _fake(bin_dir, "ps", f"{{me}} python {old}/x\n88 srv", 0)
+    named = f"{old}/{name}" if name else str(old)
+    _fake(bin_dir, "lsof", f"p{{me}}\ncpytest\n{fd}\nn{named}", 0)
+    _fake(bin_dir, "ps", "{me} python x", 0)
     monkeypatch.setattr(runtime_state_users, "_LSOF", (str(bin_dir / "lsof"),))
     monkeypatch.setattr(runtime_state_users, "_PS", (str(bin_dir / "ps"),))
     spellings = runtime_state_users._spellings([old])
+    own = frozenset(runtime_state_users._spellings([old / ".install.lock"]))
 
     assert runtime_state_users._listing_users(spellings)[old].startswith(f"pid {os.getpid()}")
-    assert runtime_state_users._listing_users(spellings, skip=os.getpid()) == {}
+    users = runtime_state_users._listing_users(spellings, ignore=own)
+    assert (users == {}) if ignored else (users[old].startswith(f"pid {os.getpid()}"))

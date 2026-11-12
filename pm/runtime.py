@@ -195,7 +195,7 @@ def collect_runtime_generations(root: Path) -> list[Path]:
     """
     from pm.filesystem import lock_fd
     from hermes_cli.runtime_state import leases_held
-    from hermes_cli.runtime_state_users import set_aside, unused
+    from hermes_cli.runtime_state_users import ASIDE_MARK, set_aside, unused
 
     generations = root / "generations"
     removed: list[Path] = []
@@ -213,7 +213,11 @@ def collect_runtime_generations(root: Path) -> list[Path]:
             if not generation.is_dir() or generation.is_symlink() or generation == root / selected:
                 continue
             published = (generation / "pm-runtime.json").is_file()
-            if published and (not (generation / ".lease-managed").is_file() or leases_held(generation)):
+            # A generation left set aside (``ASIDE_MARK``) by a collector that was killed or could
+            # not put it back was already chosen for removal: it needs no lease marker, which a
+            # part-way removal may have taken.
+            marked = (generation / ".lease-managed").is_file() or ASIDE_MARK in generation.name
+            if published and (not marked or leases_held(generation)):
                 continue
             stale.append(generation)
         kind = "PM runtime generation"

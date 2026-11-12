@@ -121,16 +121,18 @@ def _leased(state: Path) -> bool:
     return _leases_under(state)
 
 
-def _leases_under(root: Path) -> bool:
-    """True while a lease is held in a generation under *root*: the state, or where its contents
-    were set aside."""
+def _leases_under(state: Path) -> bool:
+    """True while a lease is held in a generation of *state*, wherever its contents are: in place,
+    or set aside (``.collecting-*``) by a collection that was interrupted or is under way."""
     from hermes_cli.runtime_state import leases_held
+    from hermes_cli.runtime_state_users import ASIDE_MARK
 
-    for generations in (root / "environments", root / "pm-runtime" / "generations"):
-        if generations.is_dir():
-            for generation in generations.iterdir():
-                if generation.is_dir() and (generation / ".leases").is_dir() and leases_held(generation):
-                    return True
+    for root in (state, *sorted(state.glob(f"{ASIDE_MARK}*"))):
+        for generations in (root / "environments", root / "pm-runtime" / "generations"):
+            if generations.is_dir():
+                for generation in generations.iterdir():
+                    if generation.is_dir() and (generation / ".leases").is_dir() and leases_held(generation):
+                        return True
     return False
 
 
@@ -177,7 +179,8 @@ def collect_orphan_install_states(installs: Path) -> list[Path]:
             if not locked or not _is_orphan(state, data_root, retention) or _leased(state):
                 logger.debug("orphan install state %s is held or back in use; skipped", state.name)
                 continue
-            with set_aside([state], kind=kind, keep=_KEPT_UNTIL_LAST, held=_leases_under) as idle:
+            with set_aside([state], kind=kind, keep=_KEPT_UNTIL_LAST,
+                           held=lambda _aside, state=state: _leases_under(state)) as idle:
                 if not idle:
                     logger.debug("orphan install state %s is in use or cannot be set aside; skipped", state.name)
                     continue
