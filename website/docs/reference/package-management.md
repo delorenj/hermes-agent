@@ -131,7 +131,12 @@ the account that does, however it was started. Each generation kept this way
 is logged with the reason. The check sees what the operating system shows the
 collector: another user's process shows only its arguments, so any other use it
 makes is invisible, and a process whose only link is code already imported into
-memory shows nothing. Such uses are not protected. When the process table cannot be read, nothing is collected. A
+memory shows nothing. Such uses are not protected. When the process table cannot be read, nothing is collected. Every
+scan lists the process table again after reading it and reads any process
+started meanwhile, until a listing names nobody new, so a child forked during
+the scan that took over its parent's open files or working directory is seen;
+a host still starting processes after 64 listings gets no verdict, and nothing
+is collected. A
 generation that passes that check is not deleted on its word: it is
 first renamed out of the way (`<name>.collecting-<id>`, or inside an install
 state), looked at once more, by lease as well, and renamed back if a process or
@@ -139,7 +144,8 @@ reader turned up in between, so a process that starts using it during collection
 finds nothing at the old path rather than losing files while it runs. The new
 name is random and Hermes selects a generation by its recorded path, never by
 listing the directory, so only a process that goes looking in the directory by
-hand can still reach it. A process that merely imports from a generation and
+hand, or one handed an open descriptor of it over a socket, can still reach it.
+A process that merely imports from a generation and
 holds no open file, argument, environment entry or service definition naming it
 is invisible to any scan, before or after this check.
 

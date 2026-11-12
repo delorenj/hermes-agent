@@ -20,18 +20,26 @@ enough for a process to start using an idle one in between. So a collector remov
 it by, looks again, and only then yields what is still idle for deletion; anything that turned
 out to be in use is renamed back. The new name is random and nothing configured names it, but it
 is not hidden: a process that goes looking in the directory by hand can still reach it. What a
-probe cannot see it cannot protect: another user's process shows only its argv, and a process
-whose only link to a generation is code already imported into memory shows nothing at all.
+probe cannot see it cannot protect: another user's process shows only its argv, a process whose
+only link to a generation is code already imported into memory shows nothing at all, and a
+descriptor handed to another process over a socket moves where no listing follows it.
+
+A probe reads one process after another, so it is not an instant either: a process can fork
+after the table was listed, leave its descriptors and working directory to a child the listing
+missed, and let go of them itself before its turn comes. So every probe lists the table again
+after reading it and reads whoever is new, until a listing turns up nobody new; a host that keeps
+spawning through :data:`SCAN_ROUNDS` listings is no answer.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Hashable, Iterator
 import contextlib
 import logging
 import os
 from pathlib import Path
 import secrets
 import subprocess
+import time
 
 LOG = logging.getLogger(__name__)
 
@@ -42,6 +50,10 @@ PROBE_TIMEOUT_SECONDS = 15
 # ``PATH`` does not include ``/usr/sbin``. Neither is on Windows, where psutil answers instead.
 _LSOF = ("/usr/sbin/lsof", "/usr/bin/lsof")
 _PS = ("/bin/ps", "/usr/bin/ps")
+# How many times a probe lists the process table looking for processes born while it read the
+# last listing. A quiet host settles on the second listing; one still spawning after this many
+# is no answer, and the candidates are kept. A Linux listing takes milliseconds.
+SCAN_ROUNDS = 64
 
 
 def unused(candidates: Collection[Path], *, kind: str) -> list[Path]:
@@ -85,10 +97,11 @@ def set_aside(candidates: Collection[Path], *, kind: str, held: Callable[[Path],
     process that starts afterwards finds nothing at the old path, and one that started in between
     shows up in a second look (its files and working directory under the new name, its argv and
     environment under the old one, which the new name answers to), or through ``held`` (a lease
-    taken in the gap; the one signal that crosses a PID namespace). What is in use is renamed back
+    taken in the gap; the one signal that crosses a PID namespace). A child it forks while the second
+    look reads the table is read too (see the module docs). What is in use is renamed back
     and never yielded. The new name is random and named by no configuration, and Hermes picks a
     generation by its recorded path, never by listing the directory, so nothing reaches it after the
-    second look but a process that goes looking for it by hand.
+    second look but a process that goes looking for it by hand, or one handed a descriptor of it.
 
     Never raises for the checks: a candidate that cannot be renamed, a listing that fails, or a
     ``held`` that raises keeps the candidate. Whatever is not yielded is renamed back on the way out,
@@ -288,28 +301,67 @@ def _without(blob: bytes, ignore: frozenset[bytes]) -> bytes:
     return b"\0".join(name for name in blob.split(b"\0") if name not in ignore) if ignore else blob
 
 
+def _until_settled(listing: Callable[[], list[Hashable] | None], read: Callable[[list[Hashable]], bool]) -> bool:
+    """List the process table, ``read`` everyone on it, then list it again and read whoever is new,
+    until a listing names nobody new: True. A process that forks while it waits for its turn and
+    leaves what it uses to the child before that turn comes is caught in the child, which the next
+    listing names (a child that exits first leaves its own children to a later listing in turn).
+
+    An entry stands for one process: a pid, or a pid with its start time where the listing shows it
+    for free. False when a listing or a read fails, when nobody is listed at all, or when processes
+    are still starting after :data:`SCAN_ROUNDS` listings or :data:`PROBE_TIMEOUT_SECONDS` (the
+    collector holds the install lock meanwhile)."""
+    seen: set[Hashable] = set()
+    deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+    for _ in range(SCAN_ROUNDS):
+        listed = listing()
+        if listed is None:
+            return False
+        fresh = [entry for entry in listed if entry not in seen]
+        if not fresh:
+            return bool(seen)  # an empty table is no listing
+        if time.monotonic() > deadline or not read(fresh):
+            return False
+        seen.update(fresh)
+    LOG.warning("processes kept starting through %d listings of the process table", SCAN_ROUNDS)
+    return False
+
+
 def _proc_users(spellings: dict[bytes, list[Path]], *, ignore: frozenset[bytes] = frozenset()) -> dict[Path, str] | None:
-    """Linux: what ``/proc`` shows of every process.
+    """Linux: what ``/proc`` shows of every process, read until no process is new (:func:`_until_settled`).
 
     Another user's process shows only its argv; one that exits mid-scan shows nothing more. The
     scan counts only if it saw this process's own argv: a ``/proc`` that hides even that is no
     listing at all. ``ignore`` names files this process alone may hold open without that being a use.
     """
-    try:
-        pids = [entry.name for entry in os.scandir("/proc") if entry.name.isdigit()]
-    except OSError:
-        return None
     own = str(os.getpid())
     users: dict[Path, str] = {}
     witnessed = False
-    for pid in pids:
-        for what, blob in _proc_views(pid):
-            witnessed = witnessed or (pid == own and what == "argv")
-            if pid == own and what == "open file":
-                blob = _without(blob, ignore)
-            for path in _matches(spellings, users, blob):
-                users[path] = f"pid {pid} ({_comm(pid)}): {what}"
+
+    def read(fresh: list[Hashable]) -> bool:
+        nonlocal witnessed
+        for pid in fresh:
+            for what, blob in _proc_views(pid):
+                witnessed = witnessed or (pid == own and what == "argv")
+                if pid == own and what == "open file":
+                    blob = _without(blob, ignore)
+                for path in _matches(spellings, users, blob):
+                    users[path] = f"pid {pid} ({_comm(pid)}): {what}"
+        return True
+
+    if not _until_settled(_proc_table, read):
+        return None
     return users if witnessed else None
+
+
+def _proc_table() -> list[Hashable] | None:
+    """The pids ``/proc`` lists. Names only, so a listing takes a few milliseconds and a busy host
+    settles: a pid comes round again only after the kernel has handed out every other one up to
+    ``kernel.pid_max`` (4194304 on a 64-bit systemd host), far more than one scan sees born."""
+    try:
+        return [entry.name for entry in os.scandir("/proc") if entry.name.isdigit()]
+    except OSError:
+        return None
 
 
 def _proc_views(pid: str) -> list[tuple[str, bytes]]:
@@ -358,20 +410,47 @@ def _listing_users(spellings: dict[bytes, list[Path]], *,
     and environment (a venv's ``bin/python`` is a symlink: ``lsof`` reports the interpreter it
     resolves to, only argv still names the venv).
 
-    Each listing counts only if it exits 0 and includes this process.
+    Each listing counts only if it exits 0 and includes this process. Both tools read the whole
+    table every time, so a round after the first reads again whoever a fresh ``ps`` listing names
+    that was not listed before (:func:`_until_settled`).
     """
     lsof, ps = (next((path for path in paths if os.access(path, os.X_OK)), None) for paths in (_LSOF, _PS))
     if lsof is None or ps is None:
         return None
-    files = _output([lsof, "-n", "-P", "-w", "-F", "pcfn"])
-    table = _output([ps, "-A", "-ww", "-E", "-o", "pid=", "-o", "command="])
-    if files is None or table is None:
-        return None
     users: dict[Path, str] = {}
     own = str(os.getpid())
-    if _scan_lsof(files, spellings, users, own, ignore) and _scan_ps(table, spellings, users, own):
-        return users
-    return None
+
+    def read(_fresh: list[Hashable]) -> bool:
+        files = _output([lsof, "-n", "-P", "-w", "-F", "pcfn"])
+        table = _output([ps, "-A", "-ww", "-E", "-o", "pid=", "-o", "command="])
+        if files is None or table is None:
+            return False
+        return _scan_lsof(files, spellings, users, own, ignore) and _scan_ps(table, spellings, users, own)
+
+    return users if _until_settled(lambda: _ps_table(ps), read) else None
+
+
+def _ps_table(ps: str) -> list[Hashable] | None:
+    """Every process as ``(pid, start time)`` from ``ps``, less the ``ps`` that lists them."""
+    try:
+        with subprocess.Popen([ps, "-A", "-o", "pid=", "-o", "lstart="], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
+            try:
+                listing, _ = child.communicate(timeout=PROBE_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if child.returncode != 0:
+        return None
+    table: list[Hashable] = []
+    for line in listing.split(b"\n"):
+        pid, _, started = line.strip().partition(b" ")
+        if pid.isdigit() and int(pid) != child.pid:
+            table.append((pid.decode("ascii"), b" ".join(started.split())))
+    return table
 
 
 def _output(argv: list[str]) -> bytes | None:
@@ -430,20 +509,40 @@ _PSUTIL_VIEWS = (("exe", "executable"), ("cwd", "working directory"), ("open_fil
 
 
 def _psutil_users(spellings: dict[bytes, list[Path]], *, ignore: frozenset[bytes] = frozenset()) -> dict[Path, str] | None:
-    """Windows: psutil, when this interpreter has it (the ``-I -S`` bootstrap does not)."""
+    """Windows: psutil, when this interpreter has it (the ``-I -S`` bootstrap does not); read until
+    no process is new (:func:`_until_settled`)."""
     try:
         import psutil
     except ImportError:
         return None
     users: dict[Path, str] = {}
     witnessed = False
-    for process in psutil.process_iter():
-        for what, blob in _psutil_views(process, psutil):
-            witnessed = witnessed or (process.pid == os.getpid() and what == "argv")
-            if process.pid == os.getpid() and what == "open file":
-                blob = _without(blob, ignore)
-            for path in _matches(spellings, users, blob):
-                users[path] = f"pid {process.pid}: {what}"
+    listed: dict[Hashable, object] = {}
+
+    def table() -> list[Hashable]:
+        listed.clear()
+        for process in psutil.process_iter():
+            try:
+                started = process.create_time()
+            except (psutil.Error, OSError):
+                started = None  # gone already: nothing left to read
+            listed[(str(process.pid), started)] = process
+        return list(listed)
+
+    def read(fresh: list[Hashable]) -> bool:
+        nonlocal witnessed
+        for entry in fresh:
+            process = listed[entry]
+            for what, blob in _psutil_views(process, psutil):
+                witnessed = witnessed or (process.pid == os.getpid() and what == "argv")
+                if process.pid == os.getpid() and what == "open file":
+                    blob = _without(blob, ignore)
+                for path in _matches(spellings, users, blob):
+                    users[path] = f"pid {process.pid}: {what}"
+        return True
+
+    if not _until_settled(table, read):
+        return None
     return users if witnessed else None
 
 
