@@ -404,6 +404,31 @@ def test_an_interrupt_during_the_second_look_puts_every_candidate_back(tmp_path)
 
 
 @pytest.mark.platforms("posix")
+@pytest.mark.parametrize("keep", [None, frozenset({"inputs"})], ids=["generation", "state contents"])
+def test_an_interrupt_right_after_a_rename_still_puts_it_back(tmp_path, monkeypatch, keep):
+    """The target is recorded before the move, so an interrupt that lands after the rename but
+    before the collector would have noted it still leaves the candidate where it was."""
+    old = tmp_path / "old"
+    (old / "inputs").mkdir(parents=True)
+    (old / "payload").write_text("x", encoding="utf-8")
+    real, calls = os.rename, []
+
+    def rename_then_interrupt(src, dst):
+        real(src, dst)
+        calls.append(dst)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(runtime_state_users.os, "rename", rename_then_interrupt)
+    with pytest.raises(KeyboardInterrupt), runtime_state_users.set_aside([old], kind="test", keep=keep):
+        pytest.fail("nothing is handed over after an interrupt")
+    monkeypatch.undo()
+    assert (old / "payload").is_file() and (old / "inputs").is_dir()
+    assert [p.name for p in tmp_path.iterdir() if runtime_state_users.ASIDE_MARK in p.name] == []
+    assert [p.name for p in old.iterdir() if runtime_state_users.ASIDE_MARK in p.name] == []
+
+
+@pytest.mark.platforms("posix")
 def test_what_appeared_in_an_install_state_after_the_second_look_is_not_removed(tmp_path, monkeypatch):
     """Only what was set aside and looked at is deleted. A directory that shows up in the state in
     the meantime (a launch from the recreated checkout) was never looked at: it stays, with the
