@@ -22,6 +22,14 @@ from pm.environments import install_state_dir, runtime_facts_path
 from pm.install_states import collect_orphan_install_states
 from pm.runtime import collect_runtime_generations
 
+
+@pytest.fixture(autouse=True)
+def _patient_scan(monkeypatch):
+    """The CI host is busy; a probe that gave up on it would keep everything and fail tests that
+    are not about giving up. The tests that are set their own limit."""
+    monkeypatch.setattr(runtime_state_users, "SCAN_ROUNDS", 1000, raising=False)
+
+
 LOGGER = "hermes_cli.runtime_state_users"
 # Reads the path of a file to hold open from stdin (empty: none), reports ready, then waits.
 CHILD = (
@@ -165,6 +173,89 @@ def test_a_process_that_starts_between_inspection_and_removal_keeps_it(tmp_path,
     assert "second look" in kept[0]
 
     assert collect() == [old], "once the process exits the generation is collected as before"
+
+
+# Holds a file it is told about on stdin; on "fork" it forks a child that keeps the descriptor,
+# closes its own, and prints the child's pid; on the next line both exit.
+FORKER = (
+    "import os, sys\n"
+    "fd = os.open(sys.stdin.readline().strip(), os.O_RDONLY)\n"
+    "print('ready', flush=True)\n"
+    "sys.stdin.readline()\n"
+    "r, w = os.pipe()\n"
+    "child = os.fork()\n"
+    "if child == 0:\n"
+    "    os.close(w)\n"
+    "    os.read(r, 1)\n"
+    "    os._exit(0)\n"
+    "os.close(r)\n"
+    "os.close(fd)\n"
+    "print(child, flush=True)\n"
+    "sys.stdin.readline()\n"
+    "os.close(w)\n"
+    "os.waitpid(child, 0)\n"
+)
+
+
+class _Listed(list):
+    """A materialised ``os.scandir`` result that still works as a context manager."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("kind", ["dependencies", "runtime", "orphans"])
+def test_a_child_forked_while_the_second_look_reads_the_table_keeps_it(tmp_path, monkeypatch, caplog, kind):
+    """A process began using the generation after the first look. Right after the second look lists
+    the process table, it forks and leaves its descriptor to the child, which that listing missed,
+    then closes its own before its turn comes: read on that one listing, nobody uses the generation."""
+    make, collect = _collector(kind, tmp_path, monkeypatch)
+    old, idle = make("a-old"), make("idle")  # install states are handled in name order: old goes first
+    held = old / "held.bin"
+    held.write_bytes(b"x")
+    forker = subprocess.Popen([sys.executable, "-c", FORKER], cwd=tmp_path, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True, encoding="utf-8")
+    armed: list = []
+    child: list[int] = []
+
+    def start() -> None:  # the gap after the first look: the process starts using the generation
+        forker.stdin.write(f"{held}\n")
+        forker.stdin.flush()
+        assert forker.stdout.readline().strip() == "ready"
+        armed.append(True)
+
+    def fork() -> None:
+        forker.stdin.write("fork\n")
+        forker.stdin.flush()
+        child.append(int(forker.stdout.readline()))
+
+    real_scandir = os.scandir
+
+    def scandir(path="."):
+        if path == "/proc" and armed:  # the second look's listing, taken before the fork
+            armed.clear()
+            listed = _Listed(real_scandir(path))
+            fork()
+            return listed
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    try:
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            _after_the_first_look(monkeypatch, start)
+            assert collect() == [idle]
+        assert child, "the second look never listed the process table"
+        assert old.is_dir() and held.is_file() and _debris(old, kind) == []
+        kept = [r.getMessage() for r in caplog.records if r.getMessage().startswith("kept")]
+        assert len(kept) == 1 and f"pid {child[0]}" in kept[0] and "second look" in kept[0], kept
+    finally:
+        forker.communicate("\n", timeout=15)
+
+    assert collect() == [old], "once both processes exit the generation is collected as before"
 
 
 @pytest.mark.platforms("posix")
@@ -429,38 +520,49 @@ def test_an_interrupt_right_after_a_rename_still_puts_it_back(tmp_path, monkeypa
 
 
 @pytest.mark.platforms("posix")
+@pytest.mark.parametrize("leftover", ["not empty", "empty"])
 @pytest.mark.parametrize("keep", [None, frozenset({"inputs"})], ids=["generation", "state contents"])
-def test_a_set_aside_name_that_is_taken_is_never_reused_or_touched(tmp_path, monkeypatch, keep):
+def test_a_set_aside_name_that_is_taken_is_never_reused_or_touched(tmp_path, monkeypatch, keep, leftover):
     """The name a candidate is set aside under is one nothing has. A leftover that already carries
-    the first name drawn stays exactly as it was, through the move and the put-back."""
+    the first name drawn stays exactly as it was, through the move and the put-back (an empty one
+    too, which a POSIX ``rename`` of a generation onto it would silently replace)."""
     old = tmp_path / "old"
     (old / "inputs").mkdir(parents=True)
     (old / "payload").write_text("x", encoding="utf-8")
     taken = old / f"{runtime_state_users.ASIDE_MARK}aaaaaaaa" if keep else tmp_path / f"old{runtime_state_users.ASIDE_MARK}aaaaaaaa"
     taken.mkdir()
-    (taken / "theirs").write_text("not ours", encoding="utf-8")
+    if leftover == "not empty":
+        (taken / "theirs").write_text("not ours", encoding="utf-8")
+    identity = (taken.stat().st_dev, taken.stat().st_ino)
     tokens = iter(["aaaaaaaa", "bbbbbbbb"])
     monkeypatch.setattr(runtime_state_users.secrets, "token_hex", lambda _n: next(tokens))
 
     with runtime_state_users.set_aside([old], kind="test", held=lambda _aside: True, keep=keep) as idle:
         assert idle == {}  # held: put back
-    assert (taken / "theirs").read_text(encoding="utf-8") == "not ours"
+    assert (taken.stat().st_dev, taken.stat().st_ino) == identity
+    assert sorted(p.name for p in taken.iterdir()) == (["theirs"] if leftover == "not empty" else [])
     assert (old / "payload").is_file() and not (old / "theirs").exists()
     assert sorted(p.name for p in taken.parent.iterdir() if runtime_state_users.ASIDE_MARK in p.name) == [taken.name]
 
 
 @pytest.mark.platforms("posix")
-def test_a_put_back_never_moves_onto_a_name_that_is_in_use(tmp_path, caplog):
+@pytest.mark.parametrize("contents", [False, True], ids=["empty", "not empty"])
+def test_a_put_back_never_moves_onto_a_name_that_is_in_use(tmp_path, caplog, contents):
     """If the candidate's own name exists, the move was not made by us (an interrupt before it):
-    whatever sits at the set-aside name is left alone rather than moved onto it."""
+    whatever sits at the set-aside name is left alone rather than moved onto it. An empty directory
+    is the case that matters: POSIX ``rename`` would replace it without a word."""
     old, other = tmp_path / "old", tmp_path / f"old{runtime_state_users.ASIDE_MARK}cccccccc"
-    for directory, name in ((old, "mine"), (other, "theirs")):
-        directory.mkdir()
-        (directory / name).write_text(name, encoding="utf-8")
+    old.mkdir()
+    if contents:
+        (old / "mine").write_text("mine", encoding="utf-8")
+    other.mkdir()
+    (other / "theirs").write_text("theirs", encoding="utf-8")
+    identity = (old.stat().st_dev, old.stat().st_ino)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         runtime_state_users._put_back(old, other, kind="test", keep=None)
-    assert (old / "mine").is_file() and (other / "theirs").is_file()
-    assert not (old / "theirs").exists() and not (other / "mine").exists()
+    assert (old.stat().st_dev, old.stat().st_ino) == identity
+    assert sorted(p.name for p in old.iterdir()) == (["mine"] if contents else [])
+    assert sorted(p.name for p in other.iterdir()) == ["theirs"]
     assert any("left alone" in r.getMessage() for r in caplog.records)
 
 
@@ -619,6 +721,82 @@ def test_the_macos_listing_names_users_and_fails_safe(tmp_path, monkeypatch, lso
         assert users is not None and expected in users[old]
     else:
         assert users == expected
+
+
+def _fake_calls(directory: Path, name: str, outputs: list[str], *, when: str = "", otherwise: str = "") -> None:
+    """A stand-in tool whose Nth call with *when* in its arguments prints ``outputs[N]`` (the last
+    one repeats) and whose other calls print *otherwise*; ``{me}`` is the pid of whoever ran it."""
+    for index, output in enumerate([*outputs, outputs[-1]]):
+        (directory / f"{name}.{index if index < len(outputs) else 'last'}").write_text(output + "\n", encoding="utf-8")
+    (directory / f"{name}.otherwise").write_text(otherwise + "\n", encoding="utf-8")
+    script = directory / name
+    script.write_text(
+        "#!/bin/sh\n"
+        f'case "$*" in\n'
+        f'  *{when}*) n=$(cat "{directory}/{name}.calls" 2>/dev/null || echo 0)\n'
+        f'     echo $((n + 1)) > "{directory}/{name}.calls"\n'
+        f'     out="{directory}/{name}.$n"; [ -f "$out" ] || out="{directory}/{name}.last" ;;\n'
+        f'  *) out="{directory}/{name}.otherwise" ;;\n'
+        "esac\n"
+        'sed "s/{me}/$PPID/g" "$out"\n',
+        encoding="utf-8")
+    script.chmod(0o755)
+
+
+@pytest.mark.platforms("posix")
+def test_the_macos_listing_reads_a_process_born_while_it_read_the_table(tmp_path, monkeypatch):
+    """``lsof`` and ``ps`` take their own snapshots. A process born after them (a child that took
+    over its parent's descriptor) is named by the next ``ps`` listing, and the probe reads again."""
+    old = tmp_path / "old"
+    old.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    me = "p{me}\ncpytest\nfcwd\nn/elsewhere"
+    _fake_calls(bin_dir, "lsof", [me, f"{me}\np99\ncchild\nf3\nn{old}/held.bin"])
+    _fake_calls(bin_dir, "ps", ["{me} Thu Nov 12 10:00:00 2026", "{me} Thu Nov 12 10:00:00 2026\n99 Thu Nov 12 10:00:01 2026"],
+                when="lstart", otherwise="{me} python x\n99 child")
+    monkeypatch.setattr(runtime_state_users, "_LSOF", (str(bin_dir / "lsof"),))
+    monkeypatch.setattr(runtime_state_users, "_PS", (str(bin_dir / "ps"),))
+
+    users = runtime_state_users._listing_users(runtime_state_users._spellings([old]))
+
+    assert users is not None and users[old].startswith("pid 99 (child)")
+    assert (bin_dir / "lsof.calls").read_text(encoding="utf-8").strip() == "2"
+    assert (bin_dir / "ps.calls").read_text(encoding="utf-8").strip() == "3", "settled on a listing with nobody new"
+
+
+@pytest.mark.platforms("posix")
+def test_a_process_table_that_never_settles_is_no_answer(tmp_path, monkeypatch, caplog):
+    """A host that keeps starting processes through every listing gets no verdict: everything is kept."""
+    old = tmp_path / "old"
+    old.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    listings = ["{me} T0" + "".join(f"\n{100 + n} T{n}" for n in range(rounds)) for rounds in range(6)]
+    _fake_calls(bin_dir, "lsof", ["p{me}\ncpytest\nfcwd\nn/elsewhere"])
+    _fake_calls(bin_dir, "ps", listings, when="lstart", otherwise="{me} python x")
+    monkeypatch.setattr(runtime_state_users, "_LSOF", (str(bin_dir / "lsof"),))
+    monkeypatch.setattr(runtime_state_users, "_PS", (str(bin_dir / "ps"),))
+    monkeypatch.setattr(runtime_state_users, "SCAN_ROUNDS", 4)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        assert runtime_state_users._listing_users(runtime_state_users._spellings([old])) is None
+    assert any("kept starting" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.platforms("linux")
+def test_a_proc_that_never_settles_is_no_answer(tmp_path, monkeypatch):
+    old = tmp_path / "old"
+    old.mkdir()
+    real, born = runtime_state_users._proc_table, []
+
+    def table():
+        born.append(str(4_000_000_000 + len(born)))  # a pid nothing has, new on every listing
+        return [*real(), *born]
+
+    monkeypatch.setattr(runtime_state_users, "_proc_table", table)
+    monkeypatch.setattr(runtime_state_users, "SCAN_ROUNDS", 4)
+    assert runtime_state_users._proc_users(runtime_state_users._spellings([old])) is None
 
 
 @pytest.mark.platforms("any")
