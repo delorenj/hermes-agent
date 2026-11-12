@@ -129,9 +129,9 @@ process whose executable, working directory, open files, arguments or
 environment name a path inside it, or any launchd agent or systemd user unit of
 the account that does, however it was started. Each generation kept this way
 is logged with the reason. The check sees what the operating system shows the
-collector: another user's process shows only its arguments, and a process whose
-only link is code already imported into memory shows nothing, so neither is
-protected. When the process table cannot be read, nothing is collected. A
+collector: another user's process shows only its arguments, so any other use it
+makes is invisible, and a process whose only link is code already imported into
+memory shows nothing. Such uses are not protected. When the process table cannot be read, nothing is collected. A
 generation that passes that check is not deleted on its word: it is
 first renamed out of the way (`<name>.collecting-<id>`, or inside an install
 state), looked at once more, by lease as well, and renamed back if a process or

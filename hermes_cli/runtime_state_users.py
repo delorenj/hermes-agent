@@ -120,10 +120,13 @@ def set_aside(candidates: Collection[Path], *, kind: str, held: Callable[[Path],
 
 
 def _aside_name(path: Path, keep: Collection[str] | None) -> Path:
-    token = secrets.token_hex(4)
-    if keep is None:
-        return path.with_name(f"{_original(path.name)}{ASIDE_MARK}{token}")
-    return path / f"{ASIDE_MARK}{token}"
+    """A name nothing has: what is found there afterwards is ours, or the move never happened."""
+    while True:
+        token = secrets.token_hex(4)
+        target = (path.with_name(f"{_original(path.name)}{ASIDE_MARK}{token}") if keep is None
+                  else path / f"{ASIDE_MARK}{token}")
+        if not os.path.lexists(target):
+            return target
 
 
 def _move_aside(path: Path, target: Path, keep: Collection[str] | None, *, kind: str) -> bool:
@@ -199,6 +202,9 @@ def _put_back(path: Path, target: Path, *, kind: str, keep: Collection[str] | No
         return
     try:
         if keep is None:
+            if os.path.lexists(path):  # the rename never happened: that is not ours to move onto it
+                LOG.warning("%s %s: %s is not its set-aside copy (the name is in use); left alone", kind, path, target)
+                return
             os.rename(target, path)
             return
         for child in sorted(target.iterdir()):
