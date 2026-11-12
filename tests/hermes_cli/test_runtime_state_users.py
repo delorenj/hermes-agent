@@ -349,6 +349,88 @@ def test_a_generation_left_set_aside_is_still_probed_under_its_old_name(tmp_path
     assert collect() == [left]
 
 
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("kind", ["dependencies", "runtime"])
+def test_every_leftover_of_one_generation_answers_to_its_old_name(tmp_path, monkeypatch, kind):
+    """Two interrupted collections leave ``old.collecting-a`` and ``old.collecting-b``. A process
+    that started from ``old`` names it in argv; neither leftover is idle while it runs, whichever
+    of them it actually uses."""
+    make, collect = _collector(kind, tmp_path, monkeypatch)
+    old = make("old")
+    with _running(old, "argv"):
+        first = old.with_name(f"old{runtime_state_users.ASIDE_MARK}aaaaaaaa")
+        os.rename(old, first)
+        second = make(f"old{runtime_state_users.ASIDE_MARK}bbbbbbbb")
+        assert collect() == []
+        assert first.is_dir() and second.is_dir()
+    assert sorted(collect()) == sorted([first, second])
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("kind", ["dependencies", "runtime"])
+def test_a_leftover_set_aside_again_still_answers_to_its_first_name(tmp_path, monkeypatch, kind):
+    """The second look on a leftover renames it once more; a process that names the very first
+    path and starts in between is still found, and the leftover goes back where it was."""
+    make, collect = _collector(kind, tmp_path, monkeypatch)
+    left = make(f"old{runtime_state_users.ASIDE_MARK}aaaaaaaa")
+    old = left.with_name("old")
+    with ExitStack() as stack:
+        _after_the_first_look(monkeypatch, lambda: stack.enter_context(_running(old, "argv")))
+        assert collect() == []
+    assert left.is_dir() and not any(p.name.count(runtime_state_users.ASIDE_MARK) > 1 for p in left.parent.iterdir())
+    assert sorted(p.name for p in left.parent.iterdir() if runtime_state_users.ASIDE_MARK in p.name) == [left.name]
+
+
+@pytest.mark.platforms("posix")
+def test_an_interrupt_during_the_second_look_puts_every_candidate_back(tmp_path):
+    """The second look hands candidates over only once it has finished with all of them: an
+    interrupt in the middle leaves none half-way, set aside and forgotten."""
+    first, second = tmp_path / "first", tmp_path / "second"
+    for generation in (first, second):
+        generation.mkdir()
+        (generation / "payload").write_text("x", encoding="utf-8")
+    looked_at = []
+
+    def held(aside: Path) -> bool:
+        looked_at.append(aside)
+        if len(looked_at) == 2:
+            raise KeyboardInterrupt
+        return False
+
+    with pytest.raises(KeyboardInterrupt), runtime_state_users.set_aside([first, second], kind="test", held=held):
+        pytest.fail("the caller must not be handed anything when the look was interrupted")
+    assert (first / "payload").is_file() and (second / "payload").is_file()
+    assert [p.name for p in tmp_path.iterdir() if runtime_state_users.ASIDE_MARK in p.name] == []
+
+
+@pytest.mark.platforms("posix")
+def test_what_appeared_in_an_install_state_after_the_second_look_is_not_removed(tmp_path, monkeypatch):
+    """Only what was set aside and looked at is deleted. A directory that shows up in the state in
+    the meantime (a launch from the recreated checkout) was never looked at: it stays, with the
+    record, and the state is retried on the next pass."""
+    from pm import install_states
+
+    make, collect = _collector("orphans", tmp_path, monkeypatch)
+    state = make("old")
+    (state / "environments" / "gen").mkdir(parents=True)
+    (state / "environments" / "gen" / "payload").write_text("x", encoding="utf-8")
+    real_remove = install_states._remove_contents
+
+    def remove_after_a_launch(path):
+        (path / "environments" / "fresh").mkdir(parents=True)
+        (path / "environments" / "fresh" / "payload").write_text("new", encoding="utf-8")
+        return real_remove(path)
+
+    monkeypatch.setattr(install_states, "_remove_contents", remove_after_a_launch)
+    assert collect() == []
+    assert (state / "environments" / "fresh" / "payload").read_text(encoding="utf-8") == "new"
+    assert (state / "inputs" / ".project-root").is_file()
+    assert _debris(state, "orphans") == [] and not (state / "environments" / "gen").exists()
+
+    monkeypatch.setattr(install_states, "_remove_contents", real_remove)
+    assert collect() == [state]
+
+
 @pytest.mark.platforms("any")
 @pytest.mark.parametrize("kind", ["dependencies", "runtime"])
 def test_a_generation_left_set_aside_is_collected_without_its_marker(tmp_path, monkeypatch, kind):
@@ -512,7 +594,8 @@ def test_this_process_may_hold_only_the_files_it_names_open(tmp_path, monkeypatc
 
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize(("fd", "name", "ignored"), [("f9", ".install.lock", True), ("f9", "other", False),
-                                                    ("fcwd", "", False)])
+                                                    ("fcwd", "", False), ("fmem", ".install.lock", False),
+                                                    ("ftxt", ".install.lock", False)])
 def test_the_macos_listing_ignores_only_the_named_open_files(tmp_path, monkeypatch, fd, name, ignored):
     old = tmp_path / "old"
     old.mkdir()

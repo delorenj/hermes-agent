@@ -140,12 +140,16 @@ _KEPT_UNTIL_LAST = frozenset({"inputs", ".install.lock"})
 
 
 def _remove_contents(state: Path) -> bool:
-    """Remove everything but the record and the held lock; True when nothing else is left.
-    The record goes last, and only once everything else is gone: the startup prune runs on a
-    daemon thread and a removal can fail part-way (an open file on Windows, a read-only dir), and
-    a dir that lost its record first would never be recognised again."""
+    """Remove what was set aside (``.collecting-*``: this pass's, and any an earlier one left),
+    never what appeared in the state since: that was not looked at and may be in use. True when
+    nothing but the record and the held lock is left. The record goes last, and only once
+    everything else is gone: the startup prune runs on a daemon thread and a removal can fail
+    part-way (an open file on Windows, a read-only dir), and a dir that lost its record first
+    would never be recognised again."""
+    from hermes_cli.runtime_state_users import ASIDE_MARK
+
     for child in state.iterdir():
-        if child.name in _KEPT_UNTIL_LAST:
+        if child.name in _KEPT_UNTIL_LAST or not child.name.startswith(ASIDE_MARK):
             continue
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child, ignore_errors=True)
