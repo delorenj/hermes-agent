@@ -44,8 +44,9 @@ import time
 LOG = logging.getLogger(__name__)
 
 # The collectors ask while holding the install lock, which readers wait on for at most
-# INSTALL_LOCK_TIMEOUT_SECONDS before carrying on without it; a slower listing is no answer.
-PROBE_TIMEOUT_SECONDS = 15
+# INSTALL_LOCK_TIMEOUT_SECONDS (10) before carrying on without it. One probe, every listing and
+# every read of it together, gets this long: a slower one is no answer and everything is kept.
+PROBE_TIMEOUT_SECONDS = 8
 # The OS's own tools, by absolute path: a ``PATH`` entry can shadow them, and a launchd job's
 # ``PATH`` does not include ``/usr/sbin``. Neither is on Windows, where psutil answers instead.
 _LSOF = ("/usr/sbin/lsof", "/usr/bin/lsof")
@@ -301,7 +302,18 @@ def _without(blob: bytes, ignore: frozenset[bytes]) -> bytes:
     return b"\0".join(name for name in blob.split(b"\0") if name not in ignore) if ignore else blob
 
 
-def _until_settled(listing: Callable[[], list[Hashable] | None], read: Callable[[list[Hashable]], bool]) -> bool:
+class _Budget:
+    """The time one probe has left, shared by its listings, reads and the tools it runs."""
+
+    def __init__(self) -> None:
+        self._deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+
+    def left(self) -> float:
+        return self._deadline - time.monotonic()
+
+
+def _until_settled(listing: Callable[[_Budget], list[Hashable] | None],
+                   read: Callable[[list[Hashable], _Budget], bool]) -> bool:
     """List the process table, ``read`` everyone on it, then list it again and read whoever is new,
     until a listing names nobody new: True. A process that forks while it waits for its turn and
     leaves what it uses to the child before that turn comes is caught in the child, which the next
@@ -309,18 +321,19 @@ def _until_settled(listing: Callable[[], list[Hashable] | None], read: Callable[
 
     An entry stands for one process: a pid, or a pid with its start time where the listing shows it
     for free. False when a listing or a read fails, when nobody is listed at all, or when processes
-    are still starting after :data:`SCAN_ROUNDS` listings or :data:`PROBE_TIMEOUT_SECONDS` (the
-    collector holds the install lock meanwhile)."""
+    are still starting after :data:`SCAN_ROUNDS` listings, or when :data:`PROBE_TIMEOUT_SECONDS`
+    has run out by the time a listing is to be believed (the collector holds the install lock
+    meanwhile)."""
     seen: set[Hashable] = set()
-    deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+    budget = _Budget()
     for _ in range(SCAN_ROUNDS):
-        listed = listing()
-        if listed is None:
+        listed = listing(budget)
+        if not listed or budget.left() <= 0:  # no listing at all is no answer, a late one neither
             return False
         fresh = [entry for entry in listed if entry not in seen]
         if not fresh:
-            return bool(seen)  # an empty table is no listing
-        if time.monotonic() > deadline or not read(fresh):
+            return True
+        if not read(fresh, budget) or budget.left() <= 0:
             return False
         seen.update(fresh)
     LOG.warning("processes kept starting through %d listings of the process table", SCAN_ROUNDS)
@@ -338,7 +351,7 @@ def _proc_users(spellings: dict[bytes, list[Path]], *, ignore: frozenset[bytes] 
     users: dict[Path, str] = {}
     witnessed = False
 
-    def read(fresh: list[Hashable]) -> bool:
+    def read(fresh: list[Hashable], _budget: _Budget) -> bool:
         nonlocal witnessed
         for pid in fresh:
             for what, blob in _proc_views(pid):
@@ -354,7 +367,7 @@ def _proc_users(spellings: dict[bytes, list[Path]], *, ignore: frozenset[bytes] 
     return users if witnessed else None
 
 
-def _proc_table() -> list[Hashable] | None:
+def _proc_table(_budget: _Budget) -> list[Hashable] | None:
     """The pids ``/proc`` lists. Names only, so a listing takes a few milliseconds and a busy host
     settles: a pid comes round again only after the kernel has handed out every other one up to
     ``kernel.pid_max`` (4194304 on a 64-bit systemd host), far more than one scan sees born."""
@@ -420,23 +433,23 @@ def _listing_users(spellings: dict[bytes, list[Path]], *,
     users: dict[Path, str] = {}
     own = str(os.getpid())
 
-    def read(_fresh: list[Hashable]) -> bool:
-        files = _output([lsof, "-n", "-P", "-w", "-F", "pcfn"])
-        table = _output([ps, "-A", "-ww", "-E", "-o", "pid=", "-o", "command="])
+    def read(_fresh: list[Hashable], budget: _Budget) -> bool:
+        files = _output([lsof, "-n", "-P", "-w", "-F", "pcfn"], budget)
+        table = _output([ps, "-A", "-ww", "-E", "-o", "pid=", "-o", "command="], budget)
         if files is None or table is None:
             return False
         return _scan_lsof(files, spellings, users, own, ignore) and _scan_ps(table, spellings, users, own)
 
-    return users if _until_settled(lambda: _ps_table(ps), read) else None
+    return users if _until_settled(lambda budget: _ps_table(ps, budget), read) else None
 
 
-def _ps_table(ps: str) -> list[Hashable] | None:
+def _ps_table(ps: str, budget: _Budget) -> list[Hashable] | None:
     """Every process as ``(pid, start time)`` from ``ps``, less the ``ps`` that lists them."""
     try:
         with subprocess.Popen([ps, "-A", "-o", "pid=", "-o", "lstart="], stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
             try:
-                listing, _ = child.communicate(timeout=PROBE_TIMEOUT_SECONDS)
+                listing, _ = child.communicate(timeout=max(budget.left(), 0.001))
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.communicate()
@@ -453,10 +466,10 @@ def _ps_table(ps: str) -> list[Hashable] | None:
     return table
 
 
-def _output(argv: list[str]) -> bytes | None:
+def _output(argv: list[str], budget: _Budget) -> bytes | None:
     try:
         done = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL,
-                              timeout=PROBE_TIMEOUT_SECONDS, check=False)
+                              timeout=max(budget.left(), 0.001), check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     return done.stdout if done.returncode == 0 else None
@@ -519,17 +532,24 @@ def _psutil_users(spellings: dict[bytes, list[Path]], *, ignore: frozenset[bytes
     witnessed = False
     listed: dict[Hashable, object] = {}
 
-    def table() -> list[Hashable]:
+    def table(_budget: _Budget) -> list[Hashable] | None:
+        # A new Process per pid per listing: ``process_iter`` hands back the objects it cached,
+        # whose start time is the old one when the pid has since gone to a new process.
         listed.clear()
-        for process in psutil.process_iter():
+        try:
+            pids = psutil.pids()
+        except (psutil.Error, OSError):
+            return None
+        for pid in pids:
             try:
+                process = psutil.Process(pid)
                 started = process.create_time()
             except (psutil.Error, OSError):
-                started = None  # gone already: nothing left to read
-            listed[(str(process.pid), started)] = process
+                continue  # gone already: nothing left to read
+            listed[(str(pid), started)] = process
         return list(listed)
 
-    def read(fresh: list[Hashable]) -> bool:
+    def read(fresh: list[Hashable], _budget: _Budget) -> bool:
         nonlocal witnessed
         for entry in fresh:
             process = listed[entry]

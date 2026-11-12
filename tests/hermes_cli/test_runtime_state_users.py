@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
+import time
 
 import pytest
 
@@ -790,9 +792,9 @@ def test_a_proc_that_never_settles_is_no_answer(tmp_path, monkeypatch):
     old.mkdir()
     real, born = runtime_state_users._proc_table, []
 
-    def table():
+    def table(budget):
         born.append(str(4_000_000_000 + len(born)))  # a pid nothing has, new on every listing
-        return [*real(), *born]
+        return [*real(budget), *born]
 
     monkeypatch.setattr(runtime_state_users, "_proc_table", table)
     monkeypatch.setattr(runtime_state_users, "SCAN_ROUNDS", 4)
@@ -807,9 +809,92 @@ def test_the_psutil_listing_names_a_working_directory(tmp_path, monkeypatch):
     old.mkdir()
     with _running(old, "working directory") as child:
         # Only the two processes the test owns: walking the host's would stat paths under the real home.
-        monkeypatch.setattr(psutil, "process_iter", lambda: [psutil.Process(os.getpid()), psutil.Process(child.pid)])
+        monkeypatch.setattr(psutil, "pids", lambda: [os.getpid(), child.pid])
         users = runtime_state_users._psutil_users(runtime_state_users._spellings([old]))
     assert users is not None and f"pid {child.pid}" in users[old]
+
+
+@pytest.mark.platforms("any")
+def test_the_psutil_listing_reads_a_pid_that_went_to_a_new_process(tmp_path, monkeypatch):
+    """psutil's ``process_iter`` hands back the objects it cached, start time included, so a pid
+    reused by a new process looks like the old one. Each listing builds its Process objects anew."""
+    old = tmp_path / "old"
+    old.mkdir()
+    held = str(old / "held.bin")
+    listings = []
+
+    class Error(Exception):
+        pass
+
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+            self.round = len(listings)  # which process holds this pid when the object is made
+
+        def create_time(self):
+            return 1.0 if self.round <= 1 else 2.0
+
+        def cmdline(self):
+            return ["python"]
+
+        def open_files(self):
+            return [SimpleNamespace(path=held)] if self.pid == 7 and self.round >= 2 else []
+
+        def exe(self):
+            return "/bin/python"
+
+        def cwd(self):
+            return "/"
+
+        def memory_maps(self):
+            return []
+
+        def environ(self):
+            return {}
+
+    cached = {}
+
+    def pids():
+        listings.append(True)
+        return [os.getpid(), 7]
+
+    def process_iter():  # what the old listing used: objects kept from the first look
+        return [cached.setdefault(pid, Process(pid)) for pid in pids()]
+
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Error=Error, Process=Process, pids=pids,
+                                                               process_iter=process_iter))
+    users = runtime_state_users._psutil_users(runtime_state_users._spellings([old]))
+    assert users is not None and users[old] == "pid 7: open file"
+
+
+def test_a_listing_that_comes_back_empty_is_no_answer():
+    """The table was there a moment ago: an empty relisting is a view that vanished, not a settled one."""
+    lists, reads = [[1], []], []
+    assert runtime_state_users._until_settled(lambda _budget: lists.pop(0),
+                                              lambda fresh, _budget: reads.append(fresh) or True) is False
+    assert reads == [[1]]
+
+
+def test_a_probe_out_of_time_is_no_answer_even_when_the_table_settled(monkeypatch):
+    """A slow read that is followed by a quiet listing still ran past the time the install lock allows."""
+    monkeypatch.setattr(runtime_state_users, "PROBE_TIMEOUT_SECONDS", 0.05)
+    slow = lambda fresh, _budget: time.sleep(0.2) or True
+    assert runtime_state_users._until_settled(lambda _budget: [1], slow) is False
+    monkeypatch.setattr(runtime_state_users, "PROBE_TIMEOUT_SECONDS", 30)
+    assert runtime_state_users._until_settled(lambda _budget: [1], lambda fresh, _budget: True) is True
+
+
+@pytest.mark.platforms("posix")
+def test_the_tools_a_probe_runs_share_its_time(tmp_path, monkeypatch):
+    """One tool that outlasts what is left of the probe's time ends the probe: no answer, not a wait."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "slow").write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+    (bin_dir / "slow").chmod(0o755)
+    monkeypatch.setattr(runtime_state_users, "PROBE_TIMEOUT_SECONDS", 0.3)
+    started = time.monotonic()
+    assert runtime_state_users._output([str(bin_dir / "slow")], runtime_state_users._Budget()) is None
+    assert time.monotonic() - started < 3
 
 
 @pytest.mark.platforms("posix")
