@@ -458,6 +458,17 @@ def _reset_foreground_exit_fence():
 
 
 @pytest.fixture(autouse=True)
+def _patient_process_scan(monkeypatch):
+    """Let the generation collectors' process scan wait out a busy host.
+
+    A scan that keeps meeting new processes gives no answer and everything is kept; on a CI runner
+    with dozens of parallel workers that would fail tests that are not about giving up. The tests
+    that are set their own limit."""
+    monkeypatch.setattr("hermes_cli.runtime_state_users.SCAN_ROUNDS", 1000)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_kanban_memory_guard(request, monkeypatch):
     """Pin the kanban dispatcher's memory guard to "no data" for every test.
 

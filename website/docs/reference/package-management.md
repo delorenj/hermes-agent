@@ -134,8 +134,11 @@ makes is invisible, and a process whose only link is code already imported into
 memory shows nothing. Such uses are not protected. When the process table cannot be read, nothing is collected. Every
 scan lists the process table again after reading it and reads any process
 started meanwhile, until a listing names nobody new, so a child forked during
-the scan that took over its parent's open files or working directory is seen;
-a host still starting processes after 64 listings gets no verdict, and nothing
+the scan that took over its parent's open files or working directory is seen
+(a process is told apart by its pid and, where the system shows it, its start
+time; a pid handed to a new process within the second a scan takes is the one
+case on Linux that escapes). A scan that is not done within 8 seconds, or that
+still finds processes starting after 64 listings, gets no verdict, and nothing
 is collected. A
 generation that passes that check is not deleted on its word: it is
 first renamed out of the way (`<name>.collecting-<id>`, or inside an install
