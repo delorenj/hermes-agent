@@ -196,9 +196,11 @@ def collect_runtime_generations(root: Path) -> list[Path]:
     Staging happens under ``.prepare.lock``, so with it held an unpublished generation
     (no ``pm-runtime.json``) is an aborted stage. A superseded published generation goes
     once every worker launched from it has exited; generations published before leases
-    existed stay, as the application collector keeps its own.
+    existed stay, as the application collector keeps its own. A generation a live process still
+    runs from without a lease (see :func:`hermes_cli.runtime_state_users.unused`) stays as well.
     """
     from hermes_cli.runtime_state import collect_lease_dirs, leases_held
+    from hermes_cli.runtime_state_users import unused
 
     generations = root / "generations"
     removed: list[Path] = []
@@ -211,12 +213,15 @@ def collect_runtime_generations(root: Path) -> list[Path]:
             selected = json.loads((root / "selected.json").read_text(encoding="utf-8-sig")).get("generation", "")
         except FileNotFoundError:
             selected = ""
+        stale = []
         for generation in sorted(generations.iterdir()):
             if not generation.is_dir() or generation.is_symlink() or generation == root / selected:
                 continue
             published = (generation / "pm-runtime.json").is_file()
             if published and (not (generation / ".lease-managed").is_file() or leases_held(generation)):
                 continue
+            stale.append(generation)
+        for generation in unused(stale, kind="PM runtime generation"):
             shutil.rmtree(generation)
             removed.append(generation)
         collect_lease_dirs(root.parent / "leases" / "pm-runtime", generations)
