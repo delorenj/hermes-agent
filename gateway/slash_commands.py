@@ -849,7 +849,7 @@ class GatewaySlashCommandsMixin(
             return t("gateway.background.usage")
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
         self._track_background_task(self._run_background_task(
-            prompt, event.source, task_id, event_message_id=self._reply_anchor_for_event(event),
+            prompt, event.source, task_id, event_message_id=self._reply_anchor_for_event(event), reply_event=event,
             # Forward image/audio attachments so the background agent can see them.
             media_urls=list(event.media_urls or []), media_types=list(event.media_types or [])))
         return t("gateway.background.started", preview=_preview(prompt), task_id=task_id)

@@ -295,15 +295,19 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:
                 try:
+                    audio_metadata = _thread_meta
+                    if getattr(adapter, "_outbound_audio_spool", None) is not None:
+                        from plugins.platforms.telegram.outbound_audio_provenance import native_reply_metadata
+                        audio_metadata = native_reply_metadata(adapter, event, _thread_meta)
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
                         await adapter.send_voice(
-                            chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
+                            chat_id=chat_id, audio_path=media_path, metadata=audio_metadata, is_voice=is_voice,
                         )
                     elif ext in _VIDEO_EXTS:
                         await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=audio_metadata)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
@@ -313,6 +317,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         metadata: Optional[dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        reply_event: Optional[MessageEvent] = None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -378,7 +383,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         if not deliver_media:
             return True
         await self._deliver_media_from_response(
-            response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
+            response, reply_event or MessageEvent(text="", source=source, message_id=event_message_id, internal=True), adapter,
             thread_metadata=metadata,
         )
         return True

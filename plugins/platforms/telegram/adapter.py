@@ -183,6 +183,7 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
+from plugins.platforms.telegram.outbound_audio_spool import build_spool, capture_native_send
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
 from plugins.platforms.telegram.telegram_network import (
@@ -590,10 +591,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._seen_update_ids: dict = {}
         self._inflight_update_ids: dict = {}
         self._update_admission = None
-        # Completed update IDs survive adapter replacement and restarts (update_admission.py).
-        # Resolved now: secondary profiles construct adapters inside their own home scope.
+        # Profile-scoped receipts survive adapter replacement/restarts (update_admission.py).
         from hermes_constants import get_hermes_home
         self._update_receipt_dir = get_hermes_home()
+        self._outbound_audio_spool = build_spool(extra, self._update_receipt_dir)
         self._update_receipts_loaded: set = set()
         self._update_receipts_dirty: set = set()
         self._update_receipt_flush: Optional[asyncio.Task] = None
@@ -5146,17 +5147,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
         thread_kwargs = self._thread_kwargs_for_send(
             chat_id, self._metadata_thread_id(metadata), metadata, reply_to_message_id=reply_to_id, reply_to_mode=self._reply_to_mode)
-        return reply_to_id, {
-            "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id,
+        return reply_to_id, {"chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id,
             "read_timeout": _MEDIA_SEND_READ_TIMEOUT, **thread_kwargs, **self._notification_kwargs(metadata)}
 
     async def _send_media(
         self, send_fn: Any, chat_id: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]], media_label: str,
         reset_media: Optional[Any] = None, **media_kwargs: Any) -> Any:
-        """Send one native media payload with thread routing + DM-topic anchor retry."""
         reply_to_id, kwargs = self._media_send_kwargs(chat_id, reply_to, metadata)
-        return await self._send_with_dm_topic_reply_anchor_retry(
-            send_fn, {**kwargs, **media_kwargs}, metadata, reply_to_id, media_label, reset_media=reset_media)
+        return await capture_native_send(
+            getattr(self, "_outbound_audio_spool", None), self._bot, chat_id, metadata, media_label, media_kwargs,
+            lambda: self._send_with_dm_topic_reply_anchor_retry(
+                send_fn, {**kwargs, **media_kwargs}, metadata, reply_to_id, media_label, reset_media=reset_media))
 
     @staticmethod
     def _caption_1024(caption: Optional[str]) -> Optional[str]:
@@ -5207,8 +5208,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
-            # sendVoice only accepts Ogg/Opus: an explicit voice-bubble request (is_voice) transcodes via
-            # ffmpeg; otherwise route by extension (.mp3/.m4a → sendAudio, others → document).
+            # Explicit voice bubbles need Ogg/Opus; otherwise route audio by extension.
             if kwargs.get("is_voice") and os.path.splitext(audio_path)[1].lower() not in (".ogg", ".opus"):
                 from gateway.platforms.base import transcode_to_ogg_opus
                 _transcoded_voice_path = await asyncio.to_thread(transcode_to_ogg_opus, audio_path)

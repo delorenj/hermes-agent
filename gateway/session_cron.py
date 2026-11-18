@@ -155,7 +155,7 @@ CRON_SESSION_READ_ONLY_SURFACE = {'layer': 'gateway', 'code': 'cron_session_read
 # Run-side verdicts run_job stamps on the job dict for the firing scheduler's bookkeeping tail
 # (cron/quota_hold.py parks past a closed usage window; cron/unreachable_retry.py re-runs a
 # never-reached model). They cross the authority boundary inside the cron result.
-RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds')
+RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_outbound_audio_reply')
 
 
 async def operation(authority, name, params, actor=None):
@@ -294,6 +294,7 @@ async def execute(authority, ref, row, policy):
     execution_id = scheduler_execution_id(data['cron_job']['id'], row['request_id'])
     # The frozen snapshot predates the fire's ledger row; the run's progress stamps need its id.
     job = dict(data['cron_job'], execution_id=execution_id)
+    job.pop("_outbound_audio_reply", None)
     token = bind_execution(authority, ref.session_id, job['id'], execution_id)
     try:
         from cron.cancellation import CancelRequest, _CombinedCancelEvent
@@ -305,6 +306,10 @@ async def execute(authority, ref, row, policy):
             stop = _CombinedCancelEvent(CancelRequest(execution_id), cancel)
             result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
                                              extra_prompt=data['extra_prompt'], cancel_event=stop)
+            if result[0]:
+                from gateway.run import _load_gateway_config
+                from plugins.platforms.telegram.outbound_audio_provenance import stamp_cron_reply
+                stamp_cron_reply(job, result[2], execution_id, _load_gateway_config())
         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
         # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
         flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}

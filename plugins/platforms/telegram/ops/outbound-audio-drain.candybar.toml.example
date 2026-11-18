@@ -1,0 +1,12 @@
+[candybar]
+name = "outbound-audio-drain"
+description = "Private operator-DM outbound audio drain; requires separate opt-in"
+schedule = "* * * * *"
+timezone = "America/New_York"
+enabled = false
+
+[candybar.runner]
+kind = "exec"
+argv = ["/home/delorenj/.hermes/hermes-agent/plugins/platforms/telegram/ops/outbound-audio-drain-runner.sh", "holocene-pm"]
+workdir = "/home/delorenj/.hermes/hermes-agent"
+timeout_s = 50
