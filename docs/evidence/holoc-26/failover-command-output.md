@@ -36,10 +36,10 @@ Actual landing source: TelegramAdapter, TelegramFallbackTransport, all seven gat
 
 ## Recovery push and remote readback
 ```text
-remote: 
-remote: Create a pull request for 'feat/holoc-26-outbound-audio-candybar' on GitHub by visiting:        
-remote:      https://github.com/delorenj/hermes-agent/pull/new/feat/holoc-26-outbound-audio-candybar        
-remote: 
+remote:
+remote: Create a pull request for 'feat/holoc-26-outbound-audio-candybar' on GitHub by visiting:
+remote:      https://github.com/delorenj/hermes-agent/pull/new/feat/holoc-26-outbound-audio-candybar
+remote:
 To github.com:delorenj/hermes-agent.git
  * [new branch]            feat/holoc-26-outbound-audio-candybar -> feat/holoc-26-outbound-audio-candybar
 cfec39692c89a3d01f427eb7647851ae82092ad1	refs/heads/feat/holoc-26-outbound-audio-candybar
@@ -159,3 +159,41 @@ adapter=TelegramAdapter(PlatformConfig(extra={}))
 assert getattr(adapter,'_outbound_audio_spool',None) is None
 print('Actual landing source: TelegramAdapter, TelegramFallbackTransport, all seven gateway modules imported; disabled adapter constructed; no bot/network call.')
 ```
+
+## Required pull before first main push
+```text
+From github.com:delorenj/hermes-agent
+ * branch                  main       -> FETCH_HEAD
+Already up to date.
+```
+
+## Successful main push
+```text
+To github.com:delorenj/hermes-agent.git
+   2335d9ef25..7e679d3fc7  HEAD -> main
+```
+
+## Exact main remote readback
+```text
+7e679d3fc7101a0092f5839edc4be1276347ead9	refs/heads/main
+```
+
+## Owned status and branch/upstream divergence
+```text
+!! .pytest-cache/
+!! .pytest_cache/
+feat/holoc-26-current-main-20261118 f6c27c4afddc25e1d2196cafea33de8b94c21fdc upstream=delorenj/feat/holoc-26-current-main-20261118
+feat/holoc-26-outbound-audio-candybar cfec39692c89a3d01f427eb7647851ae82092ad1 upstream=delorenj/feat/holoc-26-outbound-audio-candybar
+land/holoc26-failover-20261118-161128 7e679d3fc7101a0092f5839edc4be1276347ead9 upstream=delorenj/main
+main 91b809b72cfbe781996e94935124e1bdf6e7f98b upstream=delorenj/main [behind 14]
+landing HEAD vs delorenj/main (left=HEAD-only,right=remote-only): 0	0
+origin/main absent locally; upstream NousResearch not fetched or changed
+live cached HEAD vs origin/main (left=live-only,right=upstream-only): 26	7402
+```
+
+## Host scanner (exit 1)
+```text
+No matching HOLOC-26 entries.
+328 repo(s) hold work that exists only on this disk.
+```
+Ignored caches in prior status were owned run artifacts, subsequently moved to profile scratch as disclosed.
