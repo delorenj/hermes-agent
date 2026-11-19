@@ -41,6 +41,32 @@ skills/
 └── ...
 ```
 
+## Discovery limits
+
+Skill indexes and prompt snapshot manifests share `agent.skill_walk`: external directory
+symlinks are followed, but a `(device, inode)` directory is scanned only once per root.
+The shallowest then lexically first alias wins, and returned paths are sorted. Existing
+excluded directories and support directories directly inside a skill remain pruned.
+
+Each root scan has finite defaults: 4,096 physical directories, 65,536 directory
+entries (files **and** directories, including excluded names), 8,192 matching files,
+8 MiB of cumulative encoded paths retained for traversal/results, and depth 64
+(root is depth zero). The manifest tracks both SKILL.md and DESCRIPTION.md,
+so its result/path-byte ceilings double to 16,384 files/16 MiB; directory,
+entry and depth budgets remain identical. Entries are consumed incrementally
+with `scandir`, not materialized by `os.walk`. Counts and path budgets are
+checked before retention;
+path bytes are cumulative, not reclaimed, so pending traversal cannot grow without
+bound. A directory past depth 64 is skipped; any other exhausted budget stops that
+root and returns only the sorted matches collected so far. A limit warning names
+the affected path, budget and maximum. Repeated physical directories (cycles or
+aliases) and unreadable directories are also warned with their path and reason.
+These limits bound traversal/result bookkeeping, not skill body size or the latency
+of a single filesystem operation. Reduce oversized catalogs rather than relying on
+which partial entries happen to fit a limit (entry order within a directory is
+filesystem-defined). Gateway discovery must remain off the owner event loop; bounds
+are not a substitute for its context-preserving executor hop.
+
 ## SKILL.md Format
 
 ```markdown

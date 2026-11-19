@@ -876,15 +876,10 @@ def is_skill_description_truncated_for_prompt(frontmatter: dict[str, Any]) -> bo
 
 
 def iter_skill_index_files(skills_dir: Path, filename: str):
-    """Walk skills_dir yielding sorted paths matching *filename*; prunes
-    EXCLUDED_SKILL_DIRS and support dirs of skill roots."""
-    matches: list[str] = []
-    for root, dirs, files in os.walk(str(skills_dir), followlinks=True):
-        has_skill_md = "SKILL.md" in files
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
-        if filename in files:
-            matches.append(os.path.join(root, filename))
-    yield from map(Path, sorted(matches))
+    """Sorted, cycle-safe, bounded skill discovery (including external symlinks)."""
+    from agent.skill_walk import scan_skill_files
+
+    yield from scan_skill_files(skills_dir, (filename,))
 
 
 # Namespace helpers for plugin-provided skills.

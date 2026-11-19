@@ -51,27 +51,12 @@ def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
     (``iter_skill_index_files``: no excluded dirs, no support dirs of a skill), depth-bounded. The child
     names, not only mtimes: an install and an uninstall inside one coarse mtime tick (1-2 s on some
     filesystems) leave every mtime equal, and the change must still show. ~1 ms for 170 dirs."""
-    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
-    try:
-        mtime = os.stat(root).st_mtime_ns
-        with os.scandir(root) as it:
-            entries = list(it)
-    except OSError:
-        return
-    names, is_skill = [], False
-    for entry in entries:
-        with suppress(OSError):
-            if entry.is_dir():
-                names.append(entry.name)
-            elif entry.name == "SKILL.md":
-                is_skill = True
-    names.sort()
-    sig.append((str(root), mtime, tuple(names)))
-    if depth <= 0:
-        return
-    for name in names:
-        if name not in EXCLUDED_SKILL_DIRS and not (is_skill and name in SKILL_SUPPORT_DIRS):
-            _dir_tree_signature(os.path.join(root, name), sig, depth - 1)
+    from dataclasses import replace
+    from agent.skill_walk import DEFAULT_LIMITS, walk_skill_directories
+
+    for path, children, _files, stat in walk_skill_directories(
+            Path(root), (), limits=replace(DEFAULT_LIMITS, depth=depth)):
+        sig.append((str(path), stat.st_mtime_ns, tuple(sorted(child.name for child in children))))
 
 
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
