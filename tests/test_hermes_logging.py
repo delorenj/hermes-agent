@@ -1223,3 +1223,55 @@ def test_strict_url_pass_covers_absolute_urls_on_every_log_line():
     for name in ("aiohttp.access", "gateway.run"):
         formatted = fmt.format(logging.LogRecord(name, logging.INFO, __file__, 1, line, None, None))
         assert formatted == "open https://example.com/magic?token=*** to continue", name
+
+
+def test_profile_with_symlinked_logs_dir_gets_one_writer_per_log_file(hermes_home, tmp_path):
+    """A profile whose ``logs/`` is a symlink elsewhere (runtime dir outside the home) must not
+    grow a new router, and a new fd per log file, on every ``setup_logging`` call.
+
+    The owning home is the one handed to setup_logging, never ``resolve().parent.parent`` of the
+    symlink target; the latter never matched the router's profile homes, so each call stacked a
+    router over every home (28 copies of each record in the gateway)."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    target = tmp_path / "runtime" / "logs"
+    target.mkdir(parents=True)
+    linked_home = tmp_path / "profiles" / "linked"
+    linked_home.mkdir(parents=True)
+    (linked_home / "logs").symlink_to(target, target_is_directory=True)
+    plain_home = tmp_path / "profiles" / "plain"
+    plain_home.mkdir()
+
+    hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+    for _ in range(6):
+        hermes_logging.setup_logging(hermes_home=linked_home, mode="gateway")
+        hermes_logging.setup_logging(hermes_home=plain_home, mode="gateway")
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+
+    routers = [h for h in hermes_logging._queued_file_handlers if isinstance(h, hermes_logging._ProfileRoutingFileHandler)]
+    names = [r._filename for r in routers]
+    assert sorted(names) == sorted(set(names)), f"duplicate routers: {names}"
+    for router in routers:
+        assert linked_home.resolve() in router._profile_homes
+        assert plain_home.resolve() in router._profile_homes
+
+    logger = logging.getLogger("agent.conversation_loop.symlinked-logs-test")
+    for home, text in ((linked_home, "linked-turn"), (plain_home, "plain-turn"), (hermes_home, "default-turn")):
+        token = set_hermes_home_override(str(home))
+        try:
+            logger.info(text)
+        finally:
+            reset_hermes_home_override(token)
+    hermes_logging.flush_log_queue()
+
+    assert (target / "agent.log").read_text().count("linked-turn") == 1
+    assert "plain-turn" not in (target / "agent.log").read_text()
+    assert (plain_home / "logs" / "agent.log").read_text().count("plain-turn") == 1
+    assert (hermes_home / "logs" / "agent.log").read_text().count("default-turn") == 1
+
+    open_logs = [
+        os.readlink(f"/proc/self/fd/{fd}") for fd in os.listdir("/proc/self/fd")
+        if os.path.islink(f"/proc/self/fd/{fd}")
+    ]
+    mine = [p for p in open_logs if p == str(target / "agent.log")]
+    assert len(mine) == 1, f"agent.log in the symlinked dir is open {len(mine)} times"
