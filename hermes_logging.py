@@ -326,6 +326,10 @@ def _known_log_homes() -> set[Path]:
             homes.add(handler._default_home)
             homes.update(handler._profile_homes)
         elif isinstance(handler, RotatingFileHandler):
+            owner = getattr(handler, "_hermes_owner_home", None)
+            if owner is not None:
+                homes.add(owner)
+                continue
             try:
                 homes.add(Path(handler.baseFilename).resolve().parent.parent)
             except (TypeError, ValueError, OSError):
@@ -403,7 +407,7 @@ def setup_logging(
         if component is not None and mode != component:
             continue
         _add_rotating_handler(
-            log_dir / filename, level=lvl, max_bytes=size, backup_count=count,
+            log_dir / filename, owner_home=home, level=lvl, max_bytes=size, backup_count=count,
             formatter=RedactingFormatter(_LOG_FORMAT),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES[component]) if component else None,
         )
@@ -644,13 +648,24 @@ class _ProfileRoutingFileHandler(logging.Handler):
     or dashboard event loop. Per-home handlers keep rotation, redaction and managed perms.
     """
 
-    def __init__(self, existing: RotatingFileHandler, profile_homes: Sequence[Path]) -> None:
-        """Take over *existing*'s path, level, rotation, formatter and filters."""
+    def __init__(
+        self,
+        existing: RotatingFileHandler,
+        profile_homes: Sequence[Path],
+        default_home: Optional[Path] = None,
+    ) -> None:
+        """Take over *existing*'s path, level, rotation, formatter and filters.
+
+        The owning home is *default_home*, else the one ``_add_rotating_handler`` stamped on
+        *existing*. It is never derived from the resolved log path: a profile's ``logs/`` can be a
+        symlink to a directory elsewhere, and ``resolved.parent.parent`` is then not the profile home.
+        """
         super().__init__(level=existing.level)
         resolved = Path(existing.baseFilename).resolve()
         self.baseFilename = str(resolved)
         self._hermes_routed_log_path = resolved
-        self._default_home = resolved.parent.parent.resolve()
+        owner = default_home or getattr(existing, "_hermes_owner_home", None)
+        self._default_home = Path(owner).expanduser().resolve() if owner else resolved.parent.parent.resolve()
         self._profile_homes = {Path(home).expanduser().resolve() for home in profile_homes}
         self._filename = resolved.name
         self._max_bytes = getattr(existing, "maxBytes", 0)
@@ -989,9 +1004,16 @@ def _add_rotating_handler(
     backup_count: int,
     formatter: logging.Formatter,
     log_filter: Optional[logging.Filter] = None,
+    owner_home: Optional[Path] = None,
 ) -> None:
-    """Register a queued ``RotatingFileHandler`` for *path*; idempotent per resolved path."""
+    """Register a queued ``RotatingFileHandler`` for *path*; idempotent per resolved path.
+
+    *owner_home* is the Hermes home that owns *path*. It is resolved on its own, never from
+    ``path.resolve()``: a profile's ``logs/`` may be a symlink to a directory outside the home.
+    """
     resolved = path.resolve()
+    # ``path.parent.parent`` is the (unresolved) home; resolving it does not follow ``logs/``.
+    owner = Path(owner_home if owner_home is not None else path.parent.parent).expanduser().resolve()
     for existing in _queued_file_handlers:
         # Already attached directly, or already covered by the profile router — for its default
         # home or any profile home it routes (a bare handler beside it would take every record).
@@ -1000,24 +1022,33 @@ def _add_rotating_handler(
             and Path(getattr(existing, "baseFilename", "")).resolve() == resolved
         ):
             return
-        if isinstance(existing, _ProfileRoutingFileHandler) and existing._filename == resolved.name and (
-            resolved.parent.parent == existing._default_home or resolved.parent.parent in existing._profile_homes
-        ):
+        if isinstance(existing, _ProfileRoutingFileHandler) and existing._filename == resolved.name:
+            # One router serves one log filename for every home. A home it does not route yet is
+            # added to it, never given a second router (each router opens its own fd per home).
+            if owner != existing._default_home and owner not in existing._profile_homes:
+                try:
+                    from agent.redact import resolve_profile_policy
+                    resolve_profile_policy(owner)
+                except Exception:
+                    pass
+                with existing._profile_handlers_lock:
+                    existing._profile_homes = existing._profile_homes.union({owner})
             return
     handler = _new_file_handler(
         path, level=level, max_bytes=max_bytes, backup_count=backup_count, formatter=formatter,
     )
+    handler._hermes_owner_home = owner  # type: ignore[attr-defined]
     if log_filter is not None:
         handler.addFilter(log_filter)
     # Routing already on (a second home adopted earlier): a component log added now —
     # ``mode="gateway"`` after the fact — must route too, or it takes every home's records.
     routers = [h for h in _queued_file_handlers if isinstance(h, _ProfileRoutingFileHandler)]
     if routers:
-        homes: set[Path] = set()
+        homes: set[Path] = {owner}
         for router in routers:
             homes.add(router._default_home)
             homes.update(router._profile_homes)
-        routed = _ProfileRoutingFileHandler(handler, sorted(homes))
+        routed = _ProfileRoutingFileHandler(handler, sorted(homes), default_home=owner)
         _quietly(handler.close)
         handler = routed
     # Queue, not ``addHandler``: the rotation-lock wait never runs on the caller's thread.
