@@ -1851,7 +1851,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
     branch = _m()._resolve_update_branch(args)
     completion_request["branch"] = branch
     # Fork tweak #25: a branch bound to the fork never follows an upstream release or channel.
-    fork_custody = None if use_zip_update else _custody.detect(git_cmd, branch, _git_run)
+    fork_custody = None
+    if not use_zip_update:
+        try:
+            fork_custody = _custody.detect(git_cmd, branch, _git_run)
+        except (subprocess.SubprocessError, OSError):
+            pass  # git itself is failing: the fetch below reports it through the usual handler
     if fork_custody is not None:
         _custody.announce(fork_custody)
         target_ref, release_sha, target_is_head, target_repository = fork_custody.ref, None, False, None
