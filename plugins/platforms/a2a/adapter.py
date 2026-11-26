@@ -310,6 +310,10 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 class A2AAdapter(BasePlatformAdapter):
     """Inbound A2A server adapter."""
 
+    # The caller is another agent and send() drops every non-final message, so an approval prompt
+    # posted here reaches nobody: the gateway sends it to the profile's human home channel instead.
+    answers_approvals = False
+
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("a2a"))
         extra = getattr(config, "extra", {}) or {}

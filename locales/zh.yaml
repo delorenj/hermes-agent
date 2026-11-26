@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "智能拒绝：所有者覆盖仅对本次操作生效。"
     smart_deny_heading: "⚠️ **智能拒绝——所有者对单次操作的覆盖：**"
     timed_out_notice: "⌛ 审批已超时（{window}）——命令未运行。如仍需要，请让我再试一次，或提高 config.yaml 中的 approvals.timeout。"
+    rerouted_reason: "{reason}（来自 {profile} 的 {platform} 回合：该频道无人查看，因此转到这里）"
+    rerouted_timed_out_notice: "⌛ 审批在 {window} 后超时 — 命令未执行，已通知 {profile} 的回合。如需更多时间，请在 config.yaml 中调高 approvals.rerouted_timeout。"
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "允许一次"
     action_session: "本会话允许"

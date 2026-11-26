@@ -104,11 +104,20 @@ class TestHumanWaitTracker:
         """A window that overstays approvals.timeout is itself wedged and must
         stop extending the exclusion (belt-and-braces for #79719)."""
         monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 300)
+        monkeypatch.setattr(approval_context, "_get_rerouted_approval_timeout", lambda: 300)
         with approval_human_wait.human_wait_window(SESSION):
             state = approval_human_wait._human_wait_states[SESSION]
             # Simulate a window that has been open for a full day.
             state.window_started = time.monotonic() - 86_400.0
             assert approval_human_wait.human_wait_seconds(SESSION) <= 300.0 + 60.0
+
+    def test_ceiling_covers_a_rerouted_prompt_wait(self, monkeypatch):
+        """A prompt rerouted to a human home channel waits approvals.rerouted_timeout, so the ceiling
+        (and the authorization gate's lock bound) must outlast it or the gate lets a second tool
+        batch in while the first is still legitimately parked on a person."""
+        monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 60)
+        monkeypatch.setattr(approval_context, "_get_rerouted_approval_timeout", lambda: 1800)
+        assert approval_human_wait.human_wait_ceiling() == 1800.0 + approval_human_wait.HUMAN_WAIT_MARGIN_S
 
     def test_eviction_keeps_pending_sessions(self):
         with approval_human_wait.human_wait_window(SESSION):
@@ -128,6 +137,7 @@ class TestHumanWaitTracker:
         """A wedged window that eventually CLOSES must not retroactively inject
         its full overstay into completed_seconds (close-side clamp)."""
         monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 300)
+        monkeypatch.setattr(approval_context, "_get_rerouted_approval_timeout", lambda: 300)
         with approval_human_wait.human_wait_window(SESSION):
             state = approval_human_wait._human_wait_states[SESSION]
             # Simulate the window having been open for a full day before close.

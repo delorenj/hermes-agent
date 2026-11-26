@@ -1624,6 +1624,10 @@ DEFAULT_CONFIG = {
         # mirrors cron_mode deny) approve — auto-approve all dangerous commands on unattended platforms
         "mode": "smart",
         "timeout": 300,
+        # A prompt raised in a chat nobody reads (a Bloodbank command turn, an A2A peer) goes to the
+        # profile's human home channel instead, and waits this long: that person was not watching the
+        # turn. Never shorter than ``timeout``. See gateway/approval_reroute.py.
+        "rerouted_timeout": 1800,
         "discord_prompt_timeout": 300,  # Discord buttons stay clickable (min 30 s, cap MAX_SAFE_TIMEOUT_S)
         "cron_mode": "deny",
         "single_query_mode": "deny",

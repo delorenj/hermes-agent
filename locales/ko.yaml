@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "스마트 거부: 소유자 재정의는 이 작업 한 번에만 적용돼요."
     smart_deny_heading: "⚠️ **스마트 거부 — 한 번의 작업에 대한 소유자 재정의:**"
     timed_out_notice: "⌛ {window} 후 승인 시간이 초과되어 명령이 실행되지 않았어요. 여전히 원하시면 다시 요청하시거나, config.yaml의 approvals.timeout을 늘려 주세요."
+    rerouted_reason: "{reason} ({profile}의 {platform} 턴에서 요청됨: 그 채널은 아무도 읽지 않아 여기로 전달되었습니다)"
+    rerouted_timed_out_notice: "⌛ {window} 후 승인 시간이 초과되었습니다 — 명령은 실행되지 않았고 {profile}의 턴에 알렸습니다. 시간을 늘리려면 config.yaml의 approvals.rerouted_timeout을 높이세요."
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "한 번 허용"
     action_session: "세션 동안 허용"

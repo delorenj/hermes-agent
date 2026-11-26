@@ -60,6 +60,32 @@ def _identity_digest(text) -> str:
     return hashlib.sha256(str(text).encode("utf-8", "surrogatepass")).hexdigest()
 
 
+class ApprovalUndeliverable(RuntimeError):
+    """Raised by a notifier that knows no human can see the prompt, with a reason the agent may read.
+
+    A plain notifier failure is reported to the agent as a bare "failed to send"; this one's message is
+    appended to the BLOCKED result (``notify_error``) so the turn says WHY nobody was asked (e.g. a
+    Bloodbank turn whose profile has no human home channel), instead of a silent timeout."""
+
+
+def _notifier_timeout(notify_cb) -> int:
+    """The wait window for a prompt *notify_cb* delivers: the notifier's own ``wait_timeout_s()`` when it
+    declares one (a prompt rerouted to a human home channel waits ``approvals.rerouted_timeout``), else
+    ``approvals.timeout``. A lease's bound ``notify`` declares it through the lease."""
+    hook = getattr(notify_cb, "wait_timeout_s", None)
+    if not callable(hook):
+        hook = getattr(getattr(notify_cb, "__self__", None), "wait_timeout_s", None)
+    if callable(hook):
+        try:
+            declared = hook()
+        except Exception:
+            logger.debug("approval notifier wait_timeout_s failed; using approvals.timeout", exc_info=True)
+        else:
+            if declared is not None:
+                return int(declared)
+    return _ctx._get_approval_timeout()
+
+
 def _same_answerers(leader: dict, follower: dict) -> bool:
     """A follower adopts its leader's answer only when the same people may give it: the default
     (``approvers: ["*"]``, anyone admitted) or the same requester. Otherwise another requester's
@@ -167,7 +193,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     out. Shared by the terminal command guard, the execute_code guard, the plugin
     escalation gate, and MCP elicitation. Returns ``{"resolved", "choice",
     "reason"}`` or ``{"resolved": False, "choice": None, "notify_failed": True}``
-    when the notify callback raised. Persisting the choice and building the
+    when the notify callback raised (plus ``notify_error``, the agent-readable reason, when it raised
+    :class:`ApprovalUndeliverable`). Persisting the choice and building the
     tool-facing result stay with the caller.
 
     Identical concurrent approvals (same *identity* — the executed command, defaulting to the
@@ -198,7 +225,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     entry.owner = owner
     # Captured before the entry is published: a coalesced follower can find it while the pre-request
     # hooks still run, and must wait this same timeout rather than re-read a since-edited config.
-    timeout_s = entry.data["timeout_s"] = _ctx._get_approval_timeout()
+    timeout_s = entry.data["timeout_s"] = _notifier_timeout(notify_cb)
 
     def _enqueue() -> None:
         register_prepared_approval(session_key, entry)
@@ -281,7 +308,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             _drop_entry("notify_failed")
             _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
             human.outcome = "notify_failed"
-            return {"resolved": False, "choice": None, "notify_failed": True}
+            failed = {"resolved": False, "choice": None, "notify_failed": True}
+            if isinstance(exc, ApprovalUndeliverable):
+                failed["notify_error"] = str(exc)
+            return failed
 
         state = _poll_event(entry.event, session_key, timeout_s=timeout_s,
                             interrupt_log="Approval wait interrupted — returning deny for session %s")

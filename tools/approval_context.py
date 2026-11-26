@@ -345,6 +345,26 @@ def _get_approval_timeout() -> int:
     return min(raw, safe_cap)
 
 
+# A prompt rerouted from a channel nobody reads (a Bloodbank command turn, an A2A peer) to the profile's
+# human home channel reaches someone who was not watching the turn: give them time to see the push.
+REROUTED_APPROVAL_TIMEOUT_DEFAULT = 1800
+
+
+def _get_rerouted_approval_timeout() -> int:
+    """Read ``approvals.rerouted_timeout``: how long a prompt rerouted to a human home channel waits
+    (default 1800s). Never shorter than ``approvals.timeout``, and clamped like it."""
+    try:
+        raw = int(_get_approval_config().get("rerouted_timeout", REROUTED_APPROVAL_TIMEOUT_DEFAULT))
+    except (ValueError, TypeError):
+        raw = REROUTED_APPROVAL_TIMEOUT_DEFAULT
+    try:
+        from agent.deadline import MAX_SAFE_TIMEOUT_S
+        safe_cap = int(MAX_SAFE_TIMEOUT_S)
+    except Exception:
+        safe_cap = REROUTED_APPROVAL_TIMEOUT_DEFAULT
+    return max(min(raw, safe_cap), _get_approval_timeout())
+
+
 def format_approval_window(seconds: int) -> str:
     """The ONE human wording for an approval timeout window, shared by the CLI timeout notice,
     the tool result's ``user_summary`` and the gateway card copy so every surface agrees:

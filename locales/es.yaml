@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "DENEGACIÓN inteligente: la anulación del propietario aplica solo a esta operación."
     smart_deny_heading: "⚠️ **DENEGACIÓN inteligente — anulación del propietario para una sola operación:**"
     timed_out_notice: "⌛ La aprobación expiró tras {window} — el comando NO se ejecutó. Pídeme que lo intente de nuevo si aún lo quieres, o aumenta approvals.timeout en config.yaml."
+    rerouted_reason: "{reason} (del turno de {platform} de {profile}: nadie lee ese canal, así que llegó aquí)"
+    rerouted_timed_out_notice: "⌛ La aprobación expiró tras {window}: el comando NO se ejecutó y se avisó al turno de {profile}. Sube approvals.rerouted_timeout en config.yaml para tener más tiempo."
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "Permitir una vez"
     action_session: "Permitir en la sesión"

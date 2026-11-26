@@ -1817,6 +1817,11 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     # answer, and an acknowledgement would silently abandon the task (#57056). Read generically via
     # ``getattr(adapter, "interactive_resume", True)`` — no per-platform branching at the call site.
     interactive_resume: bool = True
+    # A human reads this adapter's chats and can answer an approval prompt posted there. False for
+    # machine lanes (Bloodbank command turns, A2A peers): their send() delivers nowhere a person looks,
+    # so a prompt raised by one of their turns goes to the profile's human home channel instead
+    # (gateway/approval_reroute.py), and fails loudly when there is none. Read on the CLASS.
+    answers_approvals: bool = True
     # Port-binding adapter that answers ``/p/<profile>/...`` for every served profile on the default
     # listener under ``gateway.multiplex_profiles``. Declared per adapter (not in a central list) so
     # ``hermes gateway migrate`` can tell "URL changes" from "this profile would be skipped" as new

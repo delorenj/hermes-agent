@@ -726,6 +726,8 @@ gateway:
     smart_deny_line: "Smart DENY : la dérogation du propriétaire ne s'applique qu'à cette seule opération."
     smart_deny_heading: "⚠️ **Smart DENY — dérogation du propriétaire pour une seule opération :**"
     timed_out_notice: "⌛ Approbation expirée après {window} — la commande n'a PAS été exécutée. Demandez-moi de réessayer si vous la voulez toujours, ou augmentez approvals.timeout dans config.yaml."
+    rerouted_reason: "{reason} (depuis le tour {platform} de {profile} : personne ne lit ce canal, il arrive donc ici)"
+    rerouted_timed_out_notice: "⌛ Approbation expirée après {window} — la commande n'a PAS été exécutée et le tour de {profile} a été prévenu. Augmentez approvals.rerouted_timeout dans config.yaml pour plus de temps."
     timed_out_card_body: |-
       {notice}
       ```

@@ -18,13 +18,14 @@ from typing import Any, Callable, Optional
 from agent.i18n import t
 from gateway.platforms.base import fit_prefix
 from gateway.platforms.base_exec_approval import (
-    approval_timeout_seconds, ea_default_reason_text, ea_reason_label_text, format_approval_timed_out_notice)
+    approval_timeout_seconds, ea_default_reason_text, ea_reason_label_text, format_approval_timed_out_notice,
+    format_rerouted_timed_out_notice)
 
 logger = logging.getLogger(__name__)
 
 
 def register_timeout_notice(
-    runner, approval_data: dict, *, command: str, card_message_id: Optional[str]) -> None:
+    runner, approval_data: dict, *, command: str, card_message_id: Optional[str], rerouted: Any = None) -> None:
     """Arm a settle hook that posts the timed-out notice for ``approval_data['request_id']``.
 
     ``runner`` is the ``TurnRunner`` (for ``_ctx`` and ``_schedule``); ``card_message_id`` is the
@@ -33,6 +34,10 @@ def register_timeout_notice(
     drop and rewriting it would erase the record of what was asked. ``command`` is the
     already-redacted command shown to the user. The notice is skipped when the run is no longer
     current (``ctx._run_still_current``).
+
+    ``rerouted`` is the ``gateway.approval_reroute.HumanApprovalTarget`` the prompt was sent to when
+    its origin chat has no human reader: the notice then goes to that home chat (always: it does not
+    belong to the origin run) and names the ``approvals.rerouted_timeout`` key.
     """
     from tools.approval import register_gateway_settle
 
@@ -51,31 +56,37 @@ def register_timeout_notice(
         # Same guard as every other late notice in TurnRunner: after /stop, /new or a restart the
         # turn is over and this chat belongs to a newer run — do not edit or post into it.
         still_current = getattr(runner._ctx, "_run_still_current", None)
-        if callable(still_current) and not still_current():
+        if rerouted is None and callable(still_current) and not still_current():
             return
         runner._schedule(
-            _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s, flagged),
+            _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s, flagged, rerouted=rerouted),
             "Approval timeout notice scheduling error")
 
     register_gateway_settle(session_key, request_id, settle)
 
 
 async def _post_timeout_notice(
-        ctx, command: str, card_message_id: Optional[str], timeout_s: int, reason: str = "") -> None:
+        ctx, command: str, card_message_id: Optional[str], timeout_s: int, reason: str = "",
+        rerouted: Any = None) -> None:
     from gateway.run import _interim_metadata
 
     from gateway.bot_peer_notices import automatic_notices_allowed
 
-    adapter = ctx._status_adapter
-    if not automatic_notices_allowed(getattr(ctx, "source", None)):
-        return
-    notice = format_approval_timed_out_notice(timeout_s)
-    metadata = _interim_metadata(ctx._status_thread_metadata)
+    if rerouted is not None:
+        # A human home chat: the bot-peer guard is about the origin chat, which never sees this.
+        adapter, chat_id, thread_metadata = rerouted.adapter, rerouted.chat_id, rerouted.metadata
+        notice = format_rerouted_timed_out_notice(timeout_s, rerouted.origin_profile)
+    else:
+        if not automatic_notices_allowed(getattr(ctx, "source", None)):
+            return
+        adapter, chat_id, thread_metadata = ctx._status_adapter, ctx._status_chat_id, ctx._status_thread_metadata
+        notice = format_approval_timed_out_notice(timeout_s)
+    metadata = _interim_metadata(thread_metadata)
     try:
         # Plain markdown, not the card's platform markup: ``edit_message`` re-formats it itself.
-        if card_message_id and await _edit_card(adapter, ctx._status_chat_id, card_message_id, notice, command, reason):
+        if card_message_id and await _edit_card(adapter, chat_id, card_message_id, notice, command, reason):
             return
-        await adapter.send(ctx._status_chat_id, notice, metadata=metadata)
+        await adapter.send(chat_id, notice, metadata=metadata)
     except Exception:
         logger.debug("Approval timeout notice failed", exc_info=True)
 

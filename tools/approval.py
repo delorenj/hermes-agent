@@ -1105,8 +1105,12 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 data["smart_denied"] = True
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway", identity=command)
             if decision.get("notify_failed"):
-                return _denied(spec.notify_failed, pattern_key=pattern_key,
-                               description=description, outcome="notify_failed", noun=spec.noun)
+                # A notifier that knows why nobody can be asked says so; the turn reports it instead of
+                # a bare "failed to send" (e.g. a Bloodbank turn whose profile has no human home channel).
+                why = decision.get("notify_error")
+                return _denied(f"{spec.notify_failed} Why: {why}" if why else spec.notify_failed,
+                               pattern_key=pattern_key, description=description, outcome="notify_failed",
+                               noun=spec.noun)
             # Consent contract: silence is NOT consent, and an explicit deny is a hard
             # halt — both produce a BLOCKED outcome. ``/deny <reason>`` free text is
             # relayed verbatim so the agent can adapt rather than only hearing "denied".

@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "Умный DENY: переопределение владельца действует только на эту одну операцию."
     smart_deny_heading: "⚠️ **Умный DENY — переопределение владельца на одну операцию:**"
     timed_out_notice: "⌛ Время на одобрение истекло через {window} — команда НЕ выполнена. Попросите меня повторить, если она всё ещё нужна, или увеличьте approvals.timeout в config.yaml."
+    rerouted_reason: "{reason} (из хода {platform} профиля {profile}: этот канал никто не читает, поэтому запрос пришёл сюда)"
+    rerouted_timed_out_notice: "⌛ Время на подтверждение истекло через {window} — команда НЕ выполнена, ход {profile} уведомлён. Чтобы получить больше времени, увеличьте approvals.rerouted_timeout в config.yaml."
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "Разрешить один раз"
     action_session: "Разрешить на сеанс"

@@ -46,6 +46,15 @@ class NotifyLease:
             raise RuntimeError("Approval notification unavailable: background task ended or transport missing")
         target(data)
 
+    def wait_timeout_s(self):
+        """The wait window the lease's transport declares (``wait_timeout_s`` on the notifier: a prompt
+        rerouted to a human home channel waits ``approvals.rerouted_timeout``), else ``None``."""
+        from tools import approval
+        with approval._lock:
+            target = self._target_locked()
+        hook = getattr(target, "wait_timeout_s", None)
+        return hook() if callable(hook) else None
+
     def release(self):
         from tools import approval
         with approval._lock:

@@ -44,10 +44,15 @@ def human_wait_ceiling() -> float:
     acquire in agent/tool_executor.py, so the two cannot drift. Never call while
     holding ``_human_wait_lock`` — it reads the config cache.
     ``_get_approval_timeout`` caps at ``agent.deadline.MAX_SAFE_TIMEOUT_S`` so the
-    value is always safe for ``Lock.acquire(timeout=...)`` / ``Thread.join(timeout=...)``."""
+    value is always safe for ``Lock.acquire(timeout=...)`` / ``Thread.join(timeout=...)``.
+    The longest legitimate wait is the larger of ``approvals.timeout`` and
+    ``approvals.rerouted_timeout`` (a prompt rerouted to a human home channel), so the
+    ceiling covers both: a shorter one would break the authorization gate's serialization
+    while a rerouted prompt is still answerable."""
     from tools import approval_context
     from agent.deadline import MAX_SAFE_TIMEOUT_S
-    return min(MAX_SAFE_TIMEOUT_S, float(approval_context._get_approval_timeout()) + HUMAN_WAIT_MARGIN_S)
+    longest = max(approval_context._get_approval_timeout(), approval_context._get_rerouted_approval_timeout())
+    return min(MAX_SAFE_TIMEOUT_S, float(longest) + HUMAN_WAIT_MARGIN_S)
 
 
 def _clamped_window_seconds(started: float, now: float, ceiling: float) -> float:

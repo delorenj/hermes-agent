@@ -16,7 +16,9 @@ No imports from ``gateway.platforms.base`` or ``gateway.run`` — both import th
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator, Optional
 
 from agent.i18n import t
 
@@ -66,9 +68,35 @@ def approval_timed_out_notice(window: str) -> str:
 
 
 def approval_timeout_seconds() -> int:
-    """The configured ``approvals.timeout`` (default 300s); module attribute so tests can pin it."""
+    """The window the prompt being rendered actually waits: the one its waiter captured
+    (:func:`approval_render_window`) while a prompt renders, else the configured ``approvals.timeout``
+    (default 300s); module attribute so tests can pin it."""
+    pinned = _render_window.get()
+    if pinned is not None:
+        return pinned
     from tools.approval_context import _get_approval_timeout
     return _get_approval_timeout()
+
+
+# The wait window of the prompt being rendered now. A prompt rerouted to a human home channel waits
+# ``approvals.rerouted_timeout``, not ``approvals.timeout``, and its card must say so. A ContextVar: the
+# render runs on the agent thread and its sends are scheduled from there with run_coroutine_threadsafe,
+# which carries the agent thread's context into the send task.
+_render_window: ContextVar[Optional[int]] = ContextVar("approval_render_window", default=None)
+
+
+@contextmanager
+def approval_render_window(timeout_s: Any) -> Iterator[None]:
+    """Render the prompt(s) in this block with *timeout_s* as their deadline (``None``: config)."""
+    try:
+        window = int(timeout_s) if timeout_s is not None else None
+    except (TypeError, ValueError):
+        window = None
+    token = _render_window.set(window)
+    try:
+        yield
+    finally:
+        _render_window.reset(token)
 
 
 def format_approval_window(seconds: int) -> str:
@@ -85,6 +113,13 @@ def format_approval_deadline_line(timeout_s: int) -> str:
 
 def format_approval_timed_out_notice(timeout_s: int) -> str:
     return approval_timed_out_notice(format_approval_window(timeout_s))
+
+
+def format_rerouted_timed_out_notice(timeout_s: int, profile: Optional[str]) -> str:
+    """Timeout notice for a prompt rerouted to a human home channel: names the profile whose turn
+    asked and the ``approvals.rerouted_timeout`` key that sets this window."""
+    return t("gateway.exec_approval.rerouted_timed_out_notice", window=format_approval_window(timeout_s),
+             profile=profile or "default")
 
 
 def code_fence(command: str) -> str:

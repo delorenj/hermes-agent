@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "智慧拒絕：擁有者覆寫僅適用於這一次操作。"
     smart_deny_heading: "⚠️ **智慧拒絕 — 擁有者覆寫僅限單次操作：**"
     timed_out_notice: "⌛ 批准已逾時（{window}）— 指令「未」執行。如果你仍需要，請再要求我試一次，或在 config.yaml 中提高 approvals.timeout。"
+    rerouted_reason: "{reason}（來自 {profile} 的 {platform} 回合：該頻道無人查看，因此轉到這裡）"
+    rerouted_timed_out_notice: "⌛ 審批在 {window} 後逾時 — 命令未執行，已通知 {profile} 的回合。如需更多時間，請在 config.yaml 中調高 approvals.rerouted_timeout。"
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "允許一次"
     action_session: "允許本次工作階段"

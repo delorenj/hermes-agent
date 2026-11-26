@@ -38,6 +38,18 @@ def approval_transport(turn):
             raise RuntimeError("Approval notification unavailable: no chat can show this prompt")
         presenter._render_approval_sync(data, background=True)
 
+    def wait_timeout_s():
+        # A chat nobody reads sends its prompts to a human home channel (gateway/approval_reroute.py):
+        # that person was not watching the turn, so the wait is approvals.rerouted_timeout. Read at
+        # prompt time, through the module, so a config edit (or a test pin) applies to the next prompt.
+        from gateway.approval_reroute import answers_approvals
+        from tools import approval_context
+        if answers_approvals(origin._status_adapter):
+            return approval_context._get_approval_timeout()
+        return approval_context._get_rerouted_approval_timeout()
+
+    notify.wait_timeout_s = background_notify.wait_timeout_s = wait_timeout_s
+
     # Only a chat platform can show a prompt once the turn is gone. API/webhook runs answer through
     # their own run, and a local viewer's prompts ride the turn's canonical stream: publishing no
     # transport there makes a later child request fail closed instead of parking where nobody looks.

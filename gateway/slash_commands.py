@@ -1208,9 +1208,16 @@ class GatewaySlashCommandsMixin(
         sender may answer the approvals this command selects (*choice* names its ``/approve`` or
         ``/deny`` for the chat's slash policy: the bare-word "always" lands here without dispatch's
         gate), else ``(session_key, reply, [])``.
-        A pending-approvals entry with no blocked thread is a stale prompt: drop it and say so."""
+        A pending-approvals entry with no blocked thread is a stale prompt: drop it and say so.
+
+        A chat whose own session is not blocked may be the human home channel a prompt from a chat
+        nobody reads was rerouted to (``gateway/approval_reroute.py``): the answer then resolves that
+        origin session, checked against the same authority as a card tap."""
         from tools.approval import has_blocking_approval
         session_key = self._session_key_for_source(event.source)
+        if not has_blocking_approval(session_key):
+            from gateway.approval_reroute import rerouted_session_for
+            session_key = rerouted_session_for(self._delivery_adapter_for(event.source), event.source) or session_key
         if has_blocking_approval(session_key):
             from gateway.relay.admitted_authors import answer_admitted
             from gateway.approval_actor import answerable_request_ids, refusal_text

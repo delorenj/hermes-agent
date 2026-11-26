@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "Smart DENY: Der Besitzer-Override gilt nur für diesen einen Vorgang."
     smart_deny_heading: "⚠️ **Smart DENY — Besitzer-Override für einen Vorgang:**"
     timed_out_notice: "⌛ Zeitüberschreitung der Genehmigung nach {window} — der Befehl wurde NICHT ausgeführt. Bitten Sie mich um einen neuen Versuch, wenn Sie ihn noch möchten, oder erhöhen Sie approvals.timeout in config.yaml."
+    rerouted_reason: "{reason} (aus dem {platform}-Turn von {profile}: diesen Kanal liest niemand, daher kam es hierher)"
+    rerouted_timed_out_notice: "⌛ Freigabe nach {window} abgelaufen — der Befehl wurde NICHT ausgeführt, der Turn von {profile} wurde informiert. Für mehr Zeit approvals.rerouted_timeout in config.yaml erhöhen."
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "Einmalig erlauben"
     action_session: "Für Sitzung erlauben"

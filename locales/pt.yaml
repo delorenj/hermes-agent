@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "NEGAR inteligente: a exceção do proprietário vale apenas para esta operação."
     smart_deny_heading: "⚠️ **NEGAR inteligente — exceção do proprietário para uma operação:**"
     timed_out_notice: "⌛ A aprovação expirou após {window} — o comando NÃO foi executado. Peça para eu tentar novamente se ainda quiser, ou aumente approvals.timeout em config.yaml."
+    rerouted_reason: "{reason} (do turno {platform} de {profile}: ninguém lê esse canal, por isso veio para cá)"
+    rerouted_timed_out_notice: "⌛ A aprovação expirou após {window} — o comando NÃO foi executado e o turno de {profile} foi avisado. Aumente approvals.rerouted_timeout no config.yaml para ter mais tempo."
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "Permitir uma vez"
     action_session: "Permitir na sessão"

@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "スマート DENY: オーナーによる上書きはこの 1 回の操作にのみ適用されます。"
     smart_deny_heading: "⚠️ **スマート DENY — 1 回の操作に限ったオーナーの上書き:**"
     timed_out_notice: "⌛ 承認は {window} でタイムアウトしました — コマンドは実行されていません。必要であれば再度お知らせください。または config.yaml の approvals.timeout を増やしてください。"
+    rerouted_reason: "{reason}（{profile} の {platform} ターンから：そのチャンネルは誰も見ていないため、ここに転送されました）"
+    rerouted_timed_out_notice: "⌛ {window} で承認がタイムアウトしました — コマンドは実行されず、{profile} のターンに通知しました。時間を延ばすには config.yaml の approvals.rerouted_timeout を増やしてください。"
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "今回のみ許可"
     action_session: "セッション中許可"

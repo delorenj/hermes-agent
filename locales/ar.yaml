@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "رفض ذكي: تجاوز المالك ينطبق على هذه العملية وحدها."
     smart_deny_heading: "⚠️ **رفض ذكي — تجاوز المالك لعملية واحدة:**"
     timed_out_notice: "⌛ انتهت مهلة الموافقة بعد {window} — لم يُنفَّذ الأمر. اطلب منّي المحاولة مجددًا إن كنت لا تزال تريده، أو ارفع قيمة approvals.timeout في config.yaml."
+    rerouted_reason: "{reason} (من دور {platform} الخاص بـ {profile}: لا أحد يقرأ تلك القناة، لذا وصل الطلب إلى هنا)"
+    rerouted_timed_out_notice: "⌛ انتهت مهلة الموافقة بعد {window} — لم يُنفَّذ الأمر، وتم إبلاغ دور {profile}. ارفع approvals.rerouted_timeout في config.yaml للحصول على وقت أطول."
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "السماح مرة"
     action_session: "السماح للجلسة"

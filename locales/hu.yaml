@@ -640,6 +640,8 @@ gateway:
     smart_deny_line: "Okos ELUTASÍTÁS: a tulajdonosi felülbírálás csak erre az egy műveletre vonatkozik."
     smart_deny_heading: "⚠️ **Okos ELUTASÍTÁS — tulajdonosi felülbírálás egy műveletre:**"
     timed_out_notice: "⌛ A jóváhagyás {window} után lejárt — a parancs NEM futott le. Ha még mindig kell, kérd újra, vagy emeld meg az approvals.timeout értékét a config.yaml-ben."
+    rerouted_reason: "{reason} ({profile} {platform}-köréből: azt a csatornát senki sem olvassa, ezért ide érkezett)"
+    rerouted_timed_out_notice: "⌛ A jóváhagyás {window} után lejárt — a parancs NEM futott le, és {profile} köre értesítést kapott. Több időért növeld az approvals.rerouted_timeout értékét a config.yaml-ban."
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "Engedélyezés egyszer"
     action_session: "Engedélyezés a munkamenetre"

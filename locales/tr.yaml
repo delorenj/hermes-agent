@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "Akıllı REDDET: sahip geçersiz kılması yalnızca bu tek işlem için geçerlidir."
     smart_deny_heading: "⚠️ **Akıllı REDDET — tek işlem için sahip geçersiz kılması:**"
     timed_out_notice: "⌛ Onay {window} sonra zaman aşımına uğradı — komut çalıştırılMADI. Hâlâ istiyorsanız yeniden denememi isteyin veya config.yaml içinde approvals.timeout değerini yükseltin."
+    rerouted_reason: "{reason} ({profile} profilinin {platform} turundan: o kanalı kimse okumuyor, bu yüzden buraya geldi)"
+    rerouted_timed_out_notice: "⌛ Onay {window} sonra zaman aşımına uğradı — komut ÇALIŞTIRILMADI ve {profile} turuna bildirildi. Daha fazla süre için config.yaml içinde approvals.rerouted_timeout değerini artırın."
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "Bir Kez İzin Ver"
     action_session: "Oturum İçin İzin Ver"

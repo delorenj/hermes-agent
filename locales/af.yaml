@@ -637,6 +637,8 @@ gateway:
     smart_deny_line: "Slim WEIER: eienaar-oorskrywing geld slegs vir hierdie een bewerking."
     smart_deny_heading: "⚠️ **Slim WEIER — eienaar-oorskrywing vir een bewerking:**"
     timed_out_notice: "⌛ Goedkeuring het na {window} uitgetel — die opdrag is NIE uitgevoer nie. Vra my om weer te probeer as jy dit steeds wil hê, of verhoog approvals.timeout in config.yaml."
+    rerouted_reason: "{reason} (van {profile} se {platform}-beurt: niemand lees daardie kanaal nie, so dit het hierheen gekom)"
+    rerouted_timed_out_notice: "⌛ Goedkeuring het ná {window} verval — die opdrag is NIE uitgevoer nie, en {profile} se beurt is ingelig. Verhoog approvals.rerouted_timeout in config.yaml vir meer tyd."
     timed_out_card_body: "{notice}\n```\n{command}\n```"
     action_once: "Eenmalig toelaat"
     action_session: "Sessie toelaat"

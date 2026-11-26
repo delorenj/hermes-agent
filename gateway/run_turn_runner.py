@@ -797,29 +797,89 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
 
     def _render_approval_sync(self, approval_data: dict, *, background=False) -> None:
         """Send the approval request from the agent thread: the adapter's interactive button
-        approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps."""
+        approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps.
+
+        A chat nobody reads (adapter ``answers_approvals = False``: a Bloodbank command turn, an A2A
+        peer) is never the destination: the prompt goes to the profile's human home channel
+        (``gateway/approval_reroute.py``), and with none the notifier raises ``ApprovalUndeliverable``
+        so the turn is BLOCKED with the reason at once instead of waiting out a prompt nobody saw.
+        Every render states the window its waiter actually enforces (``approval_data['timeout_s']``)."""
+        from gateway.approval_reroute import answers_approvals
+        from gateway.platforms.base_exec_approval import approval_render_window
+        ctx = self._ctx
+        with approval_render_window(approval_data.get("timeout_s")):
+            if answers_approvals(ctx._status_adapter):
+                self._render_approval_to(approval_data, ctx._status_adapter, ctx._status_chat_id,
+                                         ctx._status_thread_metadata, background=background)
+            else:
+                self._render_rerouted_approval(approval_data)
+
+    def _render_rerouted_approval(self, approval_data: dict) -> None:
+        """Render a prompt whose origin chat has no human reader in the profile's home channel."""
+        from gateway.approval_reroute import resolve_human_target, track_rerouted, undeliverable_reason
+        from tools.approval_gateway_wait import ApprovalUndeliverable
+        ctx = self._ctx
+        source = ctx.source
+        origin_platform = getattr(getattr(source, "platform", None), "value", "")
+        target = resolve_human_target(self._runner, source)
+        if target is None:
+            logger.warning(
+                "Approval prompt undeliverable: %s turn of profile %s has no human home channel "
+                "(request_id=%s, session=%s)", origin_platform, getattr(source, "profile", None) or "default",
+                approval_data.get("request_id"), ctx.session_key)
+            raise ApprovalUndeliverable(undeliverable_reason(source))
+        logger.info(
+            "Approval prompt rerouted from %s (profile=%s) to the %s home channel of profile %s "
+            "(request_id=%s, session=%s)", origin_platform, getattr(source, "profile", None) or "default",
+            target.platform_value, target.profile or "default", approval_data.get("request_id"), ctx.session_key)
+        # Before the send: a typed /approve in the home chat may race the card's receipt.
+        track_rerouted(target, ctx.session_key or "", approval_data.get("request_id"))
+        try:
+            # background=True: never touch the origin's typing/stream state, and an undelivered
+            # prompt fails closed (the origin chat cannot show it either).
+            self._render_approval_to(approval_data, target.adapter, target.chat_id,
+                                     {**(target.metadata or {}), "is_approval_prompt": True},
+                                     background=True, rerouted=target)
+        except _ExecApprovalDeclined as exc:
+            raise ApprovalUndeliverable(
+                f"the approval prompt was rerouted to the operator's {target.platform_value} home channel "
+                f"because nobody reads {origin_platform}, but that channel refused it ({exc}). Nobody "
+                "was asked.") from exc
+        except Exception as exc:
+            raise ApprovalUndeliverable(
+                f"the approval prompt was rerouted to the operator's {target.platform_value} home channel "
+                f"because nobody reads {origin_platform}, but it could not be delivered there "
+                f"({type(exc).__name__}). Nobody was asked.") from exc
+
+    def _render_approval_to(self, approval_data: dict, adapter, chat_id, thread_metadata, *,
+                            background=False, rerouted=None) -> None:
+        """Render the prompt through *adapter* into *chat_id*; buttons and the text prompt carry the
+        turn's own session key, so an answer from anywhere resolves this turn's wait. *rerouted* is the
+        ``HumanApprovalTarget`` when the prompt left the origin chat (its card names the origin)."""
         from gateway.run import _approval_send_outcome, _interim_metadata, _redact_approval_command
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         from gateway.run_turn_runner_approval_text import approval_text_prompt
         ctx = self._ctx
-        adapter = ctx._status_adapter
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
         if not background:
-            adapter.pause_typing_for_chat(ctx._status_chat_id)
+            adapter.pause_typing_for_chat(chat_id)
             self._close_native_stream_boundary("Approval")
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
         desc = _redact_approval_command(approval_data.get("description")) or ea_default_reason_text()
+        if rerouted is not None:
+            from gateway.approval_reroute import rerouted_reason
+            desc = rerouted_reason(rerouted, desc)
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
             try:
                 fut = self._schedule(
                     adapter.send_exec_approval(
-                        chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata,
+                        chat_id=chat_id, command=cmd, session_key=ctx.session_key or "",
+                        description=desc, metadata=thread_metadata,
                         request_id=approval_data.get("request_id"), **flags,
                     ),
                     "send_exec_approval scheduling error",
@@ -832,12 +892,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     # REQUESTED one: an adapter's stale-thread fallback may land it elsewhere (logged there). Never the command text.
                     logger.info("Exec approval card delivered (message_id=%s, request_id=%s, session=%s, requested_chat=%s, requested_thread=%s)",
                                 getattr(fut.result(timeout=0), "message_id", None), approval_data.get("request_id"),
-                                ctx.session_key, ctx._status_chat_id, (ctx._status_thread_metadata or {}).get("thread_id"))
+                                ctx.session_key, chat_id, (thread_metadata or {}).get("thread_id"))
                     # Without this, a card whose timer runs out keeps live buttons and nobody
                     # learns the command did NOT run (only the TUI registered a settle hook).
                     register_timeout_notice(
                         self, approval_data, command=cmd,
-                        card_message_id=getattr(fut.result(timeout=0), "message_id", None))
+                        card_message_id=getattr(fut.result(timeout=0), "message_id", None), rerouted=rerouted)
                     return
                 if outcome == "ambiguous":
                     # Timeout ≠ failure: the card may have posted with a late ack. The prompt
@@ -884,14 +944,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 logger.warning("Button-based approval failed, falling back to text: %s", e)
         # Plain-text prompt with the adapter's typed prefix (e.g. `!approve`): typed "/" is blocked
         # in Slack threads and reserved by Matrix clients.
-        msg = approval_text_prompt(adapter, ctx._status_chat_id, ctx.session_key or "", approval_data.get("request_id"),
+        msg = approval_text_prompt(adapter, chat_id, ctx.session_key or "", approval_data.get("request_id"),
                                    cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)
         try:
             # Mark as approval prompt: WeCom routes it through the control lane and Telegram pushes it
             # in "important" mode (#132516). Never ``notify`` — A2A reads that as the turn-final reply.
-            metadata = {**(ctx._status_thread_metadata or {}), "is_approval_prompt": True}
+            metadata = {**(thread_metadata or {}), "is_approval_prompt": True}
             fut = self._schedule(
-                adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)), "Approval text-send scheduling error",
+                adapter.send(chat_id, msg, metadata=_interim_metadata(metadata)), "Approval text-send scheduling error",
             )
             # A receipt that times out (or a lost ack) is AMBIGUOUS, not a failure: the prompt may be
             # on screen, so it stays armed for a typed /approve, exactly like the card path above.
@@ -905,7 +965,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                            approval_data.get("request_id"), ctx.session_key)
                 # No card to edit on the text path: the prompt has no buttons to drop and carries
                 # the /approve instructions, so the timeout notice is posted as a new message.
-                register_timeout_notice(self, approval_data, command=cmd, card_message_id=None)
+                register_timeout_notice(self, approval_data, command=cmd, card_message_id=None, rerouted=rerouted)
             if background and outcome not in ("sent", "ambiguous"):
                 # Nobody else can still show a background child's prompt: undelivered fails it closed.
                 raise RuntimeError("Approval notification was not delivered")
