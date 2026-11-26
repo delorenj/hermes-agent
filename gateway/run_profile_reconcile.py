@@ -275,6 +275,11 @@ class GatewayProfileReconcileMixin:
             scan_signature = profile_serve_signature(current[name])
             if name in changed:
                 self._drop_stale_platform_verdicts(name)
+                # The 1Password/Bitwarden snapshot is hydrated once per home. A changed config can add a
+                # secret reference (a newly wired Telegram bot): forget this home's snapshot so the
+                # connect below resolves it, instead of reporting "no bot credential" until a restart.
+                from hermes_cli.env_loader import reset_secret_source_cache
+                reset_secret_source_cache(current[name])
             try:
                 connected = await self._start_one_profile_adapters(name, current[name], claimed)
             except MultiplexConfigError as exc:

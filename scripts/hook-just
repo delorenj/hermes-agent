@@ -3,7 +3,9 @@
 # matched staged files to the job: a commit no job matches never sets up an environment.
 # An unactivated shell has no `just`, a PM tool: it comes from this checkout's own
 # environment (scripts/run-in-hermes-env), never from a venv on PATH or `uv run`.
-if command -v just >/dev/null 2>&1; then
+# A `just` on PATH is used only when it can parse this justfile: a distro `just` (e.g. 1.40)
+# predates settings like `set default-list` and would fail every hook with a parse error.
+if command -v just >/dev/null 2>&1 && just --summary >/dev/null 2>&1; then
     exec just "$@"
 fi
 exec "$(dirname "$0")/run-in-hermes-env" just "$@"
