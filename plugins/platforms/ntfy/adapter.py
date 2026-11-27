@@ -318,7 +318,11 @@ def _env_enablement() -> dict | None:
         ("NTFY_SERVER_URL", "server", lambda v: v.rstrip("/")), ("NTFY_PUBLISH_TOPIC", "publish_topic", None),
         ("NTFY_TOKEN", "token", None), ("NTFY_MARKDOWN", "markdown", lambda v: v.lower() in _MARKDOWN_TRUTHY),
     ), home_env="NTFY_HOME_CHANNEL", home_default=topic)
-    return {"topic": topic, "server": seed.pop("server", DEFAULT_SERVER), **seed}
+    # No DEFAULT_SERVER here: the registry applies this seed OVER the YAML extras, so a seeded
+    # default replaced a profile's `extra.server` with public ntfy.sh and sent its bearer token
+    # there (EARS-48 incident, 2026-11-25). Only an explicit NTFY_SERVER_URL enters the seed; the
+    # adapter applies the default itself when neither env nor YAML names a server.
+    return {"topic": topic, **seed}
 
 
 

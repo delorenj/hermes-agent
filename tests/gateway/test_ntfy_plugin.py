@@ -375,6 +375,24 @@ class TestEnvEnablement:
         assert seed["home_channel"]["name"] == "Alerts Channel"
 
 
+    def test_seed_never_injects_default_server(self, monkeypatch):
+        """The registry applies the seed over YAML extras, so a seeded default would replace a
+        profile's private `extra.server` with public ntfy.sh (and send the token there)."""
+        monkeypatch.setenv("NTFY_TOPIC", "hermes-in")
+        monkeypatch.delenv("NTFY_SERVER_URL", raising=False)
+        seed = _env_enablement()
+        assert "server" not in seed
+        extra = {"server": "https://ntfy.private.example", "topic": "hermes-in"}
+        extra.update({k: v for k, v in seed.items() if k != "home_channel"})
+        assert extra["server"] == "https://ntfy.private.example"
+
+
+    def test_seed_carries_explicit_server_url(self, monkeypatch):
+        monkeypatch.setenv("NTFY_TOPIC", "hermes-in")
+        monkeypatch.setenv("NTFY_SERVER_URL", "https://ntfy.private.example/")
+        assert _env_enablement()["server"] == "https://ntfy.private.example"
+
+
 # ---------------------------------------------------------------------------
 # 10. _standalone_send() — out-of-process cron delivery
 # ---------------------------------------------------------------------------
